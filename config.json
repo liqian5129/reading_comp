@@ -1,0 +1,52 @@
+{
+  "_comment": "===========================================",
+  "_comment2": "AI 读书搭子 配置文件",
+  "_comment3": "复制此文件为 config.json 并填写你的密钥",
+  "_comment4": "===========================================",
+  
+  "ai": {
+    "_comment": "Kimi AI 配置 - https://platform.moonshot.cn/",
+    "api_key": "sk-9uzzSiLrEeSOUgxFcSS8d3Rt4i2yTQPxcj3n2x6rnjibheBc",
+    "model": "kimi-k2.5",
+    "base_url": "https://api.moonshot.cn/v1"
+  },
+  
+  "aliyun_nls": {
+    "_comment": "阿里云 NLS 配置 - https://nls-portal.console.aliyun.com/",
+    "_comment2": "Token 有过期时间（默认 24 小时），需要定期更新",
+    "_comment3": "或者填写 access_key_id 和 access_key_secret 自动获取 Token",
+    
+    "app_key": "3EyWxTdX2nPQcmSt",
+    "token": "cb0bba3f3db54aee92b9e0cdb6cf213b",
+    "access_key_id": "你的阿里云 AccessKey ID（可选）",
+    "access_key_secret": "你的阿里云 AccessKey Secret（可选）"
+  },
+  
+  "tts": {
+    "_comment": "语音合成配置",
+    "_comment2": "可选发音人：zh-CN-XiaoxiaoNeural(晓晓女声)、zh-CN-YunxiNeural(云溪男声)等",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "_comment3": "播放器命令：macOS用afplay，Linux用aplay/mpg123，Windows需要安装播放器",
+    "player_cmd": "afplay"
+  },
+  
+  "feishu": {
+    "_comment": "飞书配置（可选）- https://open.feishu.cn/app/",
+    "enabled": false,
+    "app_id": "cli_a92abf968478dcc6",
+    "app_secret": "jpKOB7cK8QfuyRP0BIA1VgZQBaXcReC0",
+    "encrypt_key": "",
+    "verification_token": ""
+  },
+  
+  "camera": {
+    "_comment": "摄像头配置",
+    "device": 0,
+    "auto_scan_interval": 2
+  },
+  
+  "data": {
+    "_comment": "数据存储目录",
+    "data_dir": "./data"
+  }
+}

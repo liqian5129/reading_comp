@@ -1,0 +1,30 @@
+# AI
+openai>=1.0.0
+
+# OCR
+paddlepaddle
+paddleocr
+
+# Computer Vision
+opencv-python
+numpy
+pillow
+
+# Audio
+sounddevice
+numpy
+
+# Keyboard
+pynput
+
+# HTTP Client (for TTS)
+aiohttp
+
+# Database
+aiosqlite
+
+# Feishu
+lark-oapi>=1.5.0
+
+# Config (optional, for .env support)
+python-dotenv
