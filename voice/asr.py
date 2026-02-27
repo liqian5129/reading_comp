@@ -363,6 +363,13 @@ class PrewarmedASR:
                 t.start()
                 self._refresh_timer = t
 
+                # 后台监控 standby 健康状态：若服务端主动断开则触发重建
+                threading.Thread(
+                    target=self._watch_standby_health,
+                    args=(asr,),
+                    daemon=True,
+                ).start()
+
                 logger.info("✅ ASR 预热完成，下次按键可立即使用")
                 return
 
@@ -375,6 +382,25 @@ class PrewarmedASR:
         with self._pool_lock:
             self._preparing = False
             self._standby_ready.clear()
+
+    def _watch_standby_health(self, asr: 'AliyunStreamASR'):
+        """监控 standby 连接健康状态，若服务端主动断开则触发重建。"""
+        # 等待 _closed 事件：若连接正常则直到定时刷新前不会触发
+        asr._closed.wait()
+        with self._pool_lock:
+            # 只处理仍是当前 standby 的情况（若已被激活或已被刷新则跳过）
+            if self._standby is not asr:
+                return
+            if not self._standby_ready.is_set():
+                return
+            # standby 意外死亡，清理并重建
+            self._standby = None
+            self._standby_ready.clear()
+        logger.warning("⚠️ ASR standby 连接意外断开，触发重建...")
+        if self._refresh_timer:
+            self._refresh_timer.cancel()
+            self._refresh_timer = None
+        self.prepare()
 
     def _refresh_standby(self):
         """standby 即将到期时主动关闭并重建，保持随时可用。"""
@@ -389,10 +415,10 @@ class PrewarmedASR:
             self._standby = None
             self._standby_ready.clear()
             self._preparing = True  # 标记为准备中，防止并发
-        
+
         logger.info("🔄 ASR standby 即将到期，主动刷新中...")
-        
-        # 先等待旧连接完全关闭
+
+        # 先等待旧连接完全关闭，再启动新连接
         def close_and_prepare():
             try:
                 old.stop(timeout=3.0)
@@ -401,8 +427,12 @@ class PrewarmedASR:
             finally:
                 with self._pool_lock:
                     self._preparing = False  # 重置状态
+                # stop 超时后稍作等待，给 SDK 时间释放底层资源
+                # 避免旧连接线程仍在运行时立即建立新连接
+                if not old._closed.is_set():
+                    time.sleep(1.0)
                 self.prepare()
-        
+
         threading.Thread(target=close_and_prepare, daemon=True).start()
 
     # ------------------------------------------------------------------
