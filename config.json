@@ -72,7 +72,8 @@
   "camera": {
     "_comment": "摄像头配置",
     "device": 0,
-    "auto_scan_interval": 2
+    "auto_scan_interval": 2,
+    "scanner_enabled": false
   },
   
   "data": {

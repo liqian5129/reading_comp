@@ -22,6 +22,7 @@ class LLMResponse:
     text: str
     tool_calls: List[Dict[str, Any]]
     stop_reason: str
+    raw_assistant_message: Optional[Dict] = None  # 含 tool_calls 的原始 assistant 消息
 
 
 class AIClient:
@@ -224,6 +225,7 @@ class AIClient:
             
             # 提取工具调用
             tool_calls = []
+            raw_assistant_message = None
             if message.tool_calls:
                 for tc in message.tool_calls:
                     tool_calls.append({
@@ -231,7 +233,23 @@ class AIClient:
                         "name": tc.function.name,
                         "input": json.loads(tc.function.arguments)
                     })
-            
+                # 保存原始 assistant 消息（API 要求 tool 消息前必须有此消息）
+                raw_assistant_message = {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+
             stop_reason = response.choices[0].finish_reason
             if tool_calls:
                 stop_reason = "tool_use"
@@ -251,7 +269,8 @@ class AIClient:
             return LLMResponse(
                 text=text,
                 tool_calls=tool_calls,
-                stop_reason=stop_reason
+                stop_reason=stop_reason,
+                raw_assistant_message=raw_assistant_message,
             )
             
         except Exception as e:
@@ -275,18 +294,26 @@ class AIClient:
                                     tool_results: List[Dict],
                                     system_prompt: str = "",
                                     history: List[Dict[str, str]] = None,
+                                    assistant_message: Optional[Dict] = None,
                                     max_tokens: int = 4096) -> LLMResponse:
         """发送工具执行结果，继续对话 - 带计时"""
         if history is None:
             history = []
-        
+
         messages = []
-        
+
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        
+
         messages.extend(history[-20:])
-        
+
+        # 当前用户消息
+        messages.append({"role": "user", "content": user_message})
+
+        # assistant 原始消息（含 tool_calls），API 强制要求在 tool 消息之前
+        if assistant_message:
+            messages.append(assistant_message)
+
         for result in tool_results:
             messages.append({
                 "role": "tool",

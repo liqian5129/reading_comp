@@ -92,6 +92,7 @@ class Config:
         # 摄像头
         self.CAMERA_DEVICE = self._get("camera", "device", 0)
         self.AUTO_SCAN_INTERVAL = self._get("camera", "auto_scan_interval", 2)
+        self.SCANNER_ENABLED = self._get("camera", "scanner_enabled", False)
         
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
