@@ -91,12 +91,36 @@ READING_HISTORY_TOOL = {
     }
 }
 
+READING_NOTES_TOOL = {
+    "name": "reading_notes",
+    "description": (
+        "查询用户过往的读书笔记内容，返回完整笔记列表供 AI 查看和整理。"
+        "当用户说'看看我的笔记'、'整理一下笔记'、'我之前记了什么'、'最近的读书笔记'时调用。"
+        "返回每条笔记的时间、书名、标签和完整内容。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "integer",
+                "description": "查询最近几天的笔记，默认 7 天"
+            },
+            "book_name": {
+                "type": "string",
+                "description": "按书名过滤，留空则返回所有书的笔记"
+            }
+        },
+        "required": []
+    }
+}
+
 ALL_TOOLS = [
     READING_START_TOOL,
     READING_SNAP_TOOL,
     READING_NOTE_TOOL,
     READING_STOP_TOOL,
     READING_HISTORY_TOOL,
+    READING_NOTES_TOOL,
 ]
 
 
@@ -153,6 +177,8 @@ class ToolExecutor:
                 return await self._exec_reading_stop(tool_input)
             elif tool_name == "reading_history":
                 return await self._exec_reading_history(tool_input)
+            elif tool_name == "reading_notes":
+                return await self._exec_reading_notes(tool_input)
             else:
                 return {"success": False, "error": f"未知工具: {tool_name}"}
                 
@@ -313,4 +339,41 @@ class ToolExecutor:
             "total_duration": summary.duration_str,
             "total_pages": summary.total_pages,
             "total_notes": summary.total_notes
+        }
+
+    async def _exec_reading_notes(self, params: Dict) -> Dict:
+        """查询笔记内容列表"""
+        days = params.get("days", 7)
+        book_filter = params.get("book_name", "").strip()
+
+        notes = await self.session_manager.get_recent_notes(days=days)
+
+        if book_filter:
+            notes = [n for n in notes if book_filter in (n.book_name or "")]
+
+        if not notes:
+            scope = f"《{book_filter}》" if book_filter else f"最近 {days} 天"
+            return {
+                "success": True,
+                "message": f"{scope}暂无读书笔记",
+                "notes": [],
+                "total": 0
+            }
+
+        note_list = []
+        for n in notes:
+            note_list.append({
+                "id": n.id,
+                "datetime": n.created_at_str,
+                "book_name": n.book_name or "",
+                "tags": n.tags,
+                "content": n.content,
+            })
+
+        scope = f"《{book_filter}》" if book_filter else f"最近 {days} 天"
+        return {
+            "success": True,
+            "message": f"{scope}共有 {len(note_list)} 条读书笔记",
+            "notes": note_list,
+            "total": len(note_list)
         }
