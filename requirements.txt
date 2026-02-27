@@ -17,8 +17,11 @@ numpy
 # Keyboard
 pynput
 
-# HTTP Client (for TTS)
+# HTTP Client
 aiohttp
+
+# WebSocket (for Doubao TTS)
+websockets>=11.0
 
 # Database
 aiosqlite
@@ -26,5 +29,5 @@ aiosqlite
 # Feishu
 lark-oapi>=1.5.0
 
-# Config (optional, for .env support)
+# Config (optional)
 python-dotenv

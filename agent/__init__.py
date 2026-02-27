@@ -1,8 +1,8 @@
 """
 AI Agent 模块
 """
-from .kimi_client import KimiClient
+from .ai_client import AIClient
 from .memory import Memory
 from .tools import ToolRegistry, ToolExecutor
 
-__all__ = ['KimiClient', 'Memory', 'ToolRegistry', 'ToolExecutor']
+__all__ = ['AIClient', 'Memory', 'ToolRegistry', 'ToolExecutor']

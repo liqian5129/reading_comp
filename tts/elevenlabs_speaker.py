@@ -1,161 +1,148 @@
 """
-TTS 播放模块
-使用阿里云 NLS TTS
-支持流式合成和播放队列
+ElevenLabs TTS 模块
+使用 ElevenLabs API 进行语音合成
 """
 import asyncio
 import logging
 import os
 import subprocess
 import tempfile
-import threading
-import queue
-from typing import Optional, Callable, List
+from typing import Optional, List
 from dataclasses import dataclass
-from enum import Enum, auto
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
-class TTSState(Enum):
-    """TTS 状态"""
-    IDLE = auto()
-    SYNTHESIZING = auto()
-    PLAYING = auto()
-
-
 @dataclass
 class TTSRequest:
     """TTS 请求"""
     text: str
-    voice: str = "zh-CN-XiaoxiaoNeural"
+    voice_id: str = "pNInz6obpgDQGcFmaJgB"
+    model: str = "eleven_multilingual_v2"
     interrupt: bool = False
 
 
-class AliyunTTS:
+class ElevenLabsTTS:
     """
-    阿里云 NLS TTS
-    使用长文本语音合成接口
+    ElevenLabs TTS 引擎
+    文档: https://elevenlabs.io/docs/api-reference/text-to-speech
     """
     
-    TTS_URL = "https://nls-gateway-cn-shanghai.aliyuncs.com/stream/v1/tts"
+    API_URL = "https://api.elevenlabs.io/v1/text-to-speech"
     
-    def __init__(self, app_key: str, token: str):
-        self.app_key = app_key
-        self.token = token
+    def __init__(self, api_key: str, voice_id: str, model: str):
+        self.api_key = api_key
+        self.voice_id = voice_id
+        self.model = model
+        self.headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": api_key,
+        }
         
-    async def synthesize(self, text: str, voice: str = "xiaoyun", 
-                        speech_rate: int = 0, pitch_rate: int = 0) -> Optional[bytes]:
+    async def synthesize(self, text: str) -> Optional[bytes]:
         """
         合成语音
         
         Args:
-            text: 要合成的文本（长度限制约 300 字符）
-            voice: 发音人
-            speech_rate: 语速 -500~500
-            pitch_rate: 音调 -500~500
+            text: 要合成的文本
             
         Returns:
             MP3 音频数据
         """
-        headers = {
-            "Content-Type": "application/json",
-            "X-NLS-Token": self.token,
-        }
+        url = f"{self.API_URL}/{self.voice_id}"
         
         payload = {
-            "appkey": self.app_key,
             "text": text,
-            "format": "mp3",
-            "sample_rate": 16000,
-            "voice": voice,
-            "volume": 50,
-            "speech_rate": speech_rate,
-            "pitch_rate": pitch_rate,
+            "model_id": self.model,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75,
+            }
         }
         
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    self.TTS_URL, 
-                    headers=headers, 
+                    url,
+                    headers=self.headers,
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    timeout=aiohttp.ClientTimeout(total=60)
                 ) as resp:
                     if resp.status == 200:
                         audio_data = await resp.read()
-                        logger.debug(f"TTS 合成成功: {len(audio_data)} bytes")
+                        logger.debug(f"ElevenLabs TTS 合成成功: {len(audio_data)} bytes")
                         return audio_data
                     else:
                         error_text = await resp.text()
-                        logger.error(f"TTS 合成失败: {resp.status}, {error_text}")
+                        logger.error(f"ElevenLabs TTS 失败: {resp.status}, {error_text}")
                         return None
         except Exception as e:
-            logger.error(f"TTS 请求失败: {e}")
+            logger.error(f"ElevenLabs TTS 请求失败: {e}")
             return None
 
 
-class TTSPlayer:
+class ElevenLabsTTSPlayer:
     """
-    TTS 播放器
+    ElevenLabs TTS 播放器
     
     特点：
     - 异步队列，串流播放
     - 支持打断
-    - 自动清理临时文件
-    - 长文本自动分段（每段约 200 字）
+    - 长文本自动分段（每段约 500 字符）
     """
     
-    # 阿里云 TTS 长度限制约 300 字符，留些余量
-    MAX_TEXT_LENGTH = 200
+    # ElevenLabs 限制每段约 5000 字符，留些余量
+    MAX_TEXT_LENGTH = 3000
     
-    def __init__(self, tts_engine: AliyunTTS, 
+    def __init__(self, 
+                 api_key: str,
+                 voice_id: str = "pNInz6obpgDQGcFmaJgB",
+                 model: str = "eleven_multilingual_v2",
                  player_cmd: str = "afplay",
                  max_queue_size: int = 10):
         """
         Args:
-            tts_engine: TTS 引擎
+            api_key: ElevenLabs API Key
+            voice_id: 声音 ID
+            model: 模型名称
             player_cmd: 播放器命令
             max_queue_size: 播放队列最大长度
         """
-        self.tts = tts_engine
+        self.tts = ElevenLabsTTS(api_key, voice_id, model)
         self.player_cmd = player_cmd
         self.max_queue_size = max_queue_size
         
         # 队列和状态
         self._queue: asyncio.Queue[TTSRequest] = asyncio.Queue(maxsize=max_queue_size)
-        self._current_task: Optional[asyncio.Task] = None
         self._playing = False
         self._interrupt_event = asyncio.Event()
         
         # 临时文件目录
-        self._temp_dir = tempfile.mkdtemp(prefix="reading_comp_tts_")
+        self._temp_dir = tempfile.mkdtemp(prefix="reading_comp_elevenlabs_")
         
         # 任务
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
         
     def _split_text(self, text: str, max_length: int = MAX_TEXT_LENGTH) -> List[str]:
-        """
-        将长文本分段，每段不超过 max_length 个字符
-        尽量在句子边界处分割
-        """
+        """将长文本分段"""
         if len(text) <= max_length:
             return [text]
         
         segments = []
         current = ""
         
-        # 按句子分割（中文标点）
+        # 按句子分割
         import re
         sentences = re.split(r'([。！？；\n])', text)
         
         for i in range(0, len(sentences), 2):
             sentence = sentences[i]
             if i + 1 < len(sentences):
-                sentence += sentences[i + 1]  # 加上标点
+                sentence += sentences[i + 1]
             
             if len(current) + len(sentence) <= max_length:
                 current += sentence
@@ -167,7 +154,7 @@ class TTSPlayer:
         if current:
             segments.append(current)
         
-        # 如果还有超长段落，强制分割
+        # 强制分割超长段落
         final_segments = []
         for seg in segments:
             while len(seg) > max_length:
@@ -182,23 +169,19 @@ class TTSPlayer:
         """启动播放器"""
         self._running = True
         self._worker_task = asyncio.create_task(self._play_worker())
-        logger.info("TTS 播放器已启动")
+        logger.info("ElevenLabs TTS 播放器已启动")
         
     async def stop(self):
         """停止播放器"""
         self._running = False
-        
-        # 打断当前播放
         self.interrupt()
         
-        # 清空队列
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
         
-        # 等待工作线程结束
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -206,10 +189,8 @@ class TTSPlayer:
             except asyncio.CancelledError:
                 pass
         
-        # 清理临时文件
         self._cleanup_temp_files()
-        
-        logger.info("TTS 播放器已停止")
+        logger.info("ElevenLabs TTS 播放器已停止")
     
     def _cleanup_temp_files(self):
         """清理临时文件"""
@@ -223,14 +204,12 @@ class TTSPlayer:
         except Exception as e:
             logger.warning(f"清理临时文件失败: {e}")
     
-    async def speak(self, text: str, voice: str = "xiaoyun", 
-                   interrupt: bool = False) -> bool:
+    async def speak(self, text: str, interrupt: bool = False) -> bool:
         """
         播放文本
         
         Args:
-            text: 要播放的文本（长文本会自动分段）
-            voice: 发音人
+            text: 要播放的文本
             interrupt: 是否打断当前播放
             
         Returns:
@@ -244,9 +223,7 @@ class TTSPlayer:
         
         try:
             if interrupt:
-                # 打断当前播放
                 self.interrupt()
-                # 清空队列
                 while not self._queue.empty():
                     try:
                         self._queue.get_nowait()
@@ -256,9 +233,10 @@ class TTSPlayer:
             # 将分段加入队列
             for i, segment in enumerate(segments):
                 request = TTSRequest(
-                    text=segment, 
-                    voice=voice, 
-                    interrupt=(interrupt and i == 0)  # 只有第一段打断
+                    text=segment,
+                    voice_id=self.tts.voice_id,
+                    model=self.tts.model,
+                    interrupt=(interrupt and i == 0)
                 )
                 await self._queue.put(request)
             
@@ -282,7 +260,6 @@ class TTSPlayer:
         """播放工作协程"""
         while self._running:
             try:
-                # 等待队列中的请求
                 request = await asyncio.wait_for(
                     self._queue.get(), 
                     timeout=1.0
@@ -290,10 +267,7 @@ class TTSPlayer:
             except asyncio.TimeoutError:
                 continue
             
-            # 重置打断事件
             self._interrupt_event.clear()
-            
-            # 合成并播放
             await self._synthesize_and_play(request)
     
     async def _synthesize_and_play(self, request: TTSRequest):
@@ -304,20 +278,16 @@ class TTSPlayer:
             # 合成语音
             import time
             synth_start = time.time()
-            audio_data = await self.tts.synthesize(
-                request.text, 
-                voice=request.voice
-            )
+            audio_data = await self.tts.synthesize(request.text)
             synth_time = (time.time() - synth_start) * 1000
             
             if audio_data:
-                logger.info(f"🔊 阿里云 TTS 合成完成: {synth_time:.0f} ms, {len(audio_data)} bytes")
+                logger.info(f"🔊 ElevenLabs TTS 合成完成: {synth_time:.0f} ms, {len(audio_data)} bytes")
             
             if audio_data is None:
                 logger.error("TTS 合成失败")
                 return
             
-            # 检查是否被打断
             if self._interrupt_event.is_set():
                 logger.debug("TTS 被打断，跳过播放")
                 return
@@ -333,7 +303,7 @@ class TTSPlayer:
             # 播放
             await self._play_audio(temp_file)
             
-            # 清理临时文件
+            # 清理
             try:
                 os.remove(temp_file)
             except:
@@ -343,23 +313,15 @@ class TTSPlayer:
             self._playing = False
     
     async def _play_audio(self, audio_file: str):
-        """
-        播放音频文件
-        
-        Args:
-            audio_file: 音频文件路径
-        """
+        """播放音频文件"""
         try:
-            # 使用 subprocess 播放，同时监听打断事件
             proc = await asyncio.create_subprocess_exec(
                 self.player_cmd, audio_file,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
             
-            # 等待播放完成或被打断
             while True:
-                # 检查是否被打断
                 if self._interrupt_event.is_set():
                     proc.terminate()
                     try:
@@ -369,11 +331,10 @@ class TTSPlayer:
                     logger.debug("播放被打断")
                     return
                 
-                # 检查播放是否结束
                 if proc.returncode is not None:
                     break
                 
-                await asyncio.sleep(0.05)  # 50ms 检查一次
+                await asyncio.sleep(0.05)
             
             if proc.returncode == 0:
                 logger.debug("播放完成")
@@ -382,19 +343,3 @@ class TTSPlayer:
                 
         except Exception as e:
             logger.error(f"播放音频失败: {e}")
-
-
-def detect_player() -> str:
-    """检测可用的播放器"""
-    import shutil
-    
-    players = ["afplay", "mpg123", "mpg321", "cvlc", "ffplay"]
-    
-    for player in players:
-        if shutil.which(player):
-            logger.info(f"检测到播放器: {player}")
-            return player
-    
-    # 默认返回 afplay（macOS）
-    logger.warning("未检测到播放器，默认使用 afplay")
-    return "afplay"

@@ -22,7 +22,7 @@ def test_imports():
         from config import config
         from camera import capture_frame, correct_perspective
         from ocr.engine import extract_text
-        from agent.kimi_client import KimiClient
+        from agent.ai_client import AIClient
         from agent.memory import Memory
         from agent.tools import ToolRegistry
         from session.models import ReadingSession
@@ -51,7 +51,8 @@ def test_config():
     missing = config.validate()
     if missing:
         logger.warning(f"⚠ 缺少配置项: {missing}")
-        logger.info("提示: 运行 python setup.py 生成配置文件")
+        logger.info(f"提示: AI 提供商: {config.AI_PROVIDER}")
+        logger.info(f"提示: 当前模型: {config.CURRENT_MODEL}")
     else:
         logger.info("✓ 配置完整")
     
