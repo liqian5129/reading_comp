@@ -318,8 +318,26 @@ class PrewarmedASR:
                 asr = AliyunStreamASR(self._app_key, self._token, self._url)
                 asr.start(on_result=self._proxy)
 
-                # 等待最多 0.5s，检测是否立即收到错误（如 TOO_MANY_REQUESTS）
-                # TOO_MANY_REQUESTS 等网关拒绝通常在 <100ms 内返回，0.5s 足够
+                # 等待连接就绪（_connected 被设置）或失败（_closed 被设置）
+                # 最多等 5 秒，网络正常情况下应该很快
+                ready = asr._connected.wait(timeout=5.0)
+                if not ready:
+                    # 连接未就绪，检查是否已失败
+                    if asr._closed.is_set():
+                        logger.warning(
+                            f"⚠️ ASR 预热连接建立失败，{retry_delay:.0f}s 后重试"
+                            f" ({attempt + 1}/{max_retries})..."
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ ASR 预热连接超时，{retry_delay:.0f}s 后重试"
+                            f" ({attempt + 1}/{max_retries})..."
+                        )
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                    continue
+
+                # 连接已就绪，再等待一小段时间确认没有立即断开
                 connection_failed = asr._closed.wait(timeout=0.5)
                 if connection_failed:
                     logger.warning(
@@ -356,19 +374,36 @@ class PrewarmedASR:
         logger.error("❌ ASR 预热彻底失败（已重试 3 次），请检查网络或 API 配额")
         with self._pool_lock:
             self._preparing = False
+            self._standby_ready.clear()
 
     def _refresh_standby(self):
         """standby 即将到期时主动关闭并重建，保持随时可用。"""
         with self._pool_lock:
+            # 如果正在准备中或已被激活，不要重复刷新
+            if self._preparing:
+                logger.debug("ASR 已在准备中，跳过刷新")
+                return
             if self._standby is None or not self._standby_ready.is_set():
                 return  # 已被激活或已在重建中
             old = self._standby
             self._standby = None
             self._standby_ready.clear()
-            self._preparing = False
+            self._preparing = True  # 标记为准备中，防止并发
+        
         logger.info("🔄 ASR standby 即将到期，主动刷新中...")
-        threading.Thread(target=lambda: old.stop(timeout=2.0), daemon=True).start()
-        self.prepare()
+        
+        # 先等待旧连接完全关闭
+        def close_and_prepare():
+            try:
+                old.stop(timeout=3.0)
+            except Exception as e:
+                logger.warning(f"刷新时关闭旧连接出错: {e}")
+            finally:
+                with self._pool_lock:
+                    self._preparing = False  # 重置状态
+                self.prepare()
+        
+        threading.Thread(target=close_and_prepare, daemon=True).start()
 
     # ------------------------------------------------------------------
     # 录音接口
@@ -407,21 +442,31 @@ class PrewarmedASR:
     def _background_activate(self):
         """后台线程：等待 standby 就绪并激活；支持 stop() 提前取消。"""
         try:
-            # 若 standby 已过期，先关闭旧连接再重新预热
-            if self._standby_ready.is_set():
+            # 检查是否正在准备中
+            with self._pool_lock:
+                is_preparing = self._preparing
+            
+            # 若 standby 已过期或不存在，且不在准备中，则重新预热
+            if not self._standby_ready.is_set() and not is_preparing:
+                # 先关闭可能存在的旧连接
                 with self._pool_lock:
                     old = self._standby
                     self._standby = None
                     self._standby_ready.clear()
                 if old:
                     threading.Thread(
-                        target=lambda: old.stop(timeout=2.0), daemon=True
+                        target=lambda: old.stop(timeout=3.0), daemon=True
                     ).start()
+                self.prepare()
+            elif is_preparing:
+                logger.info("ASR 准备中，等待完成...")
 
-            self.prepare()
-
+            # 等待 standby 就绪（最多 20 秒）
             if not self._standby_ready.wait(timeout=20.0):
                 logger.error("❌ ASR 后台激活超时（20s），本次录音无识别")
+                # 重置准备状态，允许下次重试
+                with self._pool_lock:
+                    self._preparing = False
                 return
 
             # stop() 已在激活完成前被调用 → 保留 standby 供下次使用，不激活
@@ -450,6 +495,9 @@ class PrewarmedASR:
 
         except Exception as e:
             logger.error(f"❌ ASR 后台激活失败: {e}")
+            # 出错时重置准备状态
+            with self._pool_lock:
+                self._preparing = False
 
     def send_audio(self, pcm_data: bytes):
         if self._active:

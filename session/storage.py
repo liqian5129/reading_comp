@@ -18,9 +18,10 @@ class Storage:
     """
     SQLite 异步存储
     """
-    
-    def __init__(self, db_path: Path):
+
+    def __init__(self, db_path: Path, notes_dir: Optional[Path] = None):
         self.db_path = db_path
+        self.notes_dir = notes_dir
         self._conn: Optional[aiosqlite.Connection] = None
         
     async def initialize(self):
@@ -51,7 +52,7 @@ class Storage:
                 total_pages INTEGER DEFAULT 0,
                 total_snapshots INTEGER DEFAULT 0
             );
-            
+
             CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -62,21 +63,34 @@ class Storage:
                 dwell_ms INTEGER DEFAULT 0,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             );
-            
+
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
+                session_id TEXT DEFAULT '',
                 ts INTEGER NOT NULL,
                 content TEXT NOT NULL,
-                page_ocr_context TEXT DEFAULT '',
-                FOREIGN KEY (session_id) REFERENCES sessions(id)
+                book_name TEXT DEFAULT '',
+                tags TEXT DEFAULT '[]',
+                page_ocr_context TEXT DEFAULT ''
             );
-            
+
             CREATE INDEX IF NOT EXISTS idx_snapshots_session ON snapshots(session_id);
             CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_at);
         """)
         await self._conn.commit()
+
+        # 迁移：为旧版本数据库补充新列
+        for col, definition in [
+            ("book_name", "TEXT DEFAULT ''"),
+            ("tags", "TEXT DEFAULT '[]'"),
+        ]:
+            try:
+                await self._conn.execute(f"ALTER TABLE notes ADD COLUMN {col} {definition}")
+                await self._conn.commit()
+                logger.info(f"notes 表已迁移：添加列 {col}")
+            except Exception:
+                pass  # 列已存在
     
     # ==================== Sessions ====================
     
@@ -231,14 +245,40 @@ class Storage:
     # ==================== Notes ====================
     
     async def add_note(self, note: Note) -> int:
-        """添加笔记，返回 ID"""
+        """添加笔记，返回 ID，并同步写 JSON 文件"""
         cursor = await self._conn.execute(
-            """INSERT INTO notes (session_id, ts, content, page_ocr_context)
-               VALUES (?, ?, ?, ?)""",
-            (note.session_id, note.ts, note.content, note.page_ocr_context)
+            """INSERT INTO notes (session_id, ts, content, book_name, tags, page_ocr_context)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                note.session_id,
+                note.ts,
+                note.content,
+                note.book_name,
+                json.dumps(note.tags, ensure_ascii=False),
+                note.page_ocr_context,
+            )
         )
         await self._conn.commit()
-        return cursor.lastrowid
+        note_id = cursor.lastrowid
+        note.id = note_id
+
+        # 同步写 JSON 文件
+        if self.notes_dir:
+            self._save_note_json(note)
+
+        return note_id
+
+    def _save_note_json(self, note: Note):
+        """将笔记写入 JSON 文件，文件名使用 UTC 时间戳"""
+        try:
+            self.notes_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{note.utc_filename}.json"
+            filepath = self.notes_dir / filename
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(note.to_json_dict(), f, ensure_ascii=False, indent=2)
+            logger.info(f"笔记 JSON 已写入: {filepath}")
+        except Exception as e:
+            logger.error(f"写入笔记 JSON 失败: {e}")
     
     async def get_session_notes(self, session_id: str, limit: int = 100) -> List[Note]:
         """获取会话的笔记"""
@@ -248,35 +288,51 @@ class Storage:
             (session_id, limit)
         ) as cursor:
             async for row in cursor:
-                notes.append(Note(
-                    id=row['id'],
-                    session_id=row['session_id'],
-                    ts=row['ts'],
-                    content=row['content'],
-                    page_ocr_context=row['page_ocr_context']
-                ))
+                notes.append(self._row_to_note(row))
         return notes
-    
+
     async def get_today_notes(self, limit: int = 100) -> List[Note]:
-        """获取今日笔记"""
+        """获取今日笔记（按 notes.ts 判断，不依赖 session）"""
         today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
         notes = []
         async with self._conn.execute(
-            """SELECT n.* FROM notes n
-               JOIN sessions s ON n.session_id = s.id
-               WHERE s.start_at >= ?
-               ORDER BY n.ts ASC LIMIT ?""",
+            "SELECT * FROM notes WHERE ts >= ? ORDER BY ts ASC LIMIT ?",
             (today_start, limit)
         ) as cursor:
             async for row in cursor:
-                notes.append(Note(
-                    id=row['id'],
-                    session_id=row['session_id'],
-                    ts=row['ts'],
-                    content=row['content'],
-                    page_ocr_context=row['page_ocr_context']
-                ))
+                notes.append(self._row_to_note(row))
         return notes
+
+    async def get_recent_notes(self, days: int = 7, limit: int = 200) -> List[Note]:
+        """获取最近 N 天的笔记（不依赖 session，按 notes.ts 判断）"""
+        since_ts = int((datetime.now() - timedelta(days=days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp() * 1000)
+        notes = []
+        async with self._conn.execute(
+            "SELECT * FROM notes WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+            (since_ts, limit)
+        ) as cursor:
+            async for row in cursor:
+                notes.append(self._row_to_note(row))
+        return notes
+
+    @staticmethod
+    def _row_to_note(row) -> Note:
+        tags_raw = row['tags'] if row['tags'] else '[]'
+        try:
+            tags = json.loads(tags_raw)
+        except Exception:
+            tags = []
+        return Note(
+            id=row['id'],
+            session_id=row['session_id'] or "",
+            ts=row['ts'],
+            content=row['content'],
+            book_name=row['book_name'] if row['book_name'] else "",
+            tags=tags,
+            page_ocr_context=row['page_ocr_context'] if row['page_ocr_context'] else "",
+        )
     
     # ==================== Statistics ====================
     

@@ -137,32 +137,43 @@ class SessionManager:
         logger.debug(f"快照已添加: {snapshot_id}")
         return snapshot
     
-    async def add_note(self, content: str, page_context: str = "") -> Note:
+    async def add_note(
+        self,
+        content: str,
+        page_context: str = "",
+        book_name: str = "",
+        tags: list = None,
+    ) -> Note:
         """
-        添加笔记
-        
+        添加笔记（无需活跃会话）
+
         Args:
             content: 笔记内容
             page_context: 当前页面 OCR 上下文
-            
+            book_name: 书名（优先用传入值，否则取当前会话书名）
+            tags: 用户自定义标签列表
+
         Returns:
             创建的笔记
         """
-        if not self._current_session:
-            raise RuntimeError("没有活动会话")
-        
+        # 书名：优先用调用方传入，否则取当前会话书名
+        if not book_name and self._current_session:
+            book_name = self._current_session.book_name
+
         note = Note(
             id=0,
-            session_id=self._current_session.id,
-            ts=int(datetime.now().timestamp() * 1000),
+            session_id=self._current_session.id if self._current_session else "",
+            ts=int(datetime.utcnow().timestamp() * 1000),
             content=content,
-            page_ocr_context=page_context
+            book_name=book_name,
+            tags=tags or [],
+            page_ocr_context=page_context,
         )
-        
+
         note_id = await self.storage.add_note(note)
         note.id = note_id
-        
-        logger.info(f"笔记已添加: {note_id}")
+
+        logger.info(f"笔记已添加: {note_id}, 书名: {book_name or '(无)'}, 标签: {note.tags}")
         return note
     
     async def get_current_page_context(self) -> str:
