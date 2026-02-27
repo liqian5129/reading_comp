@@ -205,6 +205,14 @@ class SessionManager:
             return []
         return await self.storage.get_session_notes(sid)
     
+    async def get_recent_notes(self, days: int = 7, limit: int = 200) -> List[Note]:
+        """获取最近 N 天的笔记（不依赖 session）"""
+        return await self.storage.get_recent_notes(days=days, limit=limit)
+
+    async def get_today_notes(self, limit: int = 100) -> List[Note]:
+        """获取今日笔记"""
+        return await self.storage.get_today_notes(limit=limit)
+
     async def get_today_summary(self):
         """获取今日摘要"""
         return await self.storage.get_daily_summary()
