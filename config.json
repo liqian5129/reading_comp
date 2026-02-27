@@ -63,7 +63,7 @@
   
   "feishu": {
     "_comment": "飞书配置（可选）- https://open.feishu.cn/app/",
-    "enabled": false,
+    "enabled": true,
     "app_id": "cli_a92abf968478dcc6",
     "app_secret": "jpKOB7cK8QfuyRP0BIA1VgZQBaXcReC0",
     "encrypt_key": "",   "verification_token": ""

@@ -156,19 +156,19 @@ class VoiceRecorder:
             
             if text.strip():
                 segment = VoiceSegment(text=text.strip(), duration_ms=duration * 1000)
-                
+
                 if self.on_segment:
                     try:
                         self.on_segment(segment)
                     except Exception as e:
                         logger.error(f"on_segment 回调错误: {e}")
-                
+
                 if self.on_text:
                     try:
                         # 如果有事件循环，使用 run_coroutine_threadsafe
                         if self.loop and asyncio.iscoroutinefunction(self.on_text):
                             asyncio.run_coroutine_threadsafe(
-                                self.on_text(text.strip()), 
+                                self.on_text(text.strip()),
                                 self.loop
                             )
                         else:
@@ -176,7 +176,13 @@ class VoiceRecorder:
                     except Exception as e:
                         logger.error(f"on_text 回调错误: {e}")
             else:
-                logger.warning("🤷 未识别到语音")
+                asr_health = self.asr.health() if hasattr(self.asr, "health") else "ready"
+                if asr_health == "unavailable":
+                    logger.warning("⚠️ 未识别到语音（ASR 服务不可用，等待自动恢复）")
+                elif asr_health == "initializing":
+                    logger.warning("⚠️ 未识别到语音（ASR 连接尚未就绪，请稍后再试）")
+                else:
+                    logger.warning("🤷 未识别到语音")
             
             self.state = RecordingState.IDLE
             logger.info("=" * 50)
