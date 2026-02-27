@@ -264,10 +264,14 @@ class ToolExecutor:
 
         book_hint = f"《{note.book_name}》" if note.book_name else ""
         tag_hint = f"，标签：{', '.join(note.tags)}" if note.tags else ""
+        # 统计该书的笔记数（而非全局自增 ID）
+        book_note_count = await self.session_manager.count_notes_by_book(note.book_name)
+        count_scope = f"{book_hint}第 {book_note_count} 条" if note.book_name else f"第 {book_note_count} 条"
         return {
             "success": True,
-            "message": f"笔记已记录（第 {note.id} 条）{book_hint}{tag_hint}",
+            "message": f"笔记已记录（{count_scope}）{tag_hint}",
             "note_id": note.id,
+            "book_note_count": book_note_count,
             "utc_datetime": note.to_json_dict()["utc_datetime"],
         }
     
