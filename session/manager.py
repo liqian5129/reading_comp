@@ -205,6 +205,10 @@ class SessionManager:
             return []
         return await self.storage.get_session_notes(sid)
     
+    async def count_notes_by_book(self, book_name: str) -> int:
+        """统计指定书名的笔记数量"""
+        return await self.storage.count_notes_by_book(book_name)
+
     async def get_recent_notes(self, days: int = 7, limit: int = 200) -> List[Note]:
         """获取最近 N 天的笔记（不依赖 session）"""
         return await self.storage.get_recent_notes(days=days, limit=limit)

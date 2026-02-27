@@ -317,6 +317,21 @@ class Storage:
                 notes.append(self._row_to_note(row))
         return notes
 
+    async def count_notes_by_book(self, book_name: str) -> int:
+        """统计指定书名的笔记数量"""
+        if book_name:
+            async with self._conn.execute(
+                "SELECT COUNT(*) as count FROM notes WHERE book_name = ?", (book_name,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row['count'] if row else 0
+        else:
+            async with self._conn.execute(
+                "SELECT COUNT(*) as count FROM notes"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row['count'] if row else 0
+
     @staticmethod
     def _row_to_note(row) -> Note:
         tags_raw = row['tags'] if row['tags'] else '[]'
