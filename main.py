@@ -143,7 +143,8 @@ class ReadingCompanion:
                 app_secret=config.FEISHU_APP_SECRET,
                 encrypt_key=config.FEISHU_ENCRYPT_KEY,
                 verification_token=config.FEISHU_VERIFICATION_TOKEN,
-                message_handler=self._handle_feishu_message
+                message_handler=self._handle_feishu_message,
+                loop=self.loop
             )
             self.summary_pusher = SummaryPusher(self.feishu_bot)
             self.feishu_bot.start()
@@ -311,11 +312,13 @@ class ReadingCompanion:
             logger.error(f"处理消息失败: {e}")
             if channel == "voice":
                 await self.tts_player.speak("抱歉，处理时出错了", interrupt=True)
-    
+            return ""
+
+        return reply_text
+
     async def _handle_feishu_message(self, text: str, channel: str = "feishu") -> str:
         """处理飞书消息"""
-        await self._process_user_message(text, channel="feishu")
-        return ""
+        return await self._process_user_message(text, channel="feishu")
     
     def _on_page_turn(self, page_count: int):
         """翻页回调"""

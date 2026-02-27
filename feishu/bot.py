@@ -24,51 +24,52 @@ class FeishuBot:
     - 回复文本或卡片消息
     """
     
-    def __init__(self, app_id: str, app_secret: str, 
+    def __init__(self, app_id: str, app_secret: str,
                  encrypt_key: str = "",
                  verification_token: str = "",
-                 message_handler: Optional[Callable] = None):
+                 message_handler: Optional[Callable] = None,
+                 loop=None):
         self.app_id = app_id
         self.app_secret = app_secret
         self.encrypt_key = encrypt_key
         self.verification_token = verification_token
         self.message_handler = message_handler
+        self._loop = loop  # 主事件循环，用于跨线程派发协程
         
         # 飞书客户端
         self.client = lark.Client.builder() \
             .app_id(app_id) \
             .app_secret(app_secret) \
-            .log_level(lark.LogLevel.WARN) \
+            .log_level(lark.LogLevel.WARNING) \
             .build()
         
         # WS 客户端
         self.ws_client: Optional[lark.ws.Client] = None
         self._running = False
         
-    def _handle_p2_message(self, data: Dict) -> None:
-        """处理收到的消息"""
+    def _handle_p2_message(self, data) -> None:
+        """处理收到的消息（data 为 P2ImMessageReceiveV1 对象）"""
         try:
-            event = data.get("event", {})
-            message = event.get("message", {})
-            
-            msg_type = message.get("message_type")
-            content = message.get("content", "{}")
-            chat_id = message.get("chat_id")
-            msg_id = message.get("message_id")
-            
+            message = data.event.message
+
+            msg_type = message.message_type
+            content = message.content or "{}"
+            chat_id = message.chat_id
+            msg_id = message.message_id
+
             # 只处理文本消息
             if msg_type == "text":
                 content_obj = json.loads(content)
                 text = content_obj.get("text", "").strip()
-                
+
                 logger.info(f"收到飞书消息: {text}")
-                
-                # 调用处理器
-                if self.message_handler:
-                    asyncio.create_task(
-                        self._handle_message_async(chat_id, msg_id, text)
+
+                if self.message_handler and self._loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_message_async(chat_id, msg_id, text),
+                        self._loop
                     )
-                    
+
         except Exception as e:
             logger.error(f"处理飞书消息失败: {e}")
     
@@ -98,11 +99,8 @@ class FeishuBot:
             self.ws_client = lark.ws.Client(
                 self.app_id,
                 self.app_secret,
-                lark.ws.SocketModeOptions(
-                    event_handler=handler,
-                    ping_interval=30
-                ),
-                lark.LogLevel.INFO
+                log_level=lark.LogLevel.INFO,
+                event_handler=handler,
             )
             
             self._running = True
@@ -130,28 +128,32 @@ class FeishuBot:
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type("chat_id") \
-                .receive_id(chat_id) \
-                .msg_type("text") \
-                .content(json.dumps({"text": text})) \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("text")
+                    .content(json.dumps({"text": text}))
+                    .build()
+                ) \
                 .build()
-            
+
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.client.im.v1.message.create(request)
             )
-            
+
             if response.success():
                 logger.debug(f"消息发送成功: {chat_id}")
             else:
                 logger.error(f"消息发送失败: {response.code} - {response.msg}")
-                
+
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
-    
+
     async def send_interactive_card(self, chat_id: str, card: Dict):
         """
         发送交互卡片
-        
+
         Args:
             chat_id: 会话 ID
             card: 卡片内容
@@ -159,28 +161,32 @@ class FeishuBot:
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type("chat_id") \
-                .receive_id(chat_id) \
-                .msg_type("interactive") \
-                .content(json.dumps(card)) \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(json.dumps(card))
+                    .build()
+                ) \
                 .build()
-            
+
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.client.im.v1.message.create(request)
             )
-            
+
             if response.success():
                 logger.debug(f"卡片发送成功: {chat_id}")
             else:
                 logger.error(f"卡片发送失败: {response.code} - {response.msg}")
-                
+
         except Exception as e:
             logger.error(f"发送卡片失败: {e}")
-    
+
     async def send_to_user(self, user_id: str, text: str):
         """
         给用户发送消息（Open ID）
-        
+
         Args:
             user_id: 用户 Open ID
             text: 消息内容
@@ -188,20 +194,24 @@ class FeishuBot:
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type("open_id") \
-                .receive_id(user_id) \
-                .msg_type("text") \
-                .content(json.dumps({"text": text})) \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(user_id)
+                    .msg_type("text")
+                    .content(json.dumps({"text": text}))
+                    .build()
+                ) \
                 .build()
-            
+
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.client.im.v1.message.create(request)
             )
-            
+
             if response.success():
                 logger.debug(f"消息发送给用户成功: {user_id}")
             else:
                 logger.error(f"消息发送失败: {response.code} - {response.msg}")
-                
+
         except Exception as e:
             logger.error(f"发送消息给用户失败: {e}")

@@ -295,6 +295,11 @@ class PrewarmedASR:
         # 主动刷新定时器（standby 到期前 5s 自动重建）
         self._refresh_timer: Optional[threading.Timer] = None
 
+        # 自愈定时器（warmup 彻底失败后自动重试）
+        self._recovery_timer: Optional[threading.Timer] = None
+        self._recovery_attempt: int = 0
+        _RECOVERY_DELAYS = [30, 60, 120]  # 指数退避延迟（秒）
+
     # ------------------------------------------------------------------
     # 预热
     # ------------------------------------------------------------------
@@ -353,6 +358,10 @@ class PrewarmedASR:
                     self._standby_created_at = time.time()
                     self._standby_ready.set()
                     self._preparing = False
+                    self._recovery_attempt = 0  # 连接成功，重置退避计数
+                if self._recovery_timer:
+                    self._recovery_timer.cancel()
+                    self._recovery_timer = None
 
                 # 在到期前 5s 主动刷新，避免用户按键时 standby 已过期
                 if self._refresh_timer:
@@ -382,11 +391,35 @@ class PrewarmedASR:
         with self._pool_lock:
             self._preparing = False
             self._standby_ready.clear()
+        self._schedule_recovery()
+
+    def _schedule_recovery(self):
+        """warmup 彻底失败后，按指数退避自动重试。"""
+        delays = [30, 60, 120]
+        delay = delays[min(self._recovery_attempt, len(delays) - 1)]
+        self._recovery_attempt += 1
+        logger.info(f"🔁 ASR 将在 {delay}s 后自动重试（第 {self._recovery_attempt} 次恢复尝试）")
+
+        def try_recover():
+            logger.info("🔄 ASR 自动恢复：开始重新建立连接...")
+            self.prepare()
+
+        t = threading.Timer(delay, try_recover)
+        t.daemon = True
+        t.start()
+        self._recovery_timer = t
 
     def _watch_standby_health(self, asr: 'AliyunStreamASR'):
         """监控 standby 连接健康状态，若服务端主动断开则触发重建。"""
-        # 等待 _closed 事件：若连接正常则直到定时刷新前不会触发
-        asr._closed.wait()
+        # 等待 _closed 事件；加 timeout 防止半开连接导致线程永久泄漏
+        closed = asr._closed.wait(timeout=60)
+        if not closed:
+            # 60s 内没有收到关闭事件，检查是否仍是当前 standby
+            # 如果还是 standby 说明可能是半开连接，主动触发重建
+            with self._pool_lock:
+                if self._standby is not asr or not self._standby_ready.is_set():
+                    return  # 已被激活或已被刷新，正常退出
+            logger.warning("⚠️ ASR standby 60s 无响应（疑似半开连接），主动触发重建...")
         with self._pool_lock:
             # 只处理仍是当前 standby 的情况（若已被激活或已被刷新则跳过）
             if self._standby is not asr:
@@ -396,7 +429,8 @@ class PrewarmedASR:
             # standby 意外死亡，清理并重建
             self._standby = None
             self._standby_ready.clear()
-        logger.warning("⚠️ ASR standby 连接意外断开，触发重建...")
+        if closed:
+            logger.warning("⚠️ ASR standby 连接意外断开，触发重建...")
         if self._refresh_timer:
             self._refresh_timer.cancel()
             self._refresh_timer = None
@@ -494,9 +528,8 @@ class PrewarmedASR:
             # 等待 standby 就绪（最多 20 秒）
             if not self._standby_ready.wait(timeout=20.0):
                 logger.error("❌ ASR 后台激活超时（20s），本次录音无识别")
-                # 重置准备状态，允许下次重试
-                with self._pool_lock:
-                    self._preparing = False
+                # 注意：不重置 _preparing，_do_prepare 线程可能仍在运行，
+                # 让它自己管理 _preparing 状态，避免启动重复的 prepare 线程
                 return
 
             # stop() 已在激活完成前被调用 → 保留 standby 供下次使用，不激活
@@ -563,6 +596,19 @@ class PrewarmedASR:
 
     def is_active(self) -> bool:
         return self._active is not None and self._active.is_active()
+
+    def health(self) -> str:
+        """
+        返回当前 ASR 健康状态：
+          'ready'        - standby 连接就绪，按键可立即识别
+          'initializing' - 正在建立连接
+          'unavailable'  - 连接失败，等待自动恢复
+        """
+        if self._standby_ready.is_set():
+            return "ready"
+        if self._preparing:
+            return "initializing"
+        return "unavailable"
 
 
 class MockASR:
