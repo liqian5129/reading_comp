@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import queue
+import time
 from typing import Callable, Optional
 from dataclasses import dataclass
 
@@ -48,9 +49,13 @@ class AliyunStreamASR:
         self._results: list[str] = []
         self._lock = threading.Lock()
         
+        # 调试统计
+        self._audio_bytes_sent = 0
+        self._audio_chunks_sent = 0
+        
     def _on_sentence_begin(self, message, *args):
         """一句话开始"""
-        logger.debug(f"ASR 句子开始")
+        logger.info(f"🎤 ASR: 句子开始")
         
     def _on_sentence_end(self, message, *args):
         """一句话结束（有结果）"""
@@ -64,6 +69,8 @@ class AliyunStreamASR:
             result = payload.get('result', '')
             confidence = payload.get('confidence', 1.0)
             
+            logger.info(f"📝 ASR 识别到: {result} (置信度: {confidence})")
+            
             if result:
                 with self._lock:
                     self._results.append(result)
@@ -74,24 +81,23 @@ class AliyunStreamASR:
                         is_final=False,
                         confidence=confidence
                     ))
-                logger.debug(f"ASR 结果: {result}")
                 
         except Exception as e:
             logger.error(f"处理 ASR 结果失败: {e}")
     
     def _on_completed(self, message, *args):
         """识别完成"""
-        logger.debug("ASR 识别完成")
+        logger.info(f"✅ ASR 识别完成: {message}")
         self._closed.set()
         
     def _on_error(self, message, *args):
         """识别错误"""
-        logger.error(f"ASR 错误: {message}")
+        logger.error(f"❌ ASR 错误: {message}")
         self._closed.set()
         
     def _on_close(self, *args):
         """连接关闭"""
-        logger.debug("ASR 连接关闭")
+        logger.info("🔌 ASR 连接关闭")
         self._closed.set()
         self._connected.clear()
 
@@ -109,6 +115,10 @@ class AliyunStreamASR:
         self._results = []
         self._connected.clear()
         self._closed.clear()
+        self._audio_bytes_sent = 0
+        self._audio_chunks_sent = 0
+        
+        logger.info(f"🔑 使用 AppKey: {self.app_key[:8]}... Token: {self.token[:8]}...")
         
         try:
             # 使用更简单的参数配置
@@ -123,6 +133,8 @@ class AliyunStreamASR:
                 on_close=self._on_close,
             )
             
+            logger.info("🚀 正在启动 ASR 连接...")
+            
             self.transcriber.start(
                 aformat="pcm",
                 sample_rate=16000,
@@ -132,10 +144,10 @@ class AliyunStreamASR:
             )
             
             self._connected.set()
-            logger.info("ASR 实时识别已启动")
+            logger.info("✅ ASR 实时识别已启动")
             
         except Exception as e:
-            logger.error(f"启动 ASR 失败: {e}")
+            logger.error(f"❌ 启动 ASR 失败: {e}")
             raise
         
     def send_audio(self, pcm_data: bytes):
@@ -148,34 +160,63 @@ class AliyunStreamASR:
         if self.transcriber and self._connected.is_set():
             try:
                 self.transcriber.send_audio(pcm_data)
+                self._audio_bytes_sent += len(pcm_data)
+                self._audio_chunks_sent += 1
+                
+                # 每 50 个包打印一次统计
+                if self._audio_chunks_sent % 50 == 0:
+                    logger.info(f"📊 ASR: 已发送 {self._audio_chunks_sent} 包, {self._audio_bytes_sent} 字节")
+                    
             except Exception as e:
                 logger.error(f"发送音频数据失败: {e}")
+        else:
+            logger.debug(f"⚠️ ASR 未就绪，跳过音频发送 (connected={self._connected.is_set()})")
     
-    def stop(self, timeout: float = 5.0) -> str:
+    def stop(self, timeout: float = 3.0) -> str:
         """
         停止识别，返回完整结果
         
         Args:
-            timeout: 等待完成的超时时间
+            timeout: 等待完成的超时时间（秒）
             
         Returns:
             完整的识别文本
         """
+        logger.info(f"🛑 停止 ASR: 共发送 {self._audio_chunks_sent} 包, {self._audio_bytes_sent} 字节")
+        
         if self.transcriber:
-            try:
-                self.transcriber.stop()
-                # 等待关闭事件
-                self._closed.wait(timeout=timeout)
-            except Exception as e:
-                logger.error(f"停止 ASR 失败: {e}")
-            finally:
-                self.transcriber = None
-                self._connected.clear()
+            # 在后台线程执行 stop，避免阻塞
+            stop_result = {"done": False, "error": None}
+            
+            def do_stop():
+                try:
+                    logger.info("⏳ 正在调用 ASR stop()...")
+                    self.transcriber.stop()
+                    stop_result["done"] = True
+                    logger.info("✅ ASR stop() 完成")
+                except Exception as e:
+                    stop_result["error"] = str(e)
+                    logger.error(f"ASR stop 出错: {e}")
+            
+            # 启动后台线程执行 stop
+            stop_thread = threading.Thread(target=do_stop, daemon=True)
+            stop_thread.start()
+            
+            # 等待 stop 完成或超时
+            stop_thread.join(timeout=timeout)
+            
+            if not stop_result["done"]:
+                logger.warning(f"⚠️ ASR stop 超时（{timeout}s），强制结束")
+            
+            # 强制清理
+            self.transcriber = None
+            self._connected.clear()
+            self._closed.set()
         
         with self._lock:
             final_text = ''.join(self._results)
         
-        logger.info(f"ASR 最终识别结果: {final_text}")
+        logger.info(f"📄 ASR 最终识别结果: '{final_text}' (共 {len(self._results)} 句)")
         return final_text
     
     def is_active(self) -> bool:

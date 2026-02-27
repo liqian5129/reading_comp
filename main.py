@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
 """
 AI 读书搭子 - 主程序
-
-核心功能：
-1. 语音输入（按住右 Alt 说话）
-2. AI 对话（Kimi 2.5 + 工具调用）
-3. TTS 播报
-4. 自动扫描书页（2秒间隔，OCR 识别）
-5. 飞书集成（Bot + 推送）
-
-启动：
-    python main.py
-
-依赖：
-    - 阿里云 NLS（ASR + TTS）
-    - Moonshot Kimi（AI）
-    - 飞书开放平台（可选）
 """
 import asyncio
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -38,13 +24,12 @@ logger = logging.getLogger("main")
 from config import config, Config
 from session.storage import Storage
 from session.manager import SessionManager
-from agent.kimi_client import KimiClient
+from agent.ai_client import AIClient
 from agent.memory import Memory
 from agent.tools import ToolRegistry, ToolExecutor
 from scanner.auto_scanner import AutoScanner
 from voice.asr import AliyunStreamASR, create_asr
 from voice.recorder import VoiceRecorder
-from tts.speaker import AliyunTTS, TTSPlayer, detect_player
 from feishu.bot import FeishuBot
 from feishu.push import SummaryPusher
 
@@ -52,7 +37,6 @@ from feishu.push import SummaryPusher
 class ReadingCompanion:
     """
     AI 读书搭子主类
-    整合所有模块，协调工作
     """
     
     def __init__(self):
@@ -72,15 +56,14 @@ class ReadingCompanion:
         # 初始化各模块
         self.storage: Optional[Storage] = None
         self.session_manager: Optional[SessionManager] = None
-        self.llm: Optional[KimiClient] = None
+        self.llm: Optional[AIClient] = None
         self.memory: Optional[Memory] = None
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_executor: Optional[ToolExecutor] = None
         self.scanner: Optional[AutoScanner] = None
         self.asr: Optional[AliyunStreamASR] = None
         self.recorder: Optional[VoiceRecorder] = None
-        self.tts: Optional[AliyunTTS] = None
-        self.tts_player: Optional[TTSPlayer] = None
+        self.tts_player = None
         self.feishu_bot: Optional[FeishuBot] = None
         self.summary_pusher: Optional[SummaryPusher] = None
         
@@ -101,12 +84,23 @@ class ReadingCompanion:
         # 2. 会话管理
         self.session_manager = SessionManager(self.storage)
         
-        # 3. AI 相关 (Kimi)
-        self.llm = KimiClient(
-            api_key=config.KIMI_API_KEY,
-            model=config.KIMI_MODEL,
-            base_url=config.KIMI_BASE_URL
-        )
+        # 3. AI 客户端（支持 Kimi 或豆包）
+        if config.AI_PROVIDER == "kimi":
+            self.llm = AIClient(
+                provider="kimi",
+                api_key=config.KIMI_API_KEY,
+                model=config.KIMI_MODEL,
+                base_url=config.KIMI_BASE_URL,
+                enable_thinking=config.KIMI_ENABLE_THINKING
+            )
+        else:  # doubao
+            self.llm = AIClient(
+                provider="doubao",
+                api_key=config.DOUBAO_API_KEY,
+                model=config.DOUBAO_MODEL,
+                base_url=config.DOUBAO_BASE_URL
+            )
+        
         self.memory = Memory(config.PERSONA_FILE)
         self.tool_registry = ToolRegistry()
         
@@ -126,17 +120,16 @@ class ReadingCompanion:
         self.asr = create_asr(config.ALIYUN_NLS_APP_KEY, config.ALIYUN_NLS_TOKEN)
         self.recorder = VoiceRecorder(
             self.asr,
-            loop=self.loop,  # 传入事件循环，用于跨线程调度
+            loop=self.loop,
             sample_rate=16000,
             channels=1,
             min_duration=0.3
         )
         self.recorder.on_text = self._on_voice_text
         
-        # 7. TTS
-        self.tts = AliyunTTS(config.ALIYUN_NLS_APP_KEY, config.ALIYUN_NLS_TOKEN)
-        player_cmd = config.TTS_PLAYER_CMD or detect_player()
-        self.tts_player = TTSPlayer(self.tts, player_cmd=player_cmd)
+        # 7. TTS（支持阿里云或 ElevenLabs）
+        from tts import create_tts_player
+        self.tts_player = create_tts_player(config)
         await self.tts_player.start()
         
         # 8. 飞书 Bot（可选）
@@ -160,23 +153,14 @@ class ReadingCompanion:
         
         self._running = False
         
-        # 停止录音
         if self.recorder:
             self.recorder.stop()
-        
-        # 停止扫描
         if self.scanner:
             await self.scanner.stop()
-        
-        # 停止 TTS
         if self.tts_player:
             await self.tts_player.stop()
-        
-        # 停止飞书
         if self.feishu_bot:
             self.feishu_bot.stop()
-        
-        # 关闭数据库
         if self.storage:
             await self.storage.close()
         
@@ -191,17 +175,13 @@ class ReadingCompanion:
         # 启动录音监听
         self.recorder.start()
         
-        logger.info("=" * 50)
+        logger.info("=" * 60)
         logger.info("🎉 AI 读书搭子已启动！")
-        logger.info(f"🤖 AI 模型: {config.KIMI_MODEL}")
+        logger.info(f"🤖 AI 提供商: {config.AI_PROVIDER}")
+        logger.info(f"🤖 AI 模型: {config.CURRENT_MODEL}")
+        logger.info(f"🔊 TTS 提供商: {config.TTS_PROVIDER}")
         logger.info("按住 【右 Alt 键】说话与 AI 交流")
-        logger.info("指令：")
-        logger.info("  - \"开始读书\" - 开始阅读会话")
-        logger.info("  - \"看看这页\" - 拍摄当前页面")
-        logger.info("  - \"记录一下...\" - 添加笔记")
-        logger.info("  - \"读完了\" - 结束会话并推送总结")
-        logger.info("  - \"今天读了什么\" - 查询历史")
-        logger.info("=" * 50)
+        logger.info("=" * 60)
         
         # 保持运行
         try:
@@ -212,8 +192,6 @@ class ReadingCompanion:
         
         await self.shutdown()
     
-    # ==================== 回调处理 ====================
-    
     async def _on_voice_text(self, text: str):
         """处理语音识别结果（异步版本）"""
         logger.info(f"👤 用户: {text}")
@@ -221,17 +199,23 @@ class ReadingCompanion:
     
     async def _process_user_message(self, text: str, channel: str = "voice"):
         """
-        处理用户消息
-        
-        Args:
-            text: 用户输入
-            channel: 渠道（voice / feishu）
+        处理用户消息 - 带完整链路计时
         """
+        logger.info("=" * 60)
+        logger.info("🚀 开始处理用户消息")
+        logger.info(f"   输入: {text[:50]}...")
+        logger.info("=" * 60)
+        
+        # 整体链路计时
+        start_time = time.time()
+        
         try:
             # 1. 调用 LLM
+            logger.info("⏳ 1. 准备调用 LLM...")
             system_prompt = self.memory.build_system_prompt()
             history = self.memory.get_history()
             tools = self.tool_registry.get_tools()
+            logger.info(f"   历史消息数: {len(history)}, 工具数: {len(tools)}")
             
             response = await self.llm.chat(
                 user_message=text,
@@ -240,12 +224,12 @@ class ReadingCompanion:
                 tools=tools
             )
             
+            llm_done_time = time.time()
+            
             # 2. 处理工具调用
             if response.tool_calls:
-                # 先记录 AI 的思考过程
                 self.memory.add_message("assistant", f"[调用工具: {', '.join(tc['name'] for tc in response.tool_calls)}]")
                 
-                # 执行工具
                 tool_results = []
                 for tool_call in response.tool_calls:
                     result = await self.tool_executor.execute(
@@ -257,7 +241,6 @@ class ReadingCompanion:
                         "content": str(result)
                     })
                 
-                # 将工具结果发送给 LLM
                 final_response = await self.llm.chat_with_tool_result(
                     user_message=text,
                     tool_results=tool_results,
@@ -269,20 +252,57 @@ class ReadingCompanion:
             else:
                 reply_text = response.text
             
+            tool_done_time = time.time()
+            
+            # 打印 AI 回复内容
+            logger.info("=" * 60)
+            logger.info("🤖 AI 回复内容:")
+            logger.info("-" * 60)
+            # 多行显示，每行最多 58 字符
+            for line in reply_text.split('\n'):
+                while line:
+                    chunk = line[:58]
+                    line = line[58:]
+                    logger.info(f"  {chunk}")
+            logger.info("-" * 60)
+            logger.info(f"📊 回复长度: {len(reply_text)} 字符, {len(reply_text.split())} 词")
+            logger.info("=" * 60)
+            
             # 3. 记录对话历史
             self.memory.add_message("user", text)
             self.memory.add_message("assistant", reply_text)
             
-            # 4. 输出回复
-            logger.info(f"🤖 AI: {reply_text}")
-            
-            # 5. 语音播报（如果是语音渠道）
-            if channel == "voice":
+            # 4. 语音播报（带 TTS 时间计算）
+            if channel == "voice" and reply_text:
+                logger.info("🔊 开始 TTS 转换...")
                 await self.tts_player.speak(reply_text, interrupt=True)
+                # 等待合成完成（不等播放），获取真实合成耗时
+                if hasattr(self.tts_player, 'wait_synthesized'):
+                    tts_time = await self.tts_player.wait_synthesized(timeout=30.0)
+                else:
+                    tts_time = 0
+                logger.info(f"✅ TTS 合成完成，耗时: {tts_time:.0f} ms")
+            else:
+                tts_time = 0
             
-            # 6. 检查是否需要推送飞书（会话结束）
-            if "read" in text or "结束" in text:
-                await self._check_and_push_feishu()
+            end_time = time.time()
+            
+            # 打印完整链路分析
+            total_time = (end_time - start_time) * 1000
+            llm_time = (llm_done_time - start_time) * 1000
+            tool_time = (tool_done_time - llm_done_time) * 1000 if response.tool_calls else 0
+            
+            logger.info("╔" + "=" * 58 + "╗")
+            logger.info("║" + " 📊 完整链路耗时分析 ".center(54) + "║")
+            logger.info("╠" + "=" * 58 + "╣")
+            logger.info(f"║  LLM 推理:     {llm_time:>6.0f} ms                          ║")
+            if response.tool_calls:
+                logger.info(f"║  工具执行:     {tool_time:>6.0f} ms                          ║")
+            if tts_time > 0:
+                logger.info(f"║  TTS 转换:     {tts_time:>6.0f} ms                          ║")
+            logger.info("╠" + "=" * 58 + "╣")
+            logger.info(f"║  总耗时:       {total_time:>6.0f} ms                          ║")
+            logger.info("╚" + "=" * 58 + "╝")
                 
         except Exception as e:
             logger.error(f"处理消息失败: {e}")
@@ -291,9 +311,7 @@ class ReadingCompanion:
     
     async def _handle_feishu_message(self, text: str, channel: str = "feishu") -> str:
         """处理飞书消息"""
-        # 复用相同的处理逻辑
         await self._process_user_message(text, channel="feishu")
-        # 返回空字符串，因为实际回复在 _process_user_message 中处理
         return ""
     
     def _on_page_turn(self, page_count: int):
@@ -302,7 +320,6 @@ class ReadingCompanion:
     
     def _on_snapshot(self, ocr_text: str, image_path: str):
         """快照回调"""
-        # 更新记忆
         self.memory.set_page_context(ocr_text, image_path)
         logger.debug(f"📸 快照已更新，文本长度: {len(ocr_text)}")
     
