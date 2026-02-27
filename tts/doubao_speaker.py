@@ -254,9 +254,9 @@ class DoubaoTTSPlayer:
     - 长文本自动分段
     """
     
-    # 豆包 TTS 单次最大字符数
-    MAX_TEXT_LENGTH = 500
-    
+    # 豆包 TTS 单次最大字符数（官方限制约 300，留余量）
+    MAX_TEXT_LENGTH = 250
+
     def __init__(self,
                  appid: str,
                  token: str,
@@ -310,33 +310,54 @@ class DoubaoTTSPlayer:
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
         
+    @staticmethod
+    def _clean_markdown(text: str) -> str:
+        """去除 Markdown 格式，使 TTS 只读纯文本"""
+        import re
+        # 去掉粗体/斜体标记 **text** / *text*
+        text = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)
+        # 去掉标题 # ## ###
+        text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
+        # 去掉列表符号 - / * / 数字. 开头
+        text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+        # 去掉行内代码 `code`
+        text = re.sub(r'`[^`]*`', '', text)
+        # 合并多个空行为单个换行
+        text = re.sub(r'\n{2,}', '\n', text)
+        # 去掉行首行尾空白
+        text = '\n'.join(line.strip() for line in text.splitlines())
+        return text.strip()
+
     def _split_text(self, text: str, max_length: int = MAX_TEXT_LENGTH) -> List[str]:
-        """将长文本分段"""
+        """去 Markdown 后分段"""
+        import re
+        text = self._clean_markdown(text)
+
         if len(text) <= max_length:
-            return [text]
-        
+            return [text] if text else []
+
         segments = []
         current = ""
-        
-        # 按句子分割
-        import re
+
+        # 按中文句子边界分割
         sentences = re.split(r'([。！？；\n])', text)
-        
+
         for i in range(0, len(sentences), 2):
             sentence = sentences[i]
             if i + 1 < len(sentences):
                 sentence += sentences[i + 1]
-            
+
             if len(current) + len(sentence) <= max_length:
                 current += sentence
             else:
                 if current:
                     segments.append(current)
                 current = sentence
-        
+
         if current:
             segments.append(current)
-        
+
         # 强制分割超长段落
         final_segments = []
         for seg in segments:
@@ -345,7 +366,7 @@ class DoubaoTTSPlayer:
                 seg = seg[max_length:]
             if seg:
                 final_segments.append(seg)
-        
+
         return final_segments if final_segments else [text[:max_length]]
         
     async def start(self):

@@ -39,13 +39,27 @@ READING_SNAP_TOOL = {
 
 READING_NOTE_TOOL = {
     "name": "reading_note",
-    "description": "记录用户的读书笔记。当用户说'记录一下'、'摘抄这段'、'记个笔记'时调用。",
+    "description": (
+        "记录用户的读书笔记。当用户说'记录一下'、'摘抄这段'、'记个笔记'时调用。"
+        "无需开启阅读会话即可随时记录。"
+        "book_name 从对话中识别书名（如用户未提及则留空）。"
+        "tags 由用户指定或从对话中提取关键词作为标签。"
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
             "content": {
                 "type": "string",
                 "description": "笔记内容"
+            },
+            "book_name": {
+                "type": "string",
+                "description": "书名，从对话上下文中识别，用户未提及则留空"
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "标签列表，由用户指定或从内容中提取关键词，可为空"
             }
         },
         "required": ["content"]
@@ -201,29 +215,34 @@ class ToolExecutor:
             }
     
     async def _exec_reading_note(self, params: Dict) -> Dict:
-        """记录笔记"""
-        if not self.session_manager.is_active():
-            return {
-                "success": False,
-                "error": "没有进行中的阅读会话，无法记录笔记"
-            }
-        
+        """记录笔记（无需活跃阅读会话）"""
         content = params.get("content", "")
         if not content:
             return {
                 "success": False,
                 "error": "笔记内容不能为空"
             }
-        
-        # 获取当前页面上下文
+
+        book_name = params.get("book_name", "")
+        tags = params.get("tags") or []
+
+        # 获取当前页面上下文（有摄像头时才有值）
         page_context = self.memory.current_page_ocr
-        
-        note = await self.session_manager.add_note(content, page_context)
-        
+
+        note = await self.session_manager.add_note(
+            content=content,
+            page_context=page_context,
+            book_name=book_name,
+            tags=tags,
+        )
+
+        book_hint = f"《{note.book_name}》" if note.book_name else ""
+        tag_hint = f"，标签：{', '.join(note.tags)}" if note.tags else ""
         return {
             "success": True,
-            "message": f"笔记已记录（第 {note.id} 条）",
-            "note_id": note.id
+            "message": f"笔记已记录（第 {note.id} 条）{book_hint}{tag_hint}",
+            "note_id": note.id,
+            "utc_datetime": note.to_json_dict()["utc_datetime"],
         }
     
     async def _exec_reading_stop(self, params: Dict) -> Dict:

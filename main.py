@@ -78,7 +78,7 @@ class ReadingCompanion:
         self.loop = asyncio.get_running_loop()
         
         # 1. 数据库
-        self.storage = Storage(config.SESSIONS_DB)
+        self.storage = Storage(config.SESSIONS_DB, notes_dir=config.NOTES_DIR)
         await self.storage.initialize()
         
         # 2. 会话管理

@@ -73,23 +73,45 @@ class Note:
     阅读笔记
     """
     id: int                          # 自增 ID
-    session_id: str                  # 所属会话 ID
-    ts: int                          # 时间戳 (ms)
+    ts: int                          # UTC 时间戳 (ms)
     content: str = ""                # 笔记内容
+    session_id: str = ""             # 所属会话 ID（可为空）
+    book_name: str = ""              # 书名（可为空）
+    tags: List[str] = field(default_factory=list)  # 用户自定义标签
     page_ocr_context: str = ""       # 记录时的页面 OCR 上下文
-    
+
     def to_dict(self) -> dict:
         return asdict(self)
-    
+
+    def to_json_dict(self) -> dict:
+        """用于写入 JSON 文件的完整格式"""
+        dt = datetime.utcfromtimestamp(self.ts / 1000)
+        return {
+            "id": self.id,
+            "utc_ts": self.ts,
+            "utc_datetime": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "book_name": self.book_name,
+            "tags": self.tags,
+            "content": self.content,
+            "session_id": self.session_id,
+            "page_ocr_context": self.page_ocr_context,
+        }
+
     @classmethod
     def from_dict(cls, data: dict) -> "Note":
         return cls(**data)
-    
+
     @property
     def created_at_str(self) -> str:
-        """格式化创建时间"""
+        """格式化创建时间（本地时间）"""
         dt = datetime.fromtimestamp(self.ts / 1000)
         return dt.strftime("%Y-%m-%d %H:%M")
+
+    @property
+    def utc_filename(self) -> str:
+        """用于 JSON 文件命名的 UTC 时间字符串"""
+        dt = datetime.utcfromtimestamp(self.ts / 1000)
+        return dt.strftime("%Y%m%dT%H%M%SZ")
 
 
 @dataclass
