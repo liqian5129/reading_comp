@@ -157,10 +157,11 @@ class ToolExecutor:
             }
         
         session = await self.session_manager.start_session(book_name=book_name)
-        
-        # 启动自动扫描
-        await self.scanner.start(session.id)
-        
+
+        # 绑定 session（扫描器已在后台运行，无需重新启动）
+        if self.scanner.is_running():
+            self.scanner.set_session(session.id)
+
         return {
             "success": True,
             "message": f"已开始阅读{f'《{book_name}》' if book_name else ''}，我会自动记录你的阅读进度",
@@ -233,9 +234,10 @@ class ToolExecutor:
                 "error": "没有进行中的阅读会话"
             }
         
-        # 停止扫描
-        await self.scanner.stop()
-        
+        # 解绑 session（扫描器继续后台运行）
+        if self.scanner.is_running():
+            self.scanner.clear_session()
+
         # 结束会话
         session = await self.session_manager.end_session()
         

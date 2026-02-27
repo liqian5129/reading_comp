@@ -224,9 +224,267 @@ class AliyunStreamASR:
         return self._connected.is_set()
 
 
-def create_asr(app_key: str, token: str) -> AliyunStreamASR:
-    """创建 ASR 实例的工厂函数"""
-    return AliyunStreamASR(app_key=app_key, token=token)
+def create_asr(app_key: str, token: str) -> 'PrewarmedASR':
+    """创建预热式 ASR 实例，启动时立即开始建立首次连接"""
+    asr = PrewarmedASR(app_key=app_key, token=token)
+    asr.prepare()
+    return asr
+
+
+class _CallbackProxy:
+    """
+    线程安全的回调转发器。
+
+    预热阶段将此对象注册到 AliyunStreamASR，
+    录音开始时通过 set_target() 绑定真实回调，
+    录音结束时 set_target(None) 切断转发。
+    """
+
+    def __init__(self):
+        self._target = None
+        self._lock = threading.Lock()
+
+    def set_target(self, callback):
+        with self._lock:
+            self._target = callback
+
+    def __call__(self, result):
+        with self._lock:
+            target = self._target
+        if target:
+            target(result)
+
+
+# 预热连接的最长保活时间（秒）。
+# 阿里云 NLS 空闲连接约 30s 超时，保守取 25s。
+_STANDBY_MAX_AGE = 25
+
+
+class PrewarmedASR:
+    """
+    预热式 ASR 管理器。
+
+    start() 完全非阻塞：
+    - standby 就绪 → 立即激活（~0ms）
+    - standby 未就绪/已过期 → 后台等待激活，期间 send_audio() 自动缓冲
+
+    这样键盘监听回调永远不会阻塞或抛出异常。
+    """
+
+    def __init__(self, app_key: str, token: str,
+                 url: str = "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"):
+        self._app_key = app_key
+        self._token = token
+        self._url = url
+
+        self._active: Optional[AliyunStreamASR] = None
+        self._standby: Optional[AliyunStreamASR] = None
+        self._standby_ready = threading.Event()
+        self._standby_created_at: float = 0.0
+        self._preparing = False
+        self._pool_lock = threading.Lock()
+
+        # 代理回调
+        self._proxy = _CallbackProxy()
+
+        # 非阻塞 start 支持
+        self._stop_requested = False       # stop() 在后台激活完成前被调用
+        self._pending_audio: list = []     # 激活前的音频缓冲
+        self._pending_lock = threading.Lock()
+
+        # 主动刷新定时器（standby 到期前 5s 自动重建）
+        self._refresh_timer: Optional[threading.Timer] = None
+
+    # ------------------------------------------------------------------
+    # 预热
+    # ------------------------------------------------------------------
+
+    def prepare(self):
+        """在后台建立下一条 ASR 连接（幂等）。"""
+        with self._pool_lock:
+            if self._preparing or self._standby_ready.is_set():
+                return
+            self._preparing = True
+
+        threading.Thread(target=self._do_prepare, daemon=True).start()
+
+    def _do_prepare(self):
+        max_retries = 3
+        retry_delay = 3.0
+
+        for attempt in range(max_retries):
+            try:
+                logger.info("🔌 ASR 预热：正在建立备用连接...")
+                asr = AliyunStreamASR(self._app_key, self._token, self._url)
+                asr.start(on_result=self._proxy)
+
+                # 等待最多 0.5s，检测是否立即收到错误（如 TOO_MANY_REQUESTS）
+                # TOO_MANY_REQUESTS 等网关拒绝通常在 <100ms 内返回，0.5s 足够
+                connection_failed = asr._closed.wait(timeout=0.5)
+                if connection_failed:
+                    logger.warning(
+                        f"⚠️ ASR 预热连接建立后立即断开，{retry_delay:.0f}s 后重试"
+                        f" ({attempt + 1}/{max_retries})..."
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                    continue
+
+                with self._pool_lock:
+                    self._standby = asr
+                    self._standby_created_at = time.time()
+                    self._standby_ready.set()
+                    self._preparing = False
+
+                # 在到期前 5s 主动刷新，避免用户按键时 standby 已过期
+                if self._refresh_timer:
+                    self._refresh_timer.cancel()
+                refresh_delay = max(_STANDBY_MAX_AGE - 5, 10)
+                t = threading.Timer(refresh_delay, self._refresh_standby)
+                t.daemon = True
+                t.start()
+                self._refresh_timer = t
+
+                logger.info("✅ ASR 预热完成，下次按键可立即使用")
+                return
+
+            except Exception as e:
+                logger.error(f"❌ ASR 预热失败: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+
+        logger.error("❌ ASR 预热彻底失败（已重试 3 次），请检查网络或 API 配额")
+        with self._pool_lock:
+            self._preparing = False
+
+    def _refresh_standby(self):
+        """standby 即将到期时主动关闭并重建，保持随时可用。"""
+        with self._pool_lock:
+            if self._standby is None or not self._standby_ready.is_set():
+                return  # 已被激活或已在重建中
+            old = self._standby
+            self._standby = None
+            self._standby_ready.clear()
+            self._preparing = False
+        logger.info("🔄 ASR standby 即将到期，主动刷新中...")
+        threading.Thread(target=lambda: old.stop(timeout=2.0), daemon=True).start()
+        self.prepare()
+
+    # ------------------------------------------------------------------
+    # 录音接口
+    # ------------------------------------------------------------------
+
+    def start(self, on_result=None):
+        """
+        非阻塞激活：立即返回，不会阻塞键盘监听线程，不抛出异常。
+
+        standby 就绪 → 立即激活
+        standby 未就绪/已过期 → 启动后台线程等待激活，同期音频自动缓冲
+        """
+        with self._pending_lock:
+            self._pending_audio.clear()
+        self._stop_requested = False
+        self._proxy.set_target(on_result)
+
+        if self._standby_ready.is_set():
+            age = time.time() - self._standby_created_at
+            if age <= _STANDBY_MAX_AGE:
+                # 立即激活，取消刷新定时器
+                if self._refresh_timer:
+                    self._refresh_timer.cancel()
+                    self._refresh_timer = None
+                with self._pool_lock:
+                    self._active = self._standby
+                    self._standby = None
+                    self._standby_ready.clear()
+                logger.info("⚡ ASR 预热连接已激活，可立即发送音频")
+                return
+
+        # standby 未就绪或已过期 → 后台等待
+        logger.info("⏳ ASR standby 未就绪，后台等待激活中...")
+        threading.Thread(target=self._background_activate, daemon=True).start()
+
+    def _background_activate(self):
+        """后台线程：等待 standby 就绪并激活；支持 stop() 提前取消。"""
+        try:
+            # 若 standby 已过期，先关闭旧连接再重新预热
+            if self._standby_ready.is_set():
+                with self._pool_lock:
+                    old = self._standby
+                    self._standby = None
+                    self._standby_ready.clear()
+                if old:
+                    threading.Thread(
+                        target=lambda: old.stop(timeout=2.0), daemon=True
+                    ).start()
+
+            self.prepare()
+
+            if not self._standby_ready.wait(timeout=20.0):
+                logger.error("❌ ASR 后台激活超时（20s），本次录音无识别")
+                return
+
+            # stop() 已在激活完成前被调用 → 保留 standby 供下次使用，不激活
+            if self._stop_requested:
+                logger.info("ASR 后台激活：录音已提前结束，standby 保留供下次使用")
+                return
+
+            with self._pool_lock:
+                if self._stop_requested:
+                    return
+                self._active = self._standby
+                self._standby = None
+                self._standby_ready.clear()
+
+            logger.info("⚡ ASR 后台激活完成")
+
+            # 冲送缓冲音频
+            with self._pending_lock:
+                buffered = self._pending_audio.copy()
+                self._pending_audio.clear()
+
+            if buffered and self._active:
+                logger.info(f"📤 冲送缓冲音频: {len(buffered)} 包")
+                for chunk in buffered:
+                    self._active.send_audio(chunk)
+
+        except Exception as e:
+            logger.error(f"❌ ASR 后台激活失败: {e}")
+
+    def send_audio(self, pcm_data: bytes):
+        if self._active:
+            self._active.send_audio(pcm_data)
+        else:
+            # 后台激活中，缓冲音频（最多 5 秒 ≈ 78 包）
+            with self._pending_lock:
+                self._pending_audio.append(pcm_data)
+                max_chunks = 5 * 16000 // 1024
+                if len(self._pending_audio) > max_chunks:
+                    self._pending_audio.pop(0)
+
+    def stop(self, timeout: float = 5.0) -> str:
+        """停止当前识别，并触发下一次预热。"""
+        self._stop_requested = True
+
+        if self._refresh_timer:
+            self._refresh_timer.cancel()
+            self._refresh_timer = None
+
+        with self._pending_lock:
+            self._pending_audio.clear()
+
+        if not self._active:
+            self.prepare()
+            return ""
+
+        self._proxy.set_target(None)
+        result = self._active.stop(timeout=timeout)
+        self._active = None
+        self.prepare()
+        return result
+
+    def is_active(self) -> bool:
+        return self._active is not None and self._active.is_active()
 
 
 class MockASR:

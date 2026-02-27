@@ -2,10 +2,14 @@
 OCR 引擎模块
 使用 PaddleOCR 进行文字识别
 """
+import os
 import numpy as np
 from pathlib import Path
 from typing import Optional, List
 import logging
+
+# 禁用 PaddleOCR 启动时的网络连通性检查（避免几十秒的卡顿）
+os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +27,8 @@ def get_ocr():
             _ocr_instance = PaddleOCR(
                 use_angle_cls=True,      # 使用方向分类器
                 lang='ch',               # 中文
-                use_gpu=False,           # CPU 运行
+                device='cpu',            # CPU 运行（PaddleOCR 3.x 参数）
                 show_log=False,          # 减少日志输出
-                enable_mkldnn=True,      # 启用 MKL-DNN 加速
             )
             logger.info("PaddleOCR 初始化完成")
         except Exception as e:
@@ -112,9 +115,8 @@ class OCREngine:
             self._ocr = PaddleOCR(
                 use_angle_cls=True,
                 lang='ch',
-                use_gpu=False,
+                device='cpu',
                 show_log=False,
-                enable_mkldnn=True,
             )
         return self._ocr
     

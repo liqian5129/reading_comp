@@ -67,7 +67,6 @@ class VoiceRecorder:
         self.state = RecordingState.IDLE
         self._recording_start_time: Optional[float] = None
         self._audio_buffer: list[np.ndarray] = []
-        self._pre_buffer: list[bytes] = []
         
         # 回调
         self.on_text: Optional[Callable[[str], None]] = None
@@ -77,10 +76,6 @@ class VoiceRecorder:
         self._stream: Optional[sd.InputStream] = None
         self._keyboard_listener: Optional[keyboard.Listener] = None
         self._lock = threading.Lock()
-        
-        # ASR 就绪等待
-        self._asr_ready = threading.Event()
-        self._asr_error: Optional[str] = None
         
         # 调试统计
         self._audio_callback_count = 0
@@ -95,32 +90,11 @@ class VoiceRecorder:
             pcm_data = (indata * 32767).astype(np.int16).tobytes()
             
             self._audio_callback_count += 1
-            
-            # 每 50 个包打印一次
+
             if self._audio_callback_count % 50 == 0:
-                logger.info(f"🎙️ 录音中... 已采集 {self._audio_callback_count} 包, 预缓冲 {len(self._pre_buffer)} 包")
-            
-            # 如果 ASR 还没准备好，先缓冲
-            if not self._asr_ready.is_set():
-                self._pre_buffer.append(pcm_data)
-                # 限制预缓冲大小（最多 5 秒）
-                max_pre_buffer = int(5 * self.sample_rate / 1024)
-                if len(self._pre_buffer) > max_pre_buffer:
-                    dropped = self._pre_buffer.pop(0)
-                    logger.debug(f"预缓冲溢出，丢弃 {len(dropped)} 字节")
-            else:
-                # 先发送预缓冲的数据
-                if self._pre_buffer:
-                    pre_buffer_copy = self._pre_buffer.copy()
-                    self._pre_buffer = []
-                    logger.info(f"📤 发送预缓冲: {len(pre_buffer_copy)} 包")
-                    for data in pre_buffer_copy:
-                        self.asr.send_audio(data)
-                
-                # 实时推送到 ASR
-                self.asr.send_audio(pcm_data)
-            
-            # 同时缓存（用于计算时长等）
+                logger.info(f"🎙️ 录音中... 已采集 {self._audio_callback_count} 包")
+
+            self.asr.send_audio(pcm_data)
             self._audio_buffer.append(indata.copy())
     
     def _on_key_press(self, key):
@@ -138,33 +112,18 @@ class VoiceRecorder:
         with self._lock:
             if self.state != RecordingState.IDLE:
                 return
-            
+            # 先设置 RECORDING，音频回调立即开始收包
             self.state = RecordingState.RECORDING
             self._recording_start_time = time.time()
             self._audio_buffer = []
-            self._pre_buffer = []
-            self._asr_ready.clear()
-            self._asr_error = None
             self._audio_callback_count = 0
-            
-            logger.info("=" * 50)
-            logger.info("🎤 开始录音...")
-            logger.info("=" * 50)
-            
-            # 启动 ASR（在后台线程）
-            asr_thread = threading.Thread(target=self._start_asr, daemon=True)
-            asr_thread.start()
-    
-    def _start_asr(self):
-        """在后台启动 ASR"""
-        try:
-            logger.info("🚀 后台线程启动 ASR...")
-            self.asr.start(on_result=self._on_asr_result)
-            self._asr_ready.set()
-            logger.info("✅ ASR 已就绪")
-        except Exception as e:
-            self._asr_error = str(e)
-            logger.error(f"❌ 启动 ASR 失败: {e}")
+
+        # asr.start() 移到锁外：PrewarmedASR 在 standby 未就绪时会等待，
+        # 若在锁内调用会阻塞键盘释放事件导致 stop 无法及时触发
+        logger.info("=" * 50)
+        logger.info("🎤 开始录音...")
+        logger.info("=" * 50)
+        self.asr.start(on_result=self._on_asr_result)
     
     def _stop_recording(self):
         """停止录音"""
@@ -176,36 +135,14 @@ class VoiceRecorder:
             duration = time.time() - self._recording_start_time
             
             logger.info("=" * 50)
-            logger.info(f"🛑 停止录音，时长: {duration:.2f}s")
-            logger.info(f"📊 采集统计: {self._audio_callback_count} 包, 预缓冲 {len(self._pre_buffer)} 包")
-            
+            logger.info(f"🛑 停止录音，时长: {duration:.2f}s，采集 {self._audio_callback_count} 包")
+
             # 检查最短时长
             if duration < self.min_duration:
                 logger.warning(f"⚠️ 录音时长过短 ({duration:.2f}s < {self.min_duration}s)，丢弃")
                 self._cleanup_and_reset()
                 return
-            
-            # 等待 ASR 就绪（最多等 5 秒）
-            if not self._asr_ready.is_set():
-                logger.info("⏳ 等待 ASR 就绪...")
-                self._asr_ready.wait(timeout=5.0)
-            
-            # 检查 ASR 是否有错误
-            if self._asr_error:
-                logger.error(f"❌ ASR 错误: {self._asr_error}")
-                self._cleanup_and_reset()
-                return
-            
-            if not self._asr_ready.is_set():
-                logger.warning("⚠️ ASR 未能及时就绪，尝试继续...")
-            
-            # 发送剩余的预缓冲数据
-            if self._pre_buffer and self._asr_ready.is_set():
-                logger.info(f"📤 发送剩余预缓冲: {len(self._pre_buffer)} 包")
-                for data in self._pre_buffer:
-                    self.asr.send_audio(data)
-                self._pre_buffer = []
-            
+
             # 给 ASR 一点时间处理最后的数据
             logger.info("⏳ 等待 ASR 完成处理...")
             time.sleep(0.5)
@@ -250,7 +187,6 @@ class VoiceRecorder:
             self.asr.stop()
         except:
             pass
-        self._pre_buffer = []
         self._audio_buffer = []
         self.state = RecordingState.IDLE
         logger.info("🧹 已清理并重置")

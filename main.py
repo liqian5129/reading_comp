@@ -104,10 +104,14 @@ class ReadingCompanion:
         self.memory = Memory(config.PERSONA_FILE)
         self.tool_registry = ToolRegistry()
         
-        # 4. 扫描器（先创建，但稍后启动）
+        # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
         self.scanner.on_page_turn = self._on_page_turn
         self.scanner.on_snapshot = self._on_snapshot
+        if config.SCANNER_ENABLED:
+            await self.scanner.start()
+        else:
+            logger.info("📷 摄像头/OCR 扫描已禁用（camera.scanner_enabled=false）")
         
         # 5. 工具执行器（依赖 scanner 和 session_manager）
         self.tool_executor = ToolExecutor(
@@ -155,7 +159,7 @@ class ReadingCompanion:
         
         if self.recorder:
             self.recorder.stop()
-        if self.scanner:
+        if self.scanner and self.scanner.is_running():
             await self.scanner.stop()
         if self.tts_player:
             await self.tts_player.stop()
@@ -228,8 +232,6 @@ class ReadingCompanion:
             
             # 2. 处理工具调用
             if response.tool_calls:
-                self.memory.add_message("assistant", f"[调用工具: {', '.join(tc['name'] for tc in response.tool_calls)}]")
-                
                 tool_results = []
                 for tool_call in response.tool_calls:
                     result = await self.tool_executor.execute(
@@ -240,12 +242,13 @@ class ReadingCompanion:
                         "tool_use_id": tool_call["id"],
                         "content": str(result)
                     })
-                
+
                 final_response = await self.llm.chat_with_tool_result(
                     user_message=text,
                     tool_results=tool_results,
                     system_prompt=system_prompt,
-                    history=history
+                    history=history,
+                    assistant_message=response.raw_assistant_message,
                 )
                 
                 reply_text = final_response.text
