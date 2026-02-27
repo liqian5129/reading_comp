@@ -120,25 +120,40 @@ class DoubaoTTS:
 
         return header + size + compressed
     
-    async def synthesize(self, text: str) -> Optional[bytes]:
+    async def synthesize(self, text: str, max_retries: int = 3) -> Optional[bytes]:
         """
-        流式合成语音
-        
+        流式合成语音，失败时自动重试（最多 max_retries 次）
+
         Args:
             text: 要合成的文本
-            
+            max_retries: 最大重试次数
+
         Returns:
             MP3 音频数据
         """
         if not text.strip():
             return None
-        
+
+        for attempt in range(max_retries):
+            result = await self._synthesize_once(text)
+            if result is not None:
+                return result
+            if attempt < max_retries - 1:
+                wait = 1.0 * (attempt + 1)
+                logger.warning(f"⚠️ 豆包 TTS 第 {attempt + 1} 次失败，{wait:.0f}s 后重试...")
+                await asyncio.sleep(wait)
+
+        logger.error(f"❌ 豆包 TTS 重试 {max_retries} 次后仍失败")
+        return None
+
+    async def _synthesize_once(self, text: str) -> Optional[bytes]:
+        """单次合成尝试"""
         reqid = str(uuid.uuid4())
         audio_chunks = []
-        
+
         try:
             logger.debug(f"🎵 豆包 TTS 开始合成: {text[:50]}...")
-            
+
             auth_headers = {"Authorization": f"Bearer; {self.token}"}
             async with websockets.connect(self.WS_URL, additional_headers=auth_headers) as ws:
                 # 发送合成请求
@@ -254,8 +269,8 @@ class DoubaoTTSPlayer:
     - 长文本自动分段
     """
     
-    # 豆包 TTS 单次最大字符数（官方限制约 300，留余量）
-    MAX_TEXT_LENGTH = 250
+    # 豆包 TTS 单次最大字符数（官方限制约 500，留余量）
+    MAX_TEXT_LENGTH = 400
 
     def __init__(self,
                  appid: str,
@@ -312,17 +327,31 @@ class DoubaoTTSPlayer:
         
     @staticmethod
     def _clean_markdown(text: str) -> str:
-        """去除 Markdown 格式，使 TTS 只读纯文本"""
+        """去除 Markdown 格式及 TTS 无法朗读的字符"""
         import re
-        # 去掉粗体/斜体标记 **text** / *text*
+        # 去掉代码块 ```...```
+        text = re.sub(r'```[\s\S]*?```', '', text)
+        # 去掉行内代码 `code`
+        text = re.sub(r'`[^`]*`', '', text)
+        # 去掉图片 ![alt](url)
+        text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+        # 链接 [text](url) → 保留文字
+        text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)
+        # 去掉粗体/斜体/删除线 **text** / *text* / ~~text~~
+        text = re.sub(r'~~(.*?)~~', r'\1', text)
         text = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)
+        text = re.sub(r'_{1,2}(.*?)_{1,2}', r'\1', text)
         # 去掉标题 # ## ###
         text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
+        # 去掉水平分割线
+        text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+        # 去掉表格行（含 | 符号）
+        text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE)
         # 去掉列表符号 - / * / 数字. 开头
         text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
         text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
-        # 去掉行内代码 `code`
-        text = re.sub(r'`[^`]*`', '', text)
+        # 去掉引用符号 >
+        text = re.sub(r'^\s*>\s*', '', text, flags=re.MULTILINE)
         # 合并多个空行为单个换行
         text = re.sub(r'\n{2,}', '\n', text)
         # 去掉行首行尾空白
