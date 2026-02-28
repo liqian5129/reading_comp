@@ -38,15 +38,18 @@ class ReadingCompanion:
     """
     AI 读书搭子主类
     """
-    
+
     def __init__(self):
-        # 配置检查
-        missing = config.validate()
-        if missing:
-            logger.error(f"缺少配置项: {', '.join(missing)}")
-            logger.error("请运行: python setup.py 生成配置文件")
-            sys.exit(1)
-        
+        # 调试模式下跳过 API key 检查
+        if config.DEBUG_MODE:
+            logger.info("⚠️  调试模式已启用，跳过 API 配置验证")
+        else:
+            missing = config.validate()
+            if missing:
+                logger.error(f"缺少配置项: {', '.join(missing)}")
+                logger.error("请运行: python setup.py 生成配置文件")
+                sys.exit(1)
+
         # 确保目录存在
         config.ensure_dirs()
         
@@ -73,17 +76,34 @@ class ReadingCompanion:
     async def initialize(self):
         """初始化所有模块"""
         logger.info("正在初始化...")
-        
+
         # 保存事件循环引用
         self.loop = asyncio.get_running_loop()
-        
+
         # 1. 数据库
         self.storage = Storage(config.SESSIONS_DB, notes_dir=config.NOTES_DIR)
         await self.storage.initialize()
-        
+
         # 2. 会话管理
         self.session_manager = SessionManager(self.storage)
-        
+
+        if config.DEBUG_MODE:
+            # --- 调试模式：只启动摄像头+OCR，跳过 AI/ASR/TTS/飞书 ---
+            logger.info("🔧 调试模式：跳过 AI / ASR / TTS / 飞书初始化")
+
+            self.scanner = AutoScanner(self.session_manager)
+            self.scanner.on_page_turn = self._on_page_turn
+            self.scanner.on_snapshot = self._on_snapshot
+            if config.SCANNER_ENABLED:
+                await self.scanner.start()
+            else:
+                logger.info("📷 摄像头/OCR 扫描已禁用（camera.scanner_enabled=false）")
+
+            logger.info("初始化完成（调试模式）")
+            return
+
+        # --- 正常模式 ---
+
         # 3. AI 客户端（支持 Kimi 或豆包）
         if config.AI_PROVIDER == "kimi":
             self.llm = AIClient(
@@ -100,10 +120,10 @@ class ReadingCompanion:
                 model=config.DOUBAO_MODEL,
                 base_url=config.DOUBAO_BASE_URL
             )
-        
+
         self.memory = Memory(config.PERSONA_FILE)
         self.tool_registry = ToolRegistry()
-        
+
         # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
         self.scanner.on_page_turn = self._on_page_turn
@@ -112,14 +132,14 @@ class ReadingCompanion:
             await self.scanner.start()
         else:
             logger.info("📷 摄像头/OCR 扫描已禁用（camera.scanner_enabled=false）")
-        
+
         # 5. 工具执行器（依赖 scanner 和 session_manager）
         self.tool_executor = ToolExecutor(
             session_manager=self.session_manager,
             scanner=self.scanner,
             memory=self.memory
         )
-        
+
         # 6. 语音
         self.asr = create_asr(
             app_key=config.ALIYUN_NLS_APP_KEY,
@@ -135,12 +155,12 @@ class ReadingCompanion:
             min_duration=0.3
         )
         self.recorder.on_text = self._on_voice_text
-        
+
         # 7. TTS（支持阿里云或 ElevenLabs）
         from tts import create_tts_player
         self.tts_player = create_tts_player(config)
         await self.tts_player.start()
-        
+
         # 8. 飞书 Bot（可选）
         if config.FEISHU_ENABLED and config.FEISHU_APP_ID and config.FEISHU_APP_SECRET:
             self.feishu_bot = FeishuBot(
@@ -154,7 +174,7 @@ class ReadingCompanion:
             self.summary_pusher = SummaryPusher(self.feishu_bot)
             self.feishu_bot.start()
             logger.info("飞书 Bot 已启动")
-        
+
         logger.info("初始化完成")
     
     async def shutdown(self):
@@ -179,19 +199,29 @@ class ReadingCompanion:
     async def run(self):
         """主运行循环"""
         await self.initialize()
-        
+
         self._running = True
-        
-        # 启动录音监听
-        self.recorder.start()
-        
-        logger.info("=" * 60)
-        logger.info("🎉 AI 读书搭子已启动！")
-        logger.info(f"🤖 AI 提供商: {config.AI_PROVIDER}")
-        logger.info(f"🤖 AI 模型: {config.CURRENT_MODEL}")
-        logger.info(f"🔊 TTS 提供商: {config.TTS_PROVIDER}")
-        logger.info("按住 【右 Alt 键】说话与 AI 交流")
-        logger.info("=" * 60)
+
+        if config.DEBUG_MODE:
+            logger.info("=" * 60)
+            logger.info("🔧 AI 读书搭子已启动（调试模式）")
+            logger.info("   ASR / AI / TTS / 飞书 均已禁用")
+            if self.scanner and self.scanner.is_running():
+                logger.info(f"   摄像头+OCR 已启动，间隔 {config.AUTO_SCAN_INTERVAL}s")
+            else:
+                logger.info("   摄像头/OCR 未启动（scanner_enabled=false）")
+            logger.info("=" * 60)
+        else:
+            # 启动录音监听
+            self.recorder.start()
+
+            logger.info("=" * 60)
+            logger.info("🎉 AI 读书搭子已启动！")
+            logger.info(f"🤖 AI 提供商: {config.AI_PROVIDER}")
+            logger.info(f"🤖 AI 模型: {config.CURRENT_MODEL}")
+            logger.info(f"🔊 TTS 提供商: {config.TTS_PROVIDER}")
+            logger.info("按住 【右 Alt 键】说话与 AI 交流")
+            logger.info("=" * 60)
         
         # 保持运行
         try:
