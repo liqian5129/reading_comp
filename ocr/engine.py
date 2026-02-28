@@ -25,13 +25,17 @@ def _create_paddle_ocr():
     major = int(version.split('.')[0])
 
     if major >= 3:
-        # 3.x：启用内置文档方向检测 + UVDoc 书页矫正
+        # 3.x：server 级模型 + UVDoc 书页矫正（5-6s，精度最高）
         return PaddleOCR(
             lang='ch',
-            use_doc_orientation_classify=True,  # 检测页面旋转方向
+            use_doc_orientation_classify=True,   # PP-LCNet 检测页面旋转方向
             use_doc_unwarping=True,              # UVDoc 书页展平矫正
-            text_detection_model_name='PP-OCRv5_mobile_det',
-            text_recognition_model_name='PP-OCRv5_mobile_rec',
+            text_detection_model_name='PP-OCRv5_server_det',
+            text_recognition_model_name='PP-OCRv5_server_rec',
+            text_det_limit_side_len=960,         # 限最长边 960px → 高分辨率检测
+            text_det_limit_type='max',
+            text_det_box_thresh=0.5,             # 降低阈值减少漏检
+            text_det_unclip_ratio=1.8,           # 扩大框，覆盖密排书页文字
         )
     else:
         # 2.x：传统参数

@@ -254,8 +254,16 @@ class TimedOCR:
             lang='ch',
             use_doc_orientation_classify=True,
             use_doc_unwarping=True,
-            text_detection_model_name='PP-OCRv5_mobile_det',
-            text_recognition_model_name='PP-OCRv5_mobile_rec',
+            # server 级模型：检测+识别精度最高（已下载，无需联网）
+            text_detection_model_name='PP-OCRv5_server_det',
+            text_recognition_model_name='PP-OCRv5_server_rec',
+            # 限最长边为 960px → 书页横图分辨率更高
+            text_det_limit_side_len=960,
+            text_det_limit_type='max',
+            # 降低检测阈值 → 减少漏检
+            text_det_box_thresh=0.5,
+            # 扩大文字框 → 密排书页文字更完整
+            text_det_unclip_ratio=1.8,
         )
         self.timings: Dict[str, float] = {}
         self._patch_timings()
@@ -291,7 +299,8 @@ class TimedOCR:
         model.predict = timed_predict
 
     def predict(self, frame: np.ndarray):
-        self.timings = {}
+        # 必须 clear() 而非 self.timings = {}，否则闭包里的引用失效
+        self.timings.clear()
         t0 = time.perf_counter()
         result = self._ocr.predict(frame)
         self.timings['total'] = time.perf_counter() - t0
@@ -299,13 +308,24 @@ class TimedOCR:
 
     def log_timings(self):
         t = self.timings
+        steps = [
+            ('orientation', 'orient '),
+            ('unwarping',   'unwarp '),
+            ('detection',   'detect '),
+            ('recognition', 'recog  '),
+        ]
         parts = []
-        for k in ('orientation', 'unwarping', 'detection', 'recognition'):
-            if k in t:
-                parts.append(f"{k[:6]}={t[k]*1000:.0f}ms")
-        if 'total' in t:
-            parts.append(f"TOTAL={t['total']*1000:.0f}ms")
-        logger.info("  计时: " + "  ".join(parts))
+        acc = 0.0
+        for key, label in steps:
+            v = t.get(key, 0)
+            acc += v
+            flag = " ✓" if key in t else " -"
+            parts.append(f"{label}{v*1000:>5.0f}ms{flag}")
+        total = t.get('total', 0)
+        overhead = total - acc
+        parts.append(f"overhead {overhead*1000:>4.0f}ms")
+        parts.append(f"│ TOTAL {total*1000:.0f}ms")
+        logger.info("  ⏱ " + "  ".join(parts))
 
 
 # ---------------------------------------------------------------------------
