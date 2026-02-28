@@ -224,9 +224,17 @@ class AliyunStreamASR:
         return self._connected.is_set()
 
 
-def create_asr(app_key: str, token: str) -> 'PrewarmedASR':
-    """创建预热式 ASR 实例，启动时立即开始建立首次连接"""
-    asr = PrewarmedASR(app_key=app_key, token=token)
+def create_asr(app_key: str, token: str = "",
+               access_key_id: str = "",
+               access_key_secret: str = "") -> 'PrewarmedASR':
+    """创建预热式 ASR 实例，启动时立即开始建立首次连接。
+
+    优先使用 access_key_id + access_key_secret 自动获取并刷新 token；
+    未配置时回退到静态 token。
+    """
+    asr = PrewarmedASR(app_key=app_key, token=token,
+                       access_key_id=access_key_id,
+                       access_key_secret=access_key_secret)
     asr.prepare()
     return asr
 
@@ -271,10 +279,18 @@ class PrewarmedASR:
     这样键盘监听回调永远不会阻塞或抛出异常。
     """
 
-    def __init__(self, app_key: str, token: str,
+    # token 有效期默认 24 小时，提前 1 小时刷新
+    _TOKEN_TTL = 23 * 3600
+
+    def __init__(self, app_key: str, token: str = "",
+                 access_key_id: str = "",
+                 access_key_secret: str = "",
                  url: str = "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"):
         self._app_key = app_key
         self._token = token
+        self._access_key_id = access_key_id
+        self._access_key_secret = access_key_secret
+        self._token_fetched_at: float = 0.0   # 上次获取 token 的时间戳
         self._url = url
 
         self._active: Optional[AliyunStreamASR] = None
@@ -319,6 +335,7 @@ class PrewarmedASR:
 
         for attempt in range(max_retries):
             try:
+                self._refresh_token_if_needed()
                 logger.info("🔌 ASR 预热：正在建立备用连接...")
                 asr = AliyunStreamASR(self._app_key, self._token, self._url)
                 asr.start(on_result=self._proxy)
@@ -392,6 +409,30 @@ class PrewarmedASR:
             self._preparing = False
             self._standby_ready.clear()
         self._schedule_recovery()
+
+    def _refresh_token_if_needed(self):
+        """若配置了 access_key，在 token 过期前自动刷新。"""
+        if not self._access_key_id or not self._access_key_secret:
+            logger.debug("🔑 未配置 access_key，跳过 token 刷新")
+            return  # 未配置 access_key，使用静态 token
+
+        age = time.time() - self._token_fetched_at
+        logger.debug(f"🔑 token age={age:.0f}s TTL={self._TOKEN_TTL}s, "
+                     f"token={'有' if self._token else '无'}")
+        if self._token and age < self._TOKEN_TTL:
+            logger.debug("🔑 token 仍有效，跳过刷新")
+            return  # token 仍有效
+
+        try:
+            from nls.token import getToken
+            logger.info("🔑 正在刷新 NLS Token...")
+            new_token = getToken(self._access_key_id, self._access_key_secret)
+            self._token = new_token
+            self._token_fetched_at = time.time()
+            logger.info(f"✅ NLS Token 刷新成功: {new_token[:8]}...")
+        except Exception as e:
+            logger.error(f"❌ NLS Token 刷新失败: {e}")
+            # 刷新失败时继续使用旧 token（可能仍有效）
 
     def _schedule_recovery(self):
         """warmup 彻底失败后，按指数退避自动重试。"""
