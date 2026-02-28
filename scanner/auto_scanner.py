@@ -1,15 +1,14 @@
 """
 自动扫描器
 
-始终在后台运行，每 2 秒执行一次：
+始终在后台运行，每 N 秒执行一次（默认 10s）：
 1. 拍照（持久化摄像头连接，无开关开销）
-2. 透视矫正
-3. OCR 识别（独立子进程，不阻塞主程序）
-4. 若有文字 → 调用 on_snapshot 更新 AI 上下文
+2. OCR 识别（独立子进程，不阻塞主程序；PaddleOCR 内置 UVDoc 书页矫正）
+3. 若识别到文字 → 调用 on_snapshot 更新 AI 上下文
 
 阅读 session 激活后额外执行：
-5. 翻页检测
-6. 存数据库
+4. 翻页检测
+5. 存数据库
 """
 import asyncio
 import logging
@@ -20,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Callable
 
-from camera import correct_perspective, fingerprint, is_page_turn
+from camera import fingerprint, is_page_turn
 from camera.capture import CameraCapture
 from ocr.engine import create_ocr_engine
 from config import config
@@ -175,7 +174,7 @@ class AutoScanner:
     # ------------------------------------------------------------------
 
     async def manual_scan(self) -> Optional[Tuple[str, str, str]]:
-        """手动触发一次扫描（用于 reading_snap 工具）"""
+        """手动触发一次扫描"""
         return await self._do_scan(force_save=True)
 
     # ------------------------------------------------------------------
@@ -213,29 +212,35 @@ class AutoScanner:
                 logger.warning("拍照失败")
                 return None
 
-            # 2. 透视矫正 + 编码（在线程池中执行，避免阻塞）
-            def prepare_image(f):
-                corrected = correct_perspective(f)
-                _, encoded = cv2.imencode('.jpg', corrected)
-                return corrected, encoded.tobytes()
+            # 2. 编码原始帧（在线程池中执行，避免阻塞）
+            # 注：OCR 子进程内部的 PaddleOCR 会通过 UVDoc 做书页矫正，无需在此重复矫正
+            def encode_frame(f):
+                _, encoded = cv2.imencode('.jpg', f)
+                return encoded.tobytes()
 
-            corrected, image_bytes = await loop.run_in_executor(None, prepare_image, frame)
+            image_bytes = await loop.run_in_executor(None, encode_frame, frame)
 
-            # 3. OCR 识别（独立进程池）
+            # 3. OCR 识别（独立进程池，不阻塞事件循环）
             ocr_text, fp = await loop.run_in_executor(
                 self._executor,
                 process_image_worker,
                 image_bytes
             )
 
+            # 4. 无论 OCR 是否有结果，都通知上层更新 AI 上下文
             if not ocr_text:
                 logger.debug("OCR 未识别到文字")
+                if self.on_snapshot:
+                    try:
+                        self.on_snapshot("", "")
+                    except Exception as e:
+                        logger.error(f"on_snapshot 回调失败: {e}")
                 return None
 
-            # 4. 保存当前帧供回调使用
+            # 4. 保存原始帧供回调使用
             ts = int(datetime.now().timestamp() * 1000)
             image_path = config.SNAPSHOTS_DIR / f"current_{ts}.jpg"
-            cv2.imwrite(str(image_path), corrected)
+            cv2.imwrite(str(image_path), frame)
 
             # 5. 始终通知上层（更新 AI 上下文）
             if self.on_snapshot:

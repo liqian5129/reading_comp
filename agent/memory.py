@@ -145,7 +145,7 @@ class Memory:
 1. 解释、总结和讨论当前书页内容
 2. 回答用户关于书中知识点的问题
 3. 记录读书笔记和想法
-4. 管理阅读会话（开始、结束、查看历史）
+4. 查询阅读历史和笔记
 5. 闲聊、推荐书单、回答其他日常问题
 
 回答风格：友好自然，简洁明了，适合语音播报（避免过长列举，少用 markdown 格式）。
@@ -163,12 +163,11 @@ class Memory:
         if self.current_page_ocr:
             # 截取前 2000 字符，避免超出 token 限制
             page_text = self.current_page_ocr[:2000]
-            parts.append(f"""
-【当前书页内容】
-{page_text}
-{"...(内容已截断)" if len(self.current_page_ocr) > 2000 else ""}
-用户可能会询问关于这页内容的问题。
-""")
+            truncated = "...(内容已截断)" if len(self.current_page_ocr) > 2000 else ""
+            parts.append(f"""【当前书页内容（摄像头已自动识别）】
+以下是摄像头刚刚拍摄并 OCR 识别的书页文字，你已经看到了这些内容，请直接基于它回答用户问题，无需再次拍照：
+
+{page_text}{truncated}""")
         
         return "\n\n".join(parts)
     

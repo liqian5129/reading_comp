@@ -92,7 +92,6 @@ class ReadingCompanion:
             logger.info("🔧 调试模式：跳过 AI / ASR / TTS / 飞书初始化")
 
             self.scanner = AutoScanner(self.session_manager)
-            self.scanner.on_page_turn = self._on_page_turn
             self.scanner.on_snapshot = self._on_snapshot
             if config.SCANNER_ENABLED:
                 await self.scanner.start()
@@ -126,7 +125,6 @@ class ReadingCompanion:
 
         # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
-        self.scanner.on_page_turn = self._on_page_turn
         self.scanner.on_snapshot = self._on_snapshot
         if config.SCANNER_ENABLED:
             await self.scanner.start()
@@ -255,7 +253,10 @@ class ReadingCompanion:
             system_prompt = self.memory.build_system_prompt()
             history = self.memory.get_history()
             tools = self.tool_registry.get_tools()
-            logger.info(f"   历史消息数: {len(history)}, 工具数: {len(tools)}")
+            page_ctx_len = len(self.memory.current_page_ocr)
+            logger.info(f"   历史消息数: {len(history)}, 工具数: {len(tools)}, "
+                        f"书页上下文: {page_ctx_len}字"
+                        + (" ✓" if page_ctx_len else " (无)"))
             
             response = await self.llm.chat(
                 user_message=text,
@@ -355,14 +356,17 @@ class ReadingCompanion:
         """处理飞书消息"""
         return await self._process_user_message(text, channel="feishu")
     
-    def _on_page_turn(self, page_count: int):
-        """翻页回调"""
-        logger.info(f"📖 已翻到第 {page_count} 页")
-    
     def _on_snapshot(self, ocr_text: str, image_path: str):
-        """快照回调"""
+        """快照回调：将 OCR 文字写入 AI 上下文"""
+        MIN_OCR_LEN = 10  # 少于此字数视为无效内容
+        if not ocr_text or len(ocr_text.strip()) < MIN_OCR_LEN:
+            self.memory.set_page_context("读书的内容为空")
+            logger.info(f"📖 OCR 内容不足（{len(ocr_text.strip()) if ocr_text else 0}字），AI 上下文已设为「读书的内容为空」")
+            return
         self.memory.set_page_context(ocr_text, image_path)
-        logger.debug(f"📸 快照已更新，文本长度: {len(ocr_text)}")
+        preview = ocr_text[:80].replace('\n', ' ')
+        logger.info(f"📖 书页上下文已注入 ({len(ocr_text)}字) → 下次 AI 对话生效")
+        logger.info(f"   预览: {preview}…")
     
     async def _check_and_push_feishu(self):
         """检查并推送飞书总结"""

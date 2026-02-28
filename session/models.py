@@ -109,9 +109,9 @@ class Note:
 
     @property
     def utc_filename(self) -> str:
-        """用于 JSON 文件命名的 UTC 时间字符串"""
-        dt = datetime.utcfromtimestamp(self.ts / 1000)
-        return dt.strftime("%Y%m%dT%H%M%SZ")
+        """用于 JSON 文件命名的本地时间字符串"""
+        dt = datetime.fromtimestamp(self.ts / 1000)
+        return dt.strftime("%Y%m%dT%H%M%S")
 
 
 @dataclass

@@ -1,0 +1,23 @@
+# Config (contains secrets/credentials)
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data
+data/sessions.db
+data/snapshots/
+data/notes/
+
+# OS
+.DS_Store
