@@ -121,7 +121,12 @@ class ReadingCompanion:
         )
         
         # 6. 语音
-        self.asr = create_asr(config.ALIYUN_NLS_APP_KEY, config.ALIYUN_NLS_TOKEN)
+        self.asr = create_asr(
+            app_key=config.ALIYUN_NLS_APP_KEY,
+            token=config.ALIYUN_NLS_TOKEN,
+            access_key_id=config.ALIYUN_NLS_ACCESS_KEY_ID,
+            access_key_secret=config.ALIYUN_NLS_ACCESS_KEY_SECRET,
+        )
         self.recorder = VoiceRecorder(
             self.asr,
             loop=self.loop,
