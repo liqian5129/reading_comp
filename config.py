@@ -93,6 +93,9 @@ class Config:
         self.CAMERA_DEVICE = self._get("camera", "device", 0)
         self.AUTO_SCAN_INTERVAL = self._get("camera", "auto_scan_interval", 2)
         self.SCANNER_ENABLED = self._get("camera", "scanner_enabled", False)
+
+        # 调试模式：跳过 ASR/AI/TTS/飞书，仅运行摄像头+OCR
+        self.DEBUG_MODE = self._get("debug", "debug_mode", False)
         
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
