@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Callable
 
 from camera import fingerprint, is_page_turn
-from camera.capture import CameraCapture
+from camera.capture import CameraCapture, find_external_camera
 from ocr.engine import create_ocr_engine
 from config import config
 
@@ -121,7 +121,8 @@ class AutoScanner:
         self._running = True
         self._executor = ProcessPoolExecutor(max_workers=1)
 
-        self._camera = CameraCapture(config.CAMERA_DEVICE)
+        device = find_external_camera() if config.CAMERA_AUTO_DETECT else config.CAMERA_DEVICE
+        self._camera = CameraCapture(device)
         if not self._camera.open():
             logger.error("摄像头无法打开，扫描器启动失败")
             self._running = False
