@@ -26,7 +26,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import config
-from camera.capture import CameraCapture
+from camera.capture import CameraCapture, find_external_camera
+from ocr.engine import sort_dual_page_lines
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,12 +95,15 @@ def draw_cn_multiline(img: np.ndarray, lines: List[str], xy: tuple,
 COLS        = 4
 PANEL_W     = 380
 PANEL_H     = 285
-TEXT_ROW_H  = 300
+TEXT_ROW_H  = 480          # 加高，容纳更多 OCR 文字
 WIN_W       = PANEL_W * COLS   # 1520
-WIN_H       = PANEL_H + TEXT_ROW_H  # 585
+WIN_H       = PANEL_H + TEXT_ROW_H  # 765
 
 # 计时条高度（面板底部）
 TIMING_H = 22
+
+# OCR 结果保存目录
+_OCR_OUT_DIR = Path(__file__).parent / "data" / "ocr_results"
 
 
 def ms(t: float) -> str:
@@ -184,18 +188,43 @@ def panel_detection(output_img: Optional[np.ndarray],
     return p
 
 
-def panel_text(lines: List[str], status: str, t_recog: float, t_total: float) -> np.ndarray:
+def panel_text(lines: List[str], status: str, t_recog: float, t_total: float,
+               last_txt: str = "") -> np.ndarray:
     p = np.full((TEXT_ROW_H, WIN_W, 3), 18, dtype=np.uint8)
 
     # 状态行
     cv2.putText(p, f"5. OCR Result  |  {status}", (10, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.50, (80, 160, 255), 1)
+    if last_txt:
+        saved_label = f"saved -> {last_txt}"
+        cv2.putText(p, saved_label, (WIN_W - 10 - len(saved_label) * 7, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (80, 200, 80), 1)
     cv2.line(p, (0, 30), (WIN_W, 30), (50, 50, 50), 1)
 
+    TEXT_AREA_H = TEXT_ROW_H - 30 - (TIMING_H + 4)  # 可用高度
+    FONT_SIZE   = 13
+    LINE_GAP    = 3
+    LINE_STEP   = FONT_SIZE + LINE_GAP
+    MAX_LINES   = TEXT_AREA_H // LINE_STEP
+    COL_W       = WIN_W // 3
+    MAX_CHARS   = COL_W // (FONT_SIZE // 2 + 1)  # 每行最多字符数（粗估）
+
     if lines:
-        mid = (len(lines) + 1) // 2
-        p = draw_cn_multiline(p, lines[:mid],    xy=(10,           36))
-        p = draw_cn_multiline(p, lines[mid:],    xy=(WIN_W // 2 + 10, 36))
+        per_col = (MAX_LINES + 2) // 3  # 每列最多显示行数（超宽行会折行，此处按原始行算）
+        cols = [lines[:per_col], lines[per_col:per_col*2], lines[per_col*2:per_col*3]]
+        for ci, col_lines in enumerate(cols):
+            if col_lines:
+                p = draw_cn_multiline(p, col_lines,
+                                      xy=(COL_W * ci + 10, 36),
+                                      size=FONT_SIZE, gap=LINE_GAP,
+                                      max_chars=MAX_CHARS)
+        # 提示是否有截断
+        total = len(lines)
+        shown = per_col * 3
+        if total > shown:
+            p = draw_cn(p, f"...（共{total}行，窗口仅显示{shown}行，完整见 txt）",
+                        xy=(10, TEXT_ROW_H - TIMING_H - 24),
+                        size=12, color=(160, 160, 80))
     else:
         p = draw_cn(p, "（暂无识别文字）", xy=(10, 40), color=(100, 100, 100))
 
@@ -216,7 +245,7 @@ def panel_text(lines: List[str], status: str, t_recog: float, t_total: float) ->
 def build_display(frame, t_capture, scanning, next_in,
                   rot_img, angle, output_img,
                   rec_polys, rec_scores, rec_texts,
-                  ocr_lines, status,
+                  ocr_lines, status, last_txt,
                   timings: Dict[str, float]) -> np.ndarray:
     p1 = panel_original(frame, t_capture, scanning, next_in)
     p2 = panel_orientation(rot_img, angle,     timings.get('orientation', 0))
@@ -232,7 +261,8 @@ def build_display(frame, t_capture, scanning, next_in,
 
     bottom = panel_text(ocr_lines, status,
                         timings.get('recognition', 0),
-                        timings.get('total', 0))
+                        timings.get('total', 0),
+                        last_txt)
     div = np.full((2, WIN_W, 3), 60, dtype=np.uint8)
     return np.vstack([top, div, bottom])
 
@@ -257,11 +287,11 @@ class TimedOCR:
             # server 级模型：检测+识别精度最高（已下载，无需联网）
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
-            # 限最长边为 960px → 书页横图分辨率更高
-            text_det_limit_side_len=960,
+            # 与相机输出宽度一致，避免缩图损失细节
+            text_det_limit_side_len=1280,
             text_det_limit_type='max',
             # 降低检测阈值 → 减少漏检
-            text_det_box_thresh=0.5,
+            text_det_box_thresh=0.4,
             # 扩大文字框 → 密排书页文字更完整
             text_det_unclip_ratio=1.8,
         )
@@ -302,7 +332,8 @@ class TimedOCR:
         # 必须 clear() 而非 self.timings = {}，否则闭包里的引用失效
         self.timings.clear()
         t0 = time.perf_counter()
-        result = self._ocr.predict(frame)
+        from ocr.engine import _sharpen
+        result = self._ocr.predict(_sharpen(frame))
         self.timings['total'] = time.perf_counter() - t0
         return result
 
@@ -329,6 +360,56 @@ class TimedOCR:
 
 
 # ---------------------------------------------------------------------------
+# OCR 结果保存
+# ---------------------------------------------------------------------------
+
+def _save_ocr_txt(polys: list, rec_texts: list, rec_scores: list,
+                  timings: Dict[str, float], angle, ts: str) -> str:
+    """
+    将全部 OCR 检测结果（含低置信度行）排序后写入 txt 文件。
+
+    使用 sort_dual_page_lines(score_thresh=0) 将所有框按双页布局排序，
+    低置信度行（score<0.5）保留但附注 [low=xx]，方便人工校对。
+    文件保存在 data/ocr_results/ 目录。
+    """
+    try:
+        _OCR_OUT_DIR.mkdir(parents=True, exist_ok=True)
+        fname = f"ocr_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        fpath = _OCR_OUT_DIR / fname
+
+        # score_thresh=0 → 保留全部行，仅排序不过滤
+        all_sorted = sort_dual_page_lines(polys, rec_texts, rec_scores,
+                                          score_thresh=0.0)
+
+        # 建立 text→score 映射（同一文字可能出现多次，用列表）
+        from collections import defaultdict
+        score_map: dict = defaultdict(list)
+        for t, s in zip(rec_texts, rec_scores):
+            score_map[t].append(s)
+
+        lines_out = [
+            f"# OCR Result  {ts}",
+            f"# angle={angle}  "
+            f"total={timings.get('total', 0)*1000:.0f}ms  "
+            f"detected={len(rec_texts)}",
+            "-" * 60,
+        ]
+        for text in all_sorted:
+            scores_for_text = score_map.get(text, [])
+            score = scores_for_text.pop(0) if scores_for_text else 1.0
+            mark = f"  [low={score:.2f}]" if score < 0.5 else ""
+            lines_out.append(f"{text}{mark}")
+        lines_out.append("")
+
+        fpath.write_text("\n".join(lines_out), encoding="utf-8")
+        logger.info(f"OCR 结果已保存: {fpath}  ({len(all_sorted)} 行)")
+        return fname
+    except Exception as e:
+        logger.warning(f"保存 OCR txt 失败: {e}")
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # OCR 后台工作线程
 # ---------------------------------------------------------------------------
 
@@ -350,7 +431,8 @@ class OCRWorker:
         self.rec_scores: list = []
         self.ocr_lines:  list = []
         self.timings:    Dict[str, float] = {}
-        self.status = "等待第一次扫描..."
+        self.status   = "等待第一次扫描..."
+        self.last_txt = ""   # 最近保存的 txt 文件名（短名）
 
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="ocr-worker")
@@ -407,14 +489,11 @@ class OCRWorker:
                 out_img = pre['output_img'] if pre else None
 
                 # 检测结果
-                rec_polys  = r['rec_polys']  or []
+                rec_polys  = r.get('rec_polys') or r.get('dt_polys') or []
                 rec_texts  = r['rec_texts']  or []
                 rec_scores = r['rec_scores'] or []
-                if not rec_polys:
-                    rec_polys = r['dt_polys'] or []
 
-                lines = [t for t, s in zip(rec_texts, rec_scores)
-                         if s >= 0.5 and t.strip()]
+                lines = sort_dual_page_lines(rec_polys, rec_texts, rec_scores)
 
                 # 更新共享状态
                 self.rot_img    = rot_img
@@ -433,6 +512,9 @@ class OCRWorker:
                 self._timed_ocr.log_timings()
                 if lines:
                     logger.info("前3行: " + " | ".join(lines[:3]))
+                # 保存全部检测结果（含低置信度）到 txt，panel 仍用过滤后的 lines
+                self.last_txt = _save_ocr_txt(
+                    rec_polys, rec_texts, rec_scores, timings, angle, ts)
 
             except Exception as e:
                 self.status = f"[{ts}] ERR: {e}"
@@ -448,8 +530,10 @@ class OCRWorker:
 def main():
     print("=" * 62)
     print("  摄像头 + OCR 完整流水线可视化（含逐步计时）")
-    print(f"  摄像头: {config.CAMERA_DEVICE}   扫描间隔: {config.AUTO_SCAN_INTERVAL}s")
+    _device = find_external_camera() if config.CAMERA_AUTO_DETECT else config.CAMERA_DEVICE
+    print(f"  摄像头: {_device}{'(自动探测)' if config.CAMERA_AUTO_DETECT else ''}   扫描间隔: {config.AUTO_SCAN_INTERVAL}s")
     print(f"  窗口:   {WIN_W} x {WIN_H}")
+    print(f"  OCR txt: {_OCR_OUT_DIR}/")
     print("  Q/ESC 退出   S 立即扫描")
     print("=" * 62)
 
@@ -458,9 +542,9 @@ def main():
     else:
         logger.info(f"字体: {_FONT_PATH}")
 
-    camera = CameraCapture(config.CAMERA_DEVICE)
+    camera = CameraCapture(_device)
     if not camera.open():
-        print(f"错误: 无法打开摄像头 {config.CAMERA_DEVICE}")
+        print(f"错误: 无法打开摄像头 {_device}")
         sys.exit(1)
 
     worker = OCRWorker()
@@ -494,7 +578,8 @@ def main():
             frame, t_capture, worker.is_scanning, next_in,
             worker.rot_img, worker.angle, worker.output_img,
             worker.rec_polys, worker.rec_scores, worker.rec_texts,
-            worker.ocr_lines, worker.status, worker.timings,
+            worker.ocr_lines, worker.status, worker.last_txt,
+            worker.timings,
         )
         cv2.imshow("Pipeline Debug", display)
 

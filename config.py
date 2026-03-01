@@ -91,6 +91,8 @@ class Config:
         
         # 摄像头
         self.CAMERA_DEVICE = self._get("camera", "device", 0)
+        # True 时自动探测第一个外接 USB 摄像头（忽略 camera.device 设置）
+        self.CAMERA_AUTO_DETECT = self._get("camera", "auto_detect", False)
         self.AUTO_SCAN_INTERVAL = self._get("camera", "auto_scan_interval", 2)
         self.SCANNER_ENABLED = self._get("camera", "scanner_enabled", False)
 
