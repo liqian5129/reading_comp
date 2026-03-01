@@ -9,7 +9,10 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 from pathlib import Path
 
-from .models import ReadingSession, PageSnapshot, Note, DailySummary
+from .models import (
+    ReadingSession, PageSnapshot, Note, DailySummary,
+    Book, BookProgress, Bookmark, ReadingListItem,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,21 +77,72 @@ class Storage:
                 page_ocr_context TEXT DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS books (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT UNIQUE NOT NULL,
+                author TEXT DEFAULT '',
+                genre TEXT DEFAULT '',
+                total_pages INTEGER DEFAULT 0,
+                cover_image_path TEXT DEFAULT '',
+                created_at INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS reading_progress (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INTEGER NOT NULL,
+                book_title TEXT NOT NULL,
+                last_page_num INTEGER DEFAULT 0,
+                last_page_ocr TEXT DEFAULT '',
+                last_read_at INTEGER DEFAULT 0,
+                total_read_time_ms INTEGER DEFAULT 0,
+                total_pages_read INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'reading',
+                FOREIGN KEY (book_id) REFERENCES books(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INTEGER NOT NULL,
+                book_title TEXT NOT NULL,
+                session_id TEXT DEFAULT '',
+                page_num INTEGER DEFAULT 0,
+                page_ocr_excerpt TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                bookmark_type TEXT DEFAULT 'manual',
+                ts INTEGER NOT NULL,
+                FOREIGN KEY (book_id) REFERENCES books(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS reading_list (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                author TEXT DEFAULT '',
+                status TEXT DEFAULT 'want',
+                priority INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                added_at INTEGER DEFAULT 0,
+                started_at INTEGER,
+                finished_at INTEGER
+            );
+
             CREATE INDEX IF NOT EXISTS idx_snapshots_session ON snapshots(session_id);
             CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_at);
+            CREATE INDEX IF NOT EXISTS idx_bookmarks_book ON bookmarks(book_id);
+            CREATE INDEX IF NOT EXISTS idx_progress_book ON reading_progress(book_id);
         """)
         await self._conn.commit()
 
         # 迁移：为旧版本数据库补充新列
-        for col, definition in [
-            ("book_name", "TEXT DEFAULT ''"),
-            ("tags", "TEXT DEFAULT '[]'"),
-        ]:
+        migrations = [
+            ("notes", "book_name", "TEXT DEFAULT ''"),
+            ("notes", "tags", "TEXT DEFAULT '[]'"),
+        ]
+        for table, col, definition in migrations:
             try:
-                await self._conn.execute(f"ALTER TABLE notes ADD COLUMN {col} {definition}")
+                await self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
                 await self._conn.commit()
-                logger.info(f"notes 表已迁移：添加列 {col}")
+                logger.info(f"{table} 表已迁移：添加列 {col}")
             except Exception:
                 pass  # 列已存在
     
@@ -406,3 +460,322 @@ class Storage:
             summary.total_notes = row['count'] if row else 0
         
         return summary
+
+    # ==================== Books ====================
+
+    async def get_or_create_book(self, title: str, author: str = "") -> Book:
+        """获取或创建书籍（按 title 去重）"""
+        async with self._conn.execute(
+            "SELECT * FROM books WHERE title = ?", (title,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return self._row_to_book(row)
+
+        ts = int(datetime.now().timestamp() * 1000)
+        cursor = await self._conn.execute(
+            "INSERT INTO books (title, author, created_at) VALUES (?, ?, ?)",
+            (title, author, ts)
+        )
+        await self._conn.commit()
+        book_id = cursor.lastrowid
+        return Book(id=book_id, title=title, author=author, created_at=ts)
+
+    @staticmethod
+    def _row_to_book(row) -> Book:
+        return Book(
+            id=row['id'],
+            title=row['title'],
+            author=row['author'] or "",
+            genre=row['genre'] or "",
+            total_pages=row['total_pages'] or 0,
+            cover_image_path=row['cover_image_path'] or "",
+            created_at=row['created_at'] or 0,
+        )
+
+    # ==================== BookProgress ====================
+
+    async def upsert_book_progress(
+        self,
+        book_id: int,
+        book_title: str,
+        page_num: int = 0,
+        page_ocr: str = "",
+        add_read_time_ms: int = 0,
+        status: str = "",
+    ) -> BookProgress:
+        """插入或更新阅读进度"""
+        ts = int(datetime.now().timestamp() * 1000)
+
+        async with self._conn.execute(
+            "SELECT * FROM reading_progress WHERE book_id = ?", (book_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if row is None:
+            cursor = await self._conn.execute(
+                """INSERT INTO reading_progress
+                   (book_id, book_title, last_page_num, last_page_ocr, last_read_at,
+                    total_read_time_ms, total_pages_read, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (book_id, book_title, page_num, page_ocr[:500], ts,
+                 add_read_time_ms, 1 if page_num else 0, status or "reading")
+            )
+            await self._conn.commit()
+            progress_id = cursor.lastrowid
+        else:
+            progress_id = row['id']
+            new_status = status if status else row['status']
+            new_pages_read = row['total_pages_read'] + (1 if page_num and page_num != row['last_page_num'] else 0)
+            await self._conn.execute(
+                """UPDATE reading_progress
+                   SET last_page_num = ?, last_page_ocr = ?, last_read_at = ?,
+                       total_read_time_ms = total_read_time_ms + ?,
+                       total_pages_read = ?, status = ?
+                   WHERE id = ?""",
+                (page_num or row['last_page_num'],
+                 page_ocr[:500] if page_ocr else row['last_page_ocr'],
+                 ts, add_read_time_ms, new_pages_read, new_status, progress_id)
+            )
+            await self._conn.commit()
+
+        async with self._conn.execute(
+            "SELECT * FROM reading_progress WHERE id = ?", (progress_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return self._row_to_progress(row)
+
+    async def get_book_progress(self, book_title: str) -> Optional[BookProgress]:
+        """按书名查询阅读进度"""
+        async with self._conn.execute(
+            "SELECT * FROM reading_progress WHERE book_title = ?", (book_title,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return self._row_to_progress(row) if row else None
+
+    async def list_book_progress(self, status: str = "") -> List[BookProgress]:
+        """列出所有阅读进度（可按状态过滤）"""
+        if status:
+            sql = "SELECT * FROM reading_progress WHERE status = ? ORDER BY last_read_at DESC"
+            params = (status,)
+        else:
+            sql = "SELECT * FROM reading_progress ORDER BY last_read_at DESC"
+            params = ()
+        results = []
+        async with self._conn.execute(sql, params) as cursor:
+            async for row in cursor:
+                results.append(self._row_to_progress(row))
+        return results
+
+    @staticmethod
+    def _row_to_progress(row) -> BookProgress:
+        return BookProgress(
+            id=row['id'],
+            book_id=row['book_id'],
+            book_title=row['book_title'],
+            last_page_num=row['last_page_num'] or 0,
+            last_page_ocr=row['last_page_ocr'] or "",
+            last_read_at=row['last_read_at'] or 0,
+            total_read_time_ms=row['total_read_time_ms'] or 0,
+            total_pages_read=row['total_pages_read'] or 0,
+            status=row['status'] or "reading",
+        )
+
+    # ==================== Bookmarks ====================
+
+    async def create_bookmark(
+        self,
+        book_id: int,
+        book_title: str,
+        session_id: str,
+        page_num: int = 0,
+        page_ocr_excerpt: str = "",
+        note: str = "",
+        bookmark_type: str = "manual",
+    ) -> Bookmark:
+        """创建书签"""
+        ts = int(datetime.now().timestamp() * 1000)
+        cursor = await self._conn.execute(
+            """INSERT INTO bookmarks
+               (book_id, book_title, session_id, page_num, page_ocr_excerpt, note, bookmark_type, ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (book_id, book_title, session_id, page_num,
+             page_ocr_excerpt[:200], note, bookmark_type, ts)
+        )
+        await self._conn.commit()
+        bm_id = cursor.lastrowid
+        return Bookmark(
+            id=bm_id, book_id=book_id, book_title=book_title,
+            session_id=session_id, page_num=page_num,
+            page_ocr_excerpt=page_ocr_excerpt[:200],
+            note=note, bookmark_type=bookmark_type, ts=ts,
+        )
+
+    async def list_bookmarks(self, book_title: str = "", limit: int = 20) -> List[Bookmark]:
+        """列出书签"""
+        if book_title:
+            sql = "SELECT * FROM bookmarks WHERE book_title = ? ORDER BY ts DESC LIMIT ?"
+            params = (book_title, limit)
+        else:
+            sql = "SELECT * FROM bookmarks ORDER BY ts DESC LIMIT ?"
+            params = (limit,)
+        results = []
+        async with self._conn.execute(sql, params) as cursor:
+            async for row in cursor:
+                results.append(self._row_to_bookmark(row))
+        return results
+
+    @staticmethod
+    def _row_to_bookmark(row) -> Bookmark:
+        return Bookmark(
+            id=row['id'],
+            book_id=row['book_id'],
+            book_title=row['book_title'],
+            session_id=row['session_id'] or "",
+            page_num=row['page_num'] or 0,
+            page_ocr_excerpt=row['page_ocr_excerpt'] or "",
+            note=row['note'] or "",
+            bookmark_type=row['bookmark_type'] or "manual",
+            ts=row['ts'],
+        )
+
+    # ==================== Reading List ====================
+
+    async def reading_list_add(self, title: str, author: str = "", notes: str = "", priority: int = 0) -> ReadingListItem:
+        """加入书单"""
+        # 如已存在则直接返回
+        async with self._conn.execute(
+            "SELECT * FROM reading_list WHERE title = ?", (title,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return self._row_to_list_item(row)
+
+        ts = int(datetime.now().timestamp() * 1000)
+        cursor = await self._conn.execute(
+            "INSERT INTO reading_list (title, author, status, priority, notes, added_at) VALUES (?, ?, 'want', ?, ?, ?)",
+            (title, author, priority, notes, ts)
+        )
+        await self._conn.commit()
+        item_id = cursor.lastrowid
+        return ReadingListItem(id=item_id, title=title, author=author, priority=priority, notes=notes, added_at=ts)
+
+    async def reading_list_update_status(self, title: str, status: str) -> bool:
+        """更新书单状态"""
+        ts = int(datetime.now().timestamp() * 1000)
+        extra = ""
+        params: list = [status]
+        if status == "reading":
+            extra = ", started_at = ?"
+            params.append(ts)
+        elif status == "done":
+            extra = ", finished_at = ?"
+            params.append(ts)
+        params.append(title)
+        await self._conn.execute(
+            f"UPDATE reading_list SET status = ?{extra} WHERE title = ?", params
+        )
+        await self._conn.commit()
+        return True
+
+    async def reading_list_remove(self, title: str) -> bool:
+        """从书单移除"""
+        await self._conn.execute("DELETE FROM reading_list WHERE title = ?", (title,))
+        await self._conn.commit()
+        return True
+
+    async def reading_list_get_all(self, status: str = "") -> List[ReadingListItem]:
+        """获取书单列表"""
+        if status:
+            sql = "SELECT * FROM reading_list WHERE status = ? ORDER BY priority DESC, added_at DESC"
+            params = (status,)
+        else:
+            sql = "SELECT * FROM reading_list ORDER BY priority DESC, added_at DESC"
+            params = ()
+        results = []
+        async with self._conn.execute(sql, params) as cursor:
+            async for row in cursor:
+                results.append(self._row_to_list_item(row))
+        return results
+
+    @staticmethod
+    def _row_to_list_item(row) -> ReadingListItem:
+        return ReadingListItem(
+            id=row['id'],
+            title=row['title'],
+            author=row['author'] or "",
+            status=row['status'] or "want",
+            priority=row['priority'] or 0,
+            notes=row['notes'] or "",
+            added_at=row['added_at'] or 0,
+            started_at=row['started_at'],
+            finished_at=row['finished_at'],
+        )
+
+    # ==================== Reading Stats ====================
+
+    async def get_reading_stats(
+        self,
+        period: str = "today",
+        book_title: str = "",
+    ) -> dict:
+        """阅读统计：翻页数 / 时长 / 笔记数"""
+        now = datetime.now()
+        if period == "today":
+            since_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        elif period == "week":
+            since_ts = int((now - timedelta(days=7)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp() * 1000)
+        elif period == "month":
+            since_ts = int((now - timedelta(days=30)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp() * 1000)
+        else:  # all
+            since_ts = 0
+
+        # 会话筛选
+        book_filter = " AND book_name = ?" if book_title else ""
+        params_base = [since_ts] + ([book_title] if book_title else [])
+
+        async with self._conn.execute(
+            f"SELECT COUNT(*) as cnt, SUM(total_pages) as pages, SUM(end_at - start_at) as duration_ms"
+            f" FROM sessions WHERE start_at >= ? AND end_at IS NOT NULL{book_filter}",
+            params_base,
+        ) as cursor:
+            row = await cursor.fetchone()
+            total_pages = row['pages'] or 0
+            total_duration_ms = row['duration_ms'] or 0
+            session_count = row['cnt'] or 0
+
+        # 笔记数
+        note_filter = " AND book_name = ?" if book_title else ""
+        async with self._conn.execute(
+            f"SELECT COUNT(*) as cnt FROM notes WHERE ts >= ?{note_filter}",
+            [since_ts] + ([book_title] if book_title else []),
+        ) as cursor:
+            row = await cursor.fetchone()
+            note_count = row['cnt'] or 0
+
+        # 书签数
+        bm_filter = " AND book_title = ?" if book_title else ""
+        async with self._conn.execute(
+            f"SELECT COUNT(*) as cnt FROM bookmarks WHERE ts >= ?{bm_filter}",
+            [since_ts] + ([book_title] if book_title else []),
+        ) as cursor:
+            row = await cursor.fetchone()
+            bookmark_count = row['cnt'] or 0
+
+        minutes = total_duration_ms // 60000
+        duration_str = f"{minutes} 分钟" if minutes < 60 else f"{minutes // 60} 小时 {minutes % 60} 分钟"
+
+        return {
+            "period": period,
+            "book_title": book_title,
+            "session_count": session_count,
+            "total_pages": total_pages,
+            "total_duration_ms": total_duration_ms,
+            "duration_str": duration_str,
+            "note_count": note_count,
+            "bookmark_count": bookmark_count,
+        }

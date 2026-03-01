@@ -3,11 +3,12 @@
 管理阅读会话的生命周期
 """
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Optional, List
 
-from .models import ReadingSession, PageSnapshot, Note
+from .models import ReadingSession, PageSnapshot, Note, Book, BookProgress, Bookmark, ReadingListItem
 from .storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -163,7 +164,7 @@ class SessionManager:
         note = Note(
             id=0,
             session_id=self._current_session.id if self._current_session else "",
-            ts=int(datetime.utcnow().timestamp() * 1000),
+            ts=int(time.time() * 1000),
             content=content,
             book_name=book_name,
             tags=tags or [],
@@ -227,3 +228,108 @@ class SessionManager:
         if not sid:
             return []
         return await self.storage.get_session_snapshots(sid)
+
+    # ==================== 书签 ====================
+
+    async def create_bookmark(
+        self,
+        book_title: str,
+        page_num: int = 0,
+        page_ocr_excerpt: str = "",
+        note: str = "",
+        bookmark_type: str = "manual",
+    ) -> Bookmark:
+        """创建书签（自动关联或创建书籍）"""
+        book = await self.storage.get_or_create_book(book_title)
+        session_id = self._current_session.id if self._current_session else ""
+        return await self.storage.create_bookmark(
+            book_id=book.id,
+            book_title=book_title,
+            session_id=session_id,
+            page_num=page_num,
+            page_ocr_excerpt=page_ocr_excerpt,
+            note=note,
+            bookmark_type=bookmark_type,
+        )
+
+    async def list_bookmarks(self, book_title: str = "", limit: int = 20) -> List[Bookmark]:
+        return await self.storage.list_bookmarks(book_title=book_title, limit=limit)
+
+    # ==================== 阅读进度 ====================
+
+    async def upsert_book_progress(
+        self,
+        book_title: str,
+        page_num: int = 0,
+        page_ocr: str = "",
+        add_read_time_ms: int = 0,
+        status: str = "",
+    ) -> BookProgress:
+        """更新阅读进度"""
+        book = await self.storage.get_or_create_book(book_title)
+        return await self.storage.upsert_book_progress(
+            book_id=book.id,
+            book_title=book_title,
+            page_num=page_num,
+            page_ocr=page_ocr,
+            add_read_time_ms=add_read_time_ms,
+            status=status,
+        )
+
+    async def get_book_progress(self, book_title: str) -> Optional[BookProgress]:
+        return await self.storage.get_book_progress(book_title)
+
+    async def list_book_progress(self, status: str = "") -> List[BookProgress]:
+        return await self.storage.list_book_progress(status=status)
+
+    # ==================== 阅读统计 ====================
+
+    async def get_reading_stats(self, period: str = "today", book_title: str = "") -> dict:
+        """获取阅读统计（today/week/month/all）"""
+        return await self.storage.get_reading_stats(period=period, book_title=book_title)
+
+    # ==================== 书单 ====================
+
+    async def manage_reading_list(
+        self,
+        action: str,
+        title: str = "",
+        author: str = "",
+        notes: str = "",
+        status: str = "",
+        priority: int = 0,
+    ) -> dict:
+        """
+        管理书单
+        action: add / list / mark_done / mark_reading / remove
+        """
+        if action == "add":
+            if not title:
+                return {"success": False, "error": "书名不能为空"}
+            item = await self.storage.reading_list_add(title, author, notes, priority)
+            return {"success": True, "action": "add", "item": item.to_dict()}
+
+        elif action == "list":
+            items = await self.storage.reading_list_get_all(status=status)
+            return {
+                "success": True,
+                "action": "list",
+                "items": [i.to_dict() for i in items],
+                "total": len(items),
+            }
+
+        elif action in ("mark_done", "mark_reading", "mark_want"):
+            new_status = {"mark_done": "done", "mark_reading": "reading", "mark_want": "want"}[action]
+            if not title:
+                return {"success": False, "error": "书名不能为空"}
+            await self.storage.reading_list_update_status(title, new_status)
+            return {"success": True, "action": action, "title": title, "status": new_status}
+
+        elif action == "remove":
+            if not title:
+                return {"success": False, "error": "书名不能为空"}
+            await self.storage.reading_list_remove(title)
+            return {"success": True, "action": "remove", "title": title}
+
+        else:
+            return {"success": False, "error": f"未知操作: {action}"}
