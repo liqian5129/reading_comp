@@ -85,16 +85,15 @@ class Note:
 
     def to_json_dict(self) -> dict:
         """用于写入 JSON 文件的完整格式"""
-        dt = datetime.utcfromtimestamp(self.ts / 1000)
+        dt = datetime.fromtimestamp(self.ts / 1000)  # 本地时间
         return {
             "id": self.id,
-            "utc_ts": self.ts,
-            "utc_datetime": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ts": self.ts,
+            "created_at": dt.strftime("%Y-%m-%d %H:%M:%S"),
             "book_name": self.book_name,
             "tags": self.tags,
             "content": self.content,
             "session_id": self.session_id,
-            "page_ocr_context": self.page_ocr_context,
         }
 
     @classmethod
@@ -112,6 +111,85 @@ class Note:
         """用于 JSON 文件命名的本地时间字符串"""
         dt = datetime.fromtimestamp(self.ts / 1000)
         return dt.strftime("%Y%m%dT%H%M%S")
+
+
+@dataclass
+class Book:
+    """书籍实体"""
+    id: int                          # 自增 ID
+    title: str                       # 书名（唯一）
+    author: str = ""                 # 作者
+    genre: str = ""                  # 类型/分类
+    total_pages: int = 0             # 总页数
+    cover_image_path: str = ""       # 封面图片路径
+    created_at: int = 0              # 创建时间戳 (ms)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class BookProgress:
+    """每本书的阅读进度"""
+    id: int                          # 自增 ID
+    book_id: int                     # 关联书籍 ID
+    book_title: str                  # 书名（冗余，方便查询）
+    last_page_num: int = 0           # 最后阅读页码
+    last_page_ocr: str = ""          # 最后页面 OCR 文本
+    last_read_at: int = 0            # 最后阅读时间戳 (ms)
+    total_read_time_ms: int = 0      # 累计阅读时长 (ms)
+    total_pages_read: int = 0        # 累计翻页数
+    status: str = "reading"          # reading / finished / paused
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @property
+    def status_str(self) -> str:
+        return {"reading": "阅读中", "finished": "已完成", "paused": "已暂停"}.get(self.status, self.status)
+
+
+@dataclass
+class Bookmark:
+    """书签"""
+    id: int                          # 自增 ID
+    book_id: int                     # 关联书籍 ID
+    book_title: str                  # 书名
+    session_id: str                  # 所属会话 ID
+    page_num: int = 0                # 页码（视觉识别或用户指定）
+    page_ocr_excerpt: str = ""       # 页面前 200 字
+    note: str = ""                   # 用户备注
+    bookmark_type: str = "manual"    # manual / auto
+    ts: int = 0                      # 创建时间戳 (ms)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @property
+    def created_at_str(self) -> str:
+        dt = datetime.fromtimestamp(self.ts / 1000)
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+
+@dataclass
+class ReadingListItem:
+    """书单条目"""
+    id: int                          # 自增 ID
+    title: str                       # 书名
+    author: str = ""                 # 作者
+    status: str = "want"             # want / reading / done
+    priority: int = 0                # 优先级（0=普通，1=高）
+    notes: str = ""                  # 备注
+    added_at: int = 0                # 加入时间戳 (ms)
+    started_at: Optional[int] = None # 开始阅读时间戳
+    finished_at: Optional[int] = None  # 完成时间戳
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @property
+    def status_str(self) -> str:
+        return {"want": "想读", "reading": "在读", "done": "已读"}.get(self.status, self.status)
 
 
 @dataclass

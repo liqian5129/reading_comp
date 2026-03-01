@@ -26,6 +26,8 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
+# OCR 内容少于此字数视为无效帧（与 main.py 保持一致）
+_MIN_OCR_LEN = 6
 
 # 全局 OCR 引擎（在子进程中使用）
 _ocr_engine = None
@@ -103,6 +105,9 @@ class AutoScanner:
         self.on_page_turn: Optional[Callable] = None
         self.on_snapshot: Optional[Callable[[str, str], None]] = None
 
+        # 视觉分析器（可选）
+        self._vision_analyzer = None
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -153,6 +158,10 @@ class AutoScanner:
     # ------------------------------------------------------------------
     # Session 控制
     # ------------------------------------------------------------------
+
+    def set_vision_analyzer(self, analyzer):
+        """设置视觉分析器"""
+        self._vision_analyzer = analyzer
 
     def set_session(self, session_id: str):
         """绑定阅读 session，后续扫描会存库并检测翻页"""
@@ -227,9 +236,9 @@ class AutoScanner:
                 image_bytes
             )
 
-            # 4. 无论 OCR 是否有结果，都通知上层更新 AI 上下文
-            if not ocr_text:
-                logger.debug("OCR 未识别到文字")
+            # 4. OCR 内容不足时通知上层（不触发视觉分析，节省 token）
+            if not ocr_text or len(ocr_text.strip()) < _MIN_OCR_LEN:
+                logger.debug(f"OCR 内容不足（{len(ocr_text.strip()) if ocr_text else 0}字），跳过视觉分析")
                 if self.on_snapshot:
                     try:
                         self.on_snapshot("", "")
@@ -251,6 +260,9 @@ class AutoScanner:
 
             # 6. Session 激活时才做翻页检测和存库
             if not self._session_id:
+                # 无 session 时也定期触发视觉分析（由内部间隔控制）
+                if self._vision_analyzer:
+                    self._vision_analyzer.trigger(str(image_path))
                 return None
 
             is_new_page = is_page_turn(self._last_fingerprint, fp)
@@ -266,11 +278,18 @@ class AutoScanner:
                 if is_new_page:
                     self._page_turn_count += 1
                     logger.info(f"检测到翻页，第 {self._page_turn_count} 页")
+                    # 翻页时用 force=True 立即触发视觉分析
+                    if self._vision_analyzer:
+                        self._vision_analyzer.trigger(str(image_path), force=True)
                     if self.on_page_turn:
                         try:
                             self.on_page_turn(self._page_turn_count)
                         except Exception as e:
                             logger.error(f"on_page_turn 回调失败: {e}")
+                else:
+                    # 非翻页也定期触发（由内部间隔控制）
+                    if self._vision_analyzer:
+                        self._vision_analyzer.trigger(str(image_path))
 
                 logger.debug(f"快照已保存: {snapshot.id}")
                 return str(image_path), ocr_text, fp

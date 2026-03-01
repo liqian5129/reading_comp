@@ -97,6 +97,12 @@ class Config:
         # 调试模式：跳过 ASR/AI/TTS/飞书，仅运行摄像头+OCR
         self.DEBUG_MODE = self._get("debug", "debug_mode", False)
         
+        # 视觉分析器（kimi-k2.5 原生支持图片，默认复用主模型）
+        self.VISION_ANALYZER_ENABLED = self._get("vision", "enabled", False)
+        self.VISION_MODEL = self._get("vision", "model", self.CURRENT_MODEL)
+        self.VISION_BASE_URL = self._get("vision", "base_url", self.CURRENT_BASE_URL)
+        self.VISION_API_KEY = self._get("vision", "api_key", self.CURRENT_API_KEY)
+
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
         self.DATA_DIR = Path(data_dir)
@@ -104,6 +110,7 @@ class Config:
         self.SNAPSHOTS_DIR = self.DATA_DIR / "snapshots"
         self.NOTES_DIR = self.DATA_DIR / "notes"
         self.PERSONA_FILE = self.DATA_DIR / "persona.json"
+        self.LONG_TERM_MEMORY_FILE = self.DATA_DIR / "long_term_memory.json"
     
     def _load_json_config(self):
         """从 config.json 加载配置"""

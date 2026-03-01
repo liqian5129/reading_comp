@@ -213,3 +213,123 @@ class SummaryPusher:
         
         await self.bot.send_interactive_card(chat_id, card)
         logger.info(f"会话总结已推送到飞书: {chat_id}")
+
+    # ==================== 新卡片类型 ====================
+
+    async def push_timer_alert(self, chat_id: str, message: str, minutes: int):
+        """
+        推送定时提醒卡片（黄色 ⏰）
+
+        Args:
+            chat_id: 会话 ID
+            message: 提醒内容
+            minutes: 设定的分钟数
+        """
+        now_str = datetime.now().strftime("%H:%M")
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": f"⏰ 阅读提醒"},
+                "template": "yellow",
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": f"**{message}**"},
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {"tag": "plain_text", "content": f"定时 {minutes} 分钟 · {now_str} 触发"}
+                    ],
+                },
+            ],
+        }
+        await self.bot.send_interactive_card(chat_id, card)
+        logger.info(f"定时提醒已推送到飞书: {chat_id}")
+
+    async def push_reading_card(
+        self, chat_id: str, card_type: str, content: str, book_title: str = ""
+    ):
+        """
+        推送阅读卡片（金句/知识点/摘要）
+
+        Args:
+            chat_id: 会话 ID
+            card_type: quote / knowledge / summary
+            content: 卡片内容
+            book_title: 来源书名
+        """
+        type_cfg = {
+            "quote":     ("💬 金句卡", "purple"),
+            "knowledge": ("🧠 知识点卡", "green"),
+            "summary":   ("📋 摘要卡", "blue"),
+        }
+        title, color = type_cfg.get(card_type, ("📖 阅读卡片", "blue"))
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        elements = [
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+            {"tag": "hr"},
+        ]
+        if book_title:
+            elements.append({
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": f"来源：《{book_title}》· {now_str}"}],
+            })
+        else:
+            elements.append({
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": now_str}],
+            })
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": color},
+            "elements": elements,
+        }
+        await self.bot.send_interactive_card(chat_id, card)
+        logger.info(f"阅读卡片（{card_type}）已推送到飞书: {chat_id}")
+
+    async def push_bookmark_created(self, chat_id: str, bookmark, book_title: str = ""):
+        """
+        推送书签创建通知（橙色 🔖）
+
+        Args:
+            chat_id: 会话 ID
+            bookmark: Bookmark 对象
+            book_title: 书名（冗余，用于显示）
+        """
+        title = book_title or getattr(bookmark, "book_title", "未知书籍")
+        page_hint = f"第 {bookmark.page_num} 页" if bookmark.page_num else ""
+        note_hint = f"\n备注：{bookmark.note}" if bookmark.note else ""
+
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**《{title}》{page_hint}**{note_hint}",
+                },
+            },
+        ]
+        if bookmark.page_ocr_excerpt:
+            excerpt = bookmark.page_ocr_excerpt[:100]
+            if len(bookmark.page_ocr_excerpt) > 100:
+                excerpt += "..."
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"> {excerpt}"},
+            })
+        elements.append({
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": bookmark.created_at_str}],
+        })
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": "🔖 书签已创建"}, "template": "orange"},
+            "elements": elements,
+        }
+        await self.bot.send_interactive_card(chat_id, card)
+        logger.info(f"书签通知已推送到飞书: {chat_id}")

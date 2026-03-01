@@ -123,19 +123,19 @@ class AIClient:
             messages.append(msg)
         
         # 添加当前用户消息
-        content = []
-        
+        # Kimi 文档示例：text 在前，image 在后
         if image_path:
             image_data = self._encode_image(image_path)
             if image_data:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": image_data}
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_message},
+                        {"type": "image_url", "image_url": {"url": image_data}},
+                    ]
                 })
-        
-        if isinstance(content, list):
-            content.append({"type": "text", "text": user_message})
-            messages.append({"role": "user", "content": content})
+            else:
+                messages.append({"role": "user", "content": user_message})
         else:
             messages.append({"role": "user", "content": user_message})
         

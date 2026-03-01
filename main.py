@@ -27,6 +27,8 @@ from session.manager import SessionManager
 from agent.ai_client import AIClient
 from agent.memory import Memory
 from agent.tools import ToolRegistry, ToolExecutor
+from agent.timer_manager import ReadingTimerManager
+from scanner.vision_analyzer import VisionAnalyzer
 from scanner.auto_scanner import AutoScanner
 from voice.asr import AliyunStreamASR, create_asr
 from voice.recorder import VoiceRecorder
@@ -64,6 +66,8 @@ class ReadingCompanion:
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_executor: Optional[ToolExecutor] = None
         self.scanner: Optional[AutoScanner] = None
+        self.vision_analyzer: Optional[VisionAnalyzer] = None
+        self.timer_manager: Optional[ReadingTimerManager] = None
         self.asr: Optional[AliyunStreamASR] = None
         self.recorder: Optional[VoiceRecorder] = None
         self.tts_player = None
@@ -72,6 +76,7 @@ class ReadingCompanion:
         
         # 状态
         self._running = False
+        self._last_valid_ocr_ts: float = 0.0  # 上次有效 OCR 的时间戳
         
     async def initialize(self):
         """初始化所有模块"""
@@ -120,8 +125,9 @@ class ReadingCompanion:
                 base_url=config.DOUBAO_BASE_URL
             )
 
-        self.memory = Memory(config.PERSONA_FILE)
+        self.memory = Memory(config.PERSONA_FILE, long_term_file=config.LONG_TERM_MEMORY_FILE)
         self.tool_registry = ToolRegistry()
+        self.timer_manager = ReadingTimerManager()
 
         # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
@@ -131,11 +137,34 @@ class ReadingCompanion:
         else:
             logger.info("📷 摄像头/OCR 扫描已禁用（camera.scanner_enabled=false）")
 
+        # 4b. 视觉分析器（需要支持图片的模型，默认关闭）
+        if config.VISION_ANALYZER_ENABLED:
+            if config.VISION_MODEL == config.CURRENT_MODEL:
+                vision_llm = self.llm  # 同一模型，复用客户端
+            else:
+                vision_llm = AIClient(
+                    provider="kimi",
+                    api_key=config.VISION_API_KEY,
+                    model=config.VISION_MODEL,
+                    base_url=config.VISION_BASE_URL,
+                )
+                logger.info(f"🔭 视觉分析器使用独立模型: {config.VISION_MODEL}")
+            self.vision_analyzer = VisionAnalyzer(
+                ai_client=vision_llm,
+                on_book_detected=self._on_book_detected,
+            )
+            self.scanner.set_vision_analyzer(self.vision_analyzer)
+            logger.info("🔭 视觉分析器已启用")
+        else:
+            logger.info("🔭 视觉分析器已禁用（vision.enabled=false，kimi-k2.5 不支持图片）")
+
         # 5. 工具执行器（依赖 scanner 和 session_manager）
         self.tool_executor = ToolExecutor(
             session_manager=self.session_manager,
             scanner=self.scanner,
-            memory=self.memory
+            memory=self.memory,
+            llm=self.llm,
+            timer_manager=self.timer_manager,
         )
 
         # 6. 语音
@@ -158,6 +187,8 @@ class ReadingCompanion:
         from tts import create_tts_player
         self.tts_player = create_tts_player(config)
         await self.tts_player.start()
+        # 把 TTS 注入定时器（无论飞书是否启用都能播报）
+        self.timer_manager.set_tts_player(self.tts_player)
 
         # 8. 飞书 Bot（可选）
         if config.FEISHU_ENABLED and config.FEISHU_APP_ID and config.FEISHU_APP_SECRET:
@@ -173,14 +204,25 @@ class ReadingCompanion:
             self.feishu_bot.start()
             logger.info("飞书 Bot 已启动")
 
+            # 将飞书 pusher 注入 ToolExecutor 和 TimerManager
+            feishu_chat_id = getattr(config, "FEISHU_DEFAULT_CHAT_ID", "")
+            self.tool_executor.feishu_pusher = self.summary_pusher
+            self.tool_executor.feishu_chat_id = feishu_chat_id
+            self.timer_manager.set_tts_player(self.tts_player)
+            self.timer_manager.set_feishu(self.summary_pusher, feishu_chat_id)
+
         logger.info("初始化完成")
     
     async def shutdown(self):
         """关闭所有模块"""
         logger.info("正在关闭...")
-        
+
         self._running = False
-        
+
+        if self.timer_manager:
+            self.timer_manager.cancel_all()
+        if self.vision_analyzer:
+            await self.vision_analyzer.cancel()
         if self.recorder:
             self.recorder.stop()
         if self.scanner and self.scanner.is_running():
@@ -191,7 +233,7 @@ class ReadingCompanion:
             self.feishu_bot.stop()
         if self.storage:
             await self.storage.close()
-        
+
         logger.info("已关闭")
     
     async def run(self):
@@ -356,13 +398,30 @@ class ReadingCompanion:
         """处理飞书消息"""
         return await self._process_user_message(text, channel="feishu")
     
+    def _on_book_detected(self, vision_result: dict):
+        """视觉分析回调：更新书籍上下文"""
+        book_title = vision_result.get("book_title", "")
+        confidence = vision_result.get("confidence", 0)
+        if book_title and confidence >= 0.7:
+            self.memory.update_book_context(vision_result)
+            logger.info(f"📚 书名已识别: 《{book_title}》（置信度 {confidence:.2f}）")
+
+    # OCR 连续无内容超时：超过此秒数才清空上下文
+    _OCR_CLEAR_TIMEOUT_S = 60
+
     def _on_snapshot(self, ocr_text: str, image_path: str):
         """快照回调：将 OCR 文字写入 AI 上下文"""
-        MIN_OCR_LEN = 10  # 少于此字数视为无效内容
+        MIN_OCR_LEN = 6  # 少于此字数视为无效内容
         if not ocr_text or len(ocr_text.strip()) < MIN_OCR_LEN:
-            self.memory.set_page_context("读书的内容为空")
-            logger.info(f"📖 OCR 内容不足（{len(ocr_text.strip()) if ocr_text else 0}字），AI 上下文已设为「读书的内容为空」")
+            # 检查距上次有效 OCR 是否超过超时阈值
+            elapsed = time.time() - self._last_valid_ocr_ts
+            if elapsed >= self._OCR_CLEAR_TIMEOUT_S:
+                self.memory.set_page_context("")
+                logger.info(f"📖 OCR 持续 {elapsed:.0f}s 无内容，已清空书页上下文")
+            else:
+                logger.debug(f"📖 OCR 无内容（已 {elapsed:.0f}s），保留上次上下文")
             return
+        self._last_valid_ocr_ts = time.time()
         self.memory.set_page_context(ocr_text, image_path)
         preview = ocr_text[:80].replace('\n', ' ')
         logger.info(f"📖 书页上下文已注入 ({len(ocr_text)}字) → 下次 AI 对话生效")
