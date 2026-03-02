@@ -4,7 +4,7 @@
 """
 import asyncio
 import logging
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Awaitable, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ class ReadingTimerManager:
         minutes: int,
         message: str = "",
         feishu_push: bool = False,
+        on_fire: Optional[Callable[[], Awaitable]] = None,
     ) -> int:
         """
         设定定时提醒
@@ -40,25 +41,33 @@ class ReadingTimerManager:
         Args:
             minutes: 多少分钟后触发
             message: 提醒内容（为空时使用默认文案）
-            feishu_push: 是否同步推送飞书
+            feishu_push: 是否同步推送飞书提醒卡
+            on_fire: 触发时额外执行的 async 回调（可读取触发时刻的最新状态）
 
         Returns:
             timer_id（可用于取消）
         """
-        if not message:
+        if not message and not on_fire:
             message = f"已经过去 {minutes} 分钟了，是时候活动一下，保护眼睛！"
 
         timer_id = self._next_id
         self._next_id += 1
 
         task = asyncio.create_task(
-            self._run_timer(timer_id, minutes, message, feishu_push)
+            self._run_timer(timer_id, minutes, message, feishu_push, on_fire)
         )
         self._tasks[timer_id] = task
         logger.info(f"⏰ 定时器已设置: {timer_id}，{minutes} 分钟后触发")
         return timer_id
 
-    async def _run_timer(self, timer_id: int, minutes: int, message: str, feishu_push: bool):
+    async def _run_timer(
+        self,
+        timer_id: int,
+        minutes: int,
+        message: str,
+        feishu_push: bool,
+        on_fire: Optional[Callable[[], Awaitable]] = None,
+    ):
         """等待指定时间后执行提醒"""
         try:
             await asyncio.sleep(minutes * 60)
@@ -66,20 +75,33 @@ class ReadingTimerManager:
             logger.info(f"⏰ 定时器触发: {timer_id} - {message}")
 
             # TTS 播报
-            if self._tts_player:
+            if self._tts_player and message:
                 try:
                     await self._tts_player.speak(message, interrupt=False)
                 except Exception as e:
                     logger.error(f"TTS 播报失败: {e}")
 
-            # 飞书推送
-            if feishu_push and self._feishu_pusher and self._feishu_chat_id:
-                try:
-                    await self._feishu_pusher.push_timer_alert(
-                        self._feishu_chat_id, message, minutes
+            # 飞书提醒卡
+            if feishu_push:
+                if self._feishu_pusher and self._feishu_chat_id:
+                    try:
+                        await self._feishu_pusher.push_timer_alert(
+                            self._feishu_chat_id, message, minutes
+                        )
+                        logger.info(f"⏰ 飞书推送成功: {timer_id}")
+                    except Exception as e:
+                        logger.error(f"飞书推送失败: {e}")
+                else:
+                    logger.warning(
+                        f"⏰ 定时器 {timer_id}: feishu_push=True 但飞书未配置或 chat_id 为空，跳过推送"
                     )
+
+            # 自定义动作（读取触发时刻最新状态）
+            if on_fire:
+                try:
+                    await on_fire()
                 except Exception as e:
-                    logger.error(f"飞书推送失败: {e}")
+                    logger.error(f"⏰ 定时器 {timer_id} on_fire 执行失败: {e}")
 
         except asyncio.CancelledError:
             logger.info(f"⏰ 定时器已取消: {timer_id}")

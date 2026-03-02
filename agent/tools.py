@@ -189,15 +189,31 @@ READING_STATS_TOOL = {
 SET_TIMER_TOOL = {
     "name": "set_timer",
     "description": (
-        "设定阅读提醒定时器。当用户说'提醒我X分钟后休息'、'设个X分钟提醒'、"
-        "'X分钟后提醒我'时调用。"
+        "设定定时器，支持两种用途（可同时使用）：\n"
+        "① 提醒休息：'提醒我X分钟后休息'、'X分钟后提醒我活动一下'\n"
+        "② 延迟发送书页内容到飞书：'X分钟后把当前书页内容发到飞书'、"
+        "'一分钟后发送我现在看书的内容'——此时设 send_current_page=true，"
+        "内容在触发时刻读取（反映最新书页）。"
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "minutes": {"type": "integer", "description": "多少分钟后提醒"},
-            "message": {"type": "string", "description": "提醒内容，留空则使用默认文案"},
-            "feishu_push": {"type": "boolean", "description": "是否同步推送飞书，默认 false"},
+            "minutes": {"type": "integer", "description": "多少分钟后触发"},
+            "message": {
+                "type": "string",
+                "description": "触发时 TTS 播报的内容（留空则使用默认文案）"
+            },
+            "feishu_push": {
+                "type": "boolean",
+                "description": "是否发送飞书提醒卡片（适合纯提醒场景），默认 false"
+            },
+            "send_current_page": {
+                "type": "boolean",
+                "description": (
+                    "触发时是否将当前书页 OCR 内容以文本消息发到飞书，默认 false。"
+                    "用于'X分钟后发送我现在看书的内容'这类需求。"
+                )
+            },
         },
         "required": ["minutes"],
     }
@@ -223,6 +239,21 @@ GENERATE_READING_CARD_TOOL = {
     }
 }
 
+FEISHU_SEND_MESSAGE_TOOL = {
+    "name": "feishu_send_message",
+    "description": (
+        "发送任意文本消息到飞书。当用户说'发消息到飞书'、'给飞书发'、'通知飞书'、"
+        "'飞书告诉我'等时调用。可发送问候、提醒、总结等任意内容。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "message": {"type": "string", "description": "要发送的消息内容"},
+        },
+        "required": ["message"],
+    }
+}
+
 ALL_TOOLS = [
     READING_NOTE_TOOL,
     READING_HISTORY_TOOL,
@@ -235,6 +266,7 @@ ALL_TOOLS = [
     READING_STATS_TOOL,
     SET_TIMER_TOOL,
     GENERATE_READING_CARD_TOOL,
+    FEISHU_SEND_MESSAGE_TOOL,
 ]
 
 
@@ -288,6 +320,7 @@ class ToolExecutor:
                 "reading_stats": self._exec_reading_stats,
                 "set_timer": self._exec_set_timer,
                 "generate_reading_card": self._exec_generate_reading_card,
+                "feishu_send_message": self._exec_feishu_send_message,
             }
             handler = dispatch.get(tool_name)
             if handler:
@@ -581,12 +614,41 @@ class ToolExecutor:
         if not self.timer_manager:
             return {"success": False, "error": "定时器模块未初始化"}
 
+        # 构建"触发时发送书页内容"的闭包，捕获触发时刻最新 OCR 内容
+        on_fire = None
+        if params.get("send_current_page"):
+            _pusher = self.feishu_pusher
+            _chat_id = self.feishu_chat_id
+            _memory = self.memory
+            if not _pusher or not _chat_id:
+                return {"success": False, "error": "send_current_page 需要飞书配置，请先确认飞书已启用且 chat_id 有效"}
+
+            async def _send_page_content():
+                content = _memory.current_page_ocr
+                if not content:
+                    logger.warning("⏰ 定时器触发：书页 OCR 内容为空，跳过发送")
+                    return
+                await _pusher.push_text(_chat_id, content)
+                logger.info("⏰ 书页内容已发送到飞书")
+
+            on_fire = _send_page_content
+            if not message:
+                message = "书页内容已推送到飞书"
+
         timer_id = await self.timer_manager.set_timer(
-            minutes=minutes, message=message, feishu_push=feishu_push
+            minutes=minutes, message=message, feishu_push=feishu_push, on_fire=on_fire
         )
+
+        desc = []
+        if feishu_push:
+            desc.append("飞书提醒卡")
+        if on_fire:
+            desc.append("发送当前书页内容到飞书")
+        action_hint = f"（{', '.join(desc)}）" if desc else ""
+
         return {
             "success": True,
-            "message": f"已设定 {minutes} 分钟后的提醒",
+            "message": f"已设定 {minutes} 分钟后触发{action_hint}",
             "timer_id": timer_id,
             "minutes": minutes,
         }
@@ -642,3 +704,19 @@ class ToolExecutor:
             "book_title": book_title,
             "feishu_pushed": pushed,
         }
+
+    async def _exec_feishu_send_message(self, params: Dict) -> Dict:
+        """发送文本消息到飞书"""
+        message = params.get("message", "").strip()
+        if not message:
+            return {"success": False, "error": "消息内容不能为空"}
+
+        if not self.feishu_pusher or not self.feishu_chat_id:
+            return {"success": False, "error": "飞书未配置或 chat_id 为空"}
+
+        try:
+            await self.feishu_pusher.push_text(self.feishu_chat_id, message)
+            return {"success": True, "message": "消息已发送到飞书"}
+        except Exception as e:
+            logger.error(f"飞书发送消息失败: {e}")
+            return {"success": False, "error": str(e)}

@@ -394,8 +394,15 @@ class ReadingCompanion:
 
         return reply_text
 
-    async def _handle_feishu_message(self, text: str, channel: str = "feishu") -> str:
+    async def _handle_feishu_message(self, text: str, channel: str = "feishu", chat_id: str = "") -> str:
         """处理飞书消息"""
+        # 动态更新 chat_id：首条消息即可获得真实会话 ID，后续定时器推送可用
+        if chat_id and self.summary_pusher:
+            if self.timer_manager and self.timer_manager._feishu_chat_id != chat_id:
+                self.timer_manager.set_feishu(self.summary_pusher, chat_id)
+                logger.debug(f"飞书 chat_id 已更新: {chat_id}")
+            if self.tool_executor:
+                self.tool_executor.feishu_chat_id = chat_id
         return await self._process_user_message(text, channel="feishu")
     
     def _on_book_detected(self, vision_result: dict):
