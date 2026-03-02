@@ -130,6 +130,45 @@ class Storage:
             CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_at);
             CREATE INDEX IF NOT EXISTS idx_bookmarks_book ON bookmarks(book_id);
             CREATE INDEX IF NOT EXISTS idx_progress_book ON reading_progress(book_id);
+
+            CREATE TABLE IF NOT EXISTS weread_books (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id TEXT UNIQUE NOT NULL, title TEXT NOT NULL,
+                author TEXT DEFAULT '', translator TEXT DEFAULT '',
+                cover TEXT DEFAULT '', category TEXT DEFAULT '',
+                finish_reading INTEGER DEFAULT 0,
+                reading_time_s INTEGER DEFAULT 0,
+                progress INTEGER DEFAULT 0,
+                synced_at INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS weread_highlights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bookmark_id TEXT UNIQUE NOT NULL, book_id TEXT NOT NULL,
+                book_title TEXT NOT NULL, content TEXT NOT NULL,
+                chapter_uid INTEGER DEFAULT 0,
+                chapter_title TEXT DEFAULT '', chapter_idx INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT 0, synced_at INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS weread_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id TEXT UNIQUE NOT NULL, book_id TEXT NOT NULL,
+                book_title TEXT NOT NULL, abstract TEXT DEFAULT '',
+                content TEXT NOT NULL, chapter_uid INTEGER DEFAULT 0,
+                chapter_title TEXT DEFAULT '', chapter_idx INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT 0, synced_at INTEGER DEFAULT 0,
+                note_type TEXT DEFAULT '想法'
+            );
+            CREATE TABLE IF NOT EXISTS weread_progress (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id TEXT UNIQUE NOT NULL, book_title TEXT NOT NULL,
+                progress INTEGER DEFAULT 0,
+                reading_time_s INTEGER DEFAULT 0,
+                chapter_uid INTEGER DEFAULT 0,
+                chapter_offset INTEGER DEFAULT 0,
+                synced_at INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_wr_highlights_book ON weread_highlights(book_id);
+            CREATE INDEX IF NOT EXISTS idx_wr_notes_book ON weread_notes(book_id);
         """)
         await self._conn.commit()
 
@@ -137,6 +176,7 @@ class Storage:
         migrations = [
             ("notes", "book_name", "TEXT DEFAULT ''"),
             ("notes", "tags", "TEXT DEFAULT '[]'"),
+            ("weread_notes", "note_type", "TEXT DEFAULT '想法'"),
         ]
         for table, col, definition in migrations:
             try:
