@@ -291,6 +291,11 @@ class SummaryPusher:
         await self.bot.send_interactive_card(chat_id, card)
         logger.info(f"阅读卡片（{card_type}）已推送到飞书: {chat_id}")
 
+    async def push_text(self, chat_id: str, text: str):
+        """推送纯文本消息到飞书"""
+        await self.bot.send_text(chat_id, text)
+        logger.info(f"文本消息已推送到飞书: {chat_id}")
+
     async def push_bookmark_created(self, chat_id: str, bookmark, book_title: str = ""):
         """
         推送书签创建通知（橙色 🔖）

@@ -88,6 +88,7 @@ class Config:
         self.FEISHU_APP_SECRET = self._get("feishu", "app_secret", "")
         self.FEISHU_ENCRYPT_KEY = self._get("feishu", "encrypt_key", "")
         self.FEISHU_VERIFICATION_TOKEN = self._get("feishu", "verification_token", "")
+        self.FEISHU_DEFAULT_CHAT_ID = self._get("feishu", "default_chat_id", "")
         
         # 摄像头
         self.CAMERA_DEVICE = self._get("camera", "device", 0)

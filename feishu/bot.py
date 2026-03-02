@@ -76,7 +76,7 @@ class FeishuBot:
     async def _handle_message_async(self, chat_id: str, msg_id: str, text: str):
         """异步处理消息"""
         try:
-            response = await self.message_handler(text, channel="feishu")
+            response = await self.message_handler(text, channel="feishu", chat_id=chat_id)
             await self.send_text(chat_id, response)
         except Exception as e:
             logger.error(f"处理消息失败: {e}")
