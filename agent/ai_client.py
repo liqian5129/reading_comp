@@ -6,8 +6,8 @@ import base64
 import json
 import logging
 import time
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, AsyncGenerator
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import openai
@@ -23,6 +23,15 @@ class LLMResponse:
     tool_calls: List[Dict[str, Any]]
     stop_reason: str
     raw_assistant_message: Optional[Dict] = None  # 含 tool_calls 的原始 assistant 消息
+
+
+@dataclass
+class LLMStreamChunk:
+    """LLM 流式输出块"""
+    type: str            # "text_delta" | "tool_use" | "done"
+    content: str = ""    # type=text_delta 时的增量文本
+    tool_calls: list = field(default_factory=list)   # type=tool_use 时的工具调用列表
+    raw_assistant_msg: dict = None  # 用于下一轮工具调用的原始 assistant 消息
 
 
 class AIClient:
@@ -295,6 +304,7 @@ class AIClient:
                                     system_prompt: str = "",
                                     history: List[Dict[str, str]] = None,
                                     assistant_message: Optional[Dict] = None,
+                                    tools: List[Dict] = None,
                                     max_tokens: int = 4096) -> LLMResponse:
         """发送工具执行结果，继续对话 - 带计时"""
         if history is None:
@@ -320,9 +330,9 @@ class AIClient:
                 "tool_call_id": result["tool_use_id"],
                 "content": result["content"]
             })
-        
+
         total_start = time.time()
-        
+
         try:
             kwargs = {
                 "model": self.model,
@@ -330,27 +340,63 @@ class AIClient:
                 "max_tokens": max_tokens,
                 "temperature": self._get_temperature(),
             }
-            
+
             extra_body = self._get_extra_body()
             if extra_body:
                 kwargs["extra_body"] = extra_body
-            
+
+            # 传入 tools，允许继续链式调用
+            if tools:
+                kwargs["tools"] = self._convert_tools(tools)
+                kwargs["tool_choice"] = "auto"
+
             response = await self.client.chat.completions.create(**kwargs)
-            
+
             total_end = time.time()
             total_ms = (total_end - total_start) * 1000
-            
+
             message = response.choices[0].message
             text = message.content or ""
-            
+
+            # 正确解析 tool_calls（原来写死返回 []）
+            tool_calls = []
+            raw_assistant_message = None
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    tool_calls.append({
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": json.loads(tc.function.arguments)
+                    })
+                raw_assistant_message = {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+
+            stop_reason = response.choices[0].finish_reason
+            if tool_calls:
+                stop_reason = "tool_use"
+
             logger.info(f"🛠️ 工具结果处理完成: {total_ms:.0f} ms")
-            
+
             return LLMResponse(
                 text=text,
-                tool_calls=[],
-                stop_reason=response.choices[0].finish_reason
+                tool_calls=tool_calls,
+                stop_reason=stop_reason,
+                raw_assistant_message=raw_assistant_message,
             )
-            
+
         except Exception as e:
             logger.error(f"AI API 调用失败: {e}")
             return LLMResponse(
@@ -358,3 +404,100 @@ class AIClient:
                 tool_calls=[],
                 stop_reason="error"
             )
+
+    async def chat_stream(
+        self,
+        user_message: str,
+        system_prompt: str = "",
+        history: List[Dict] = None,
+        tools: List[Dict] = None,
+        tool_results: List[Dict] = None,
+        assistant_message: Dict = None,
+        max_tokens: int = 4096,
+    ) -> AsyncGenerator[LLMStreamChunk, None]:
+        """
+        流式对话。同时支持：
+        - 首轮（user 消息）
+        - 续轮（附带 tool_results，同 chat_with_tool_result）
+        """
+        if history is None:
+            history = []
+
+        messages = self._build_messages(system_prompt, history, user_message)
+
+        # 续轮：在 user 消息后追加 assistant + tool 消息
+        if tool_results and assistant_message:
+            messages.append(assistant_message)
+            for r in tool_results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": r["tool_use_id"],
+                    "content": r["content"],
+                })
+
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": max_tokens,
+            "temperature": self._get_temperature(),
+        }
+
+        extra_body = self._get_extra_body()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        if tools:
+            kwargs["tools"] = self._convert_tools(tools)
+            kwargs["tool_choice"] = "auto"
+
+        text_accum = ""
+        tc_accum: Dict[int, dict] = {}  # index → {id, name, arguments}
+
+        try:
+            stream = await self.client.chat.completions.create(**kwargs)
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    text_accum += delta.content
+                    yield LLMStreamChunk(type="text_delta", content=delta.content)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tc_accum:
+                            tc_accum[idx] = {
+                                "id": tc.id or "",
+                                "name": tc.function.name or "" if tc.function else "",
+                                "arguments": "",
+                            }
+                        if tc.function and tc.function.arguments:
+                            tc_accum[idx]["arguments"] += tc.function.arguments
+        except Exception as e:
+            logger.error(f"流式 AI 请求失败: {e}")
+            yield LLMStreamChunk(type="text_delta", content=f"抱歉，出错了：{e}")
+            yield LLMStreamChunk(type="done")
+            return
+
+        if tc_accum:
+            sorted_tcs = [tc_accum[k] for k in sorted(tc_accum.keys())]
+            tool_calls = [
+                {"id": v["id"], "name": v["name"], "input": json.loads(v["arguments"])}
+                for v in sorted_tcs
+            ]
+            raw_msg = {
+                "role": "assistant",
+                "content": text_accum or None,
+                "tool_calls": [
+                    {
+                        "id": v["id"],
+                        "type": "function",
+                        "function": {"name": v["name"], "arguments": v["arguments"]},
+                    }
+                    for v in sorted_tcs
+                ],
+            }
+            yield LLMStreamChunk(type="tool_use", tool_calls=tool_calls, raw_assistant_msg=raw_msg)
+
+        yield LLMStreamChunk(type="done")
