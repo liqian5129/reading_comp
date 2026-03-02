@@ -7,10 +7,11 @@ import asyncio
 import gzip
 import json
 import logging
+import shutil
 import subprocess
 import uuid
 import time
-from typing import Optional, List
+from typing import Optional, List, AsyncGenerator
 from dataclasses import dataclass
 import os
 
@@ -258,6 +259,60 @@ class DoubaoTTS:
             logger.error(f"❌ 豆包 TTS 请求失败: {e}")
             return None
 
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """
+        流式合成：WebSocket 每帧到达即 yield，首帧延迟约 0.3-0.8s。
+        调用方可以在首帧到达时立即开始播放，无需等待全部合成完成。
+        """
+        if not text.strip():
+            return
+
+        reqid = str(uuid.uuid4())
+        auth_headers = {"Authorization": f"Bearer; {self.token}"}
+
+        try:
+            async with websockets.connect(self.WS_URL, additional_headers=auth_headers) as ws:
+                await ws.send(self._construct_request(text, reqid))
+
+                while True:
+                    try:
+                        response = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("⚠️ 豆包 TTS 流式接收超时")
+                        break
+
+                    if not isinstance(response, bytes) or len(response) < 4:
+                        continue
+
+                    header = response[:4]
+                    header_size = (header[0] & 0x0f) * 4
+                    msg_type = (header[1] >> 4) & 0x0f
+                    ps = header_size  # payload start
+
+                    if msg_type == 0xb:
+                        # Audio-only frame
+                        if len(response) < ps + 8:
+                            continue
+                        seq_num = int.from_bytes(response[ps:ps + 4], 'big', signed=True)
+                        audio_size = int.from_bytes(response[ps + 4:ps + 8], 'big')
+                        audio_data = response[ps + 8:ps + 8 + audio_size]
+                        if audio_data:
+                            yield audio_data
+                        if seq_num < 0:
+                            break  # 最后一帧
+
+                    elif msg_type == 0x9:
+                        # Full server response (正常结束)
+                        break
+
+                    elif msg_type == 0xf:
+                        # Error
+                        logger.error("❌ 豆包 TTS 流式合成收到错误帧")
+                        break
+
+        except Exception as e:
+            logger.error(f"❌ 豆包 TTS 流式合成失败: {e}")
+
 
 class DoubaoTTSPlayer:
     """
@@ -296,6 +351,13 @@ class DoubaoTTSPlayer:
         self.player_cmd = player_cmd
         self.max_queue_size = max_queue_size
 
+        # 检测 mpg123：有则用流式管道模式，无则退回双流水线 afplay 模式
+        self._use_mpg123 = bool(shutil.which("mpg123"))
+        if self._use_mpg123:
+            logger.info("🎵 检测到 mpg123，启用流式播放模式（首字延迟更低）")
+        else:
+            logger.info("🎵 未检测到 mpg123，使用 afplay 双流水线模式")
+
         # 文本输入队列（speak() 写入）
         self._text_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
         # 音频就绪队列（合成完成后写入，播放协程消费）
@@ -319,6 +381,7 @@ class DoubaoTTSPlayer:
 
         self._synth_task: Optional[asyncio.Task] = None
         self._play_task: Optional[asyncio.Task] = None
+        self._stream_task: Optional[asyncio.Task] = None  # mpg123 流式模式
         self._running = False
         
     @staticmethod
@@ -395,11 +458,12 @@ class DoubaoTTSPlayer:
         return final_segments if final_segments else [text[:max_length]]
         
     async def start(self):
-        """启动播放器（合成+播放两个协程并发）"""
+        """启动播放器（合成+播放双流水线）"""
         self._running = True
         self._synth_task = asyncio.create_task(self._synth_worker())
         self._play_task = asyncio.create_task(self._play_worker())
-        logger.info("豆包 TTS 播放器已启动（双流水线模式）")
+        mode = "mpg123 stdin" if self._use_mpg123 else "afplay 临时文件"
+        logger.info(f"豆包 TTS 播放器已启动（双流水线 / {mode}）")
 
     async def stop(self):
         """停止播放器"""
@@ -537,8 +601,12 @@ class DoubaoTTSPlayer:
     # ── 播放协程 ──────────────────────────────────────────────────────────────
     async def _play_worker(self):
         """
-        从音频队列取已合成音频 → 写临时文件 → 播放。
-        串行播放，与合成并发。
+        从音频队列取已合成音频 → 播放。
+        串行播放，与合成并发（synth 播 A 时已在合成 B）。
+
+        若有 mpg123：直接通过 stdin 传入字节，省去临时文件 I/O，启动更快（~50ms vs ~400ms）。
+        否则：写临时文件 → afplay（兜底）。
+        贪婪合并：把已就绪的后续段拼成一次调用，消除段间停顿。
         """
         while self._running:
             try:
@@ -547,12 +615,10 @@ class DoubaoTTSPlayer:
                 continue
 
             if item is None:
-                # 合成失败，跳过
                 continue
 
             if self._interrupt_event.is_set():
                 self._interrupt_event.clear()
-                # 丢弃音频队列中剩余内容
                 while not self._audio_queue.empty():
                     try:
                         self._audio_queue.get_nowait()
@@ -562,8 +628,7 @@ class DoubaoTTSPlayer:
 
             audio_data, preview = item
 
-            # 贪婪合并：把 audio_queue 中已就绪的后续段全部拼入同一个文件，
-            # 一次 afplay 调用连续播放，消除段间 ~300ms 的子进程启动停顿。
+            # 贪婪合并：把 audio_queue 中已就绪的后续段全部拼入同一批次
             extra = 0
             while True:
                 try:
@@ -575,35 +640,39 @@ class DoubaoTTSPlayer:
                 except asyncio.QueueEmpty:
                     break
             if extra:
-                logger.debug(f"📦 贪婪合并 {extra + 1} 段音频，连续播放")
+                logger.debug(f"📦 贪婪合并 {extra + 1} 段音频")
 
-            temp_file = os.path.join(self._temp_dir, f"tts_{time.monotonic_ns()}.mp3")
-            with open(temp_file, "wb") as f:
-                f.write(audio_data)
-
-            # 记录首段播放开始时间
             if self.first_play_start is None:
                 self.first_play_start = time.time()
 
             self._playing = True
             try:
-                await self._play_audio(temp_file)
+                if self._use_mpg123:
+                    await self._play_via_mpg123(audio_data)
+                else:
+                    temp_file = os.path.join(self._temp_dir, f"tts_{time.monotonic_ns()}.mp3")
+                    with open(temp_file, "wb") as f:
+                        f.write(audio_data)
+                    await self._play_via_afplay(temp_file)
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
             finally:
                 self._playing = False
-                try:
-                    os.remove(temp_file)
-                except Exception:
-                    pass
-    
-    async def _play_audio(self, audio_file: str):
-        """播放音频文件"""
+
+    async def _play_via_mpg123(self, audio_data: bytes):
+        """用 mpg123 stdin 播放：无临时文件，启动开销小"""
         try:
             proc = await asyncio.create_subprocess_exec(
-                self.player_cmd, audio_file,
+                "mpg123", "-q", "-",
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
             )
-            
+            proc.stdin.write(audio_data)
+            proc.stdin.close()
+
             while True:
                 if self._interrupt_event.is_set():
                     proc.terminate()
@@ -611,18 +680,36 @@ class DoubaoTTSPlayer:
                         await asyncio.wait_for(proc.wait(), timeout=1.0)
                     except asyncio.TimeoutError:
                         proc.kill()
-                    logger.debug("播放被打断")
                     return
-                
                 if proc.returncode is not None:
                     break
-                
-                await asyncio.sleep(0.05)
-            
-            if proc.returncode == 0:
-                logger.debug("播放完成")
-            else:
-                logger.warning(f"播放异常退出: {proc.returncode}")
-                
+                await asyncio.sleep(0.02)
+
+            if proc.returncode != 0:
+                logger.warning(f"mpg123 异常退出: {proc.returncode}")
+
         except Exception as e:
-            logger.error(f"播放音频失败: {e}")
+            logger.error(f"mpg123 播放失败: {e}")
+
+    async def _play_via_afplay(self, audio_file: str):
+        """afplay 播放（兜底路径）"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.player_cmd, audio_file,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            while True:
+                if self._interrupt_event.is_set():
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                    return
+                if proc.returncode is not None:
+                    break
+                await asyncio.sleep(0.05)
+
+        except Exception as e:
+            logger.error(f"afplay 播放失败: {e}")
