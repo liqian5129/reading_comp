@@ -119,6 +119,12 @@ class Config:
         self.WEREAD_ENABLED = self._get("weread", "enabled", False)
         self.WEREAD_COOKIE = self._get("weread", "cookie_string", "")
 
+        # 透视校正（固定挂载摄像头，一次标定后长期使用）
+        self.PERSPECTIVE_ENABLED = self._get("perspective", "enabled", False)
+        self.PERSPECTIVE_HOMOGRAPHY_FILE = self._get(
+            "perspective", "homography_file", "camera/homography.npy"
+        )
+
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
         self.DATA_DIR = Path(data_dir)

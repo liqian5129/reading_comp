@@ -1,0 +1,24 @@
+{
+  "input_width": 1280,
+  "input_height": 800,
+  "output_width": 1280,
+  "output_height": 800,
+  "src_points": [
+    [
+      301,
+      479
+    ],
+    [
+      871,
+      429
+    ],
+    [
+      1217,
+      795
+    ],
+    [
+      25,
+      786
+    ]
+  ]
+}

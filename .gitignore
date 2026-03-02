@@ -18,8 +18,7 @@ env/
 data/sessions.db
 data/snapshots/
 data/notes/
-data/ocr_results
-data/sessions.db
+data/ocr_results/
 
 # logs
 logs/

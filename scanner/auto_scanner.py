@@ -21,6 +21,7 @@ from typing import Optional, Tuple, Callable
 
 from camera import fingerprint, is_page_turn
 from camera.capture import CameraCapture, find_external_camera
+from camera.perspective import load_fixed_homography, apply_fixed_homography
 from ocr.engine import create_ocr_engine
 from config import config
 
@@ -110,6 +111,14 @@ class AutoScanner:
 
         # 语音录音器引用（用于 OCR/ASR 资源冲突规避）
         self._voice_recorder = None
+
+        # 固定透视校正矩阵（可选，由标定脚本生成）
+        if config.PERSPECTIVE_ENABLED:
+            self._perspective_M = load_fixed_homography(config.PERSPECTIVE_HOMOGRAPHY_FILE)
+            if self._perspective_M is not None:
+                logger.info("透视校正已启用，将对每帧应用固定单应矩阵")
+        else:
+            self._perspective_M = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -233,6 +242,10 @@ class AutoScanner:
             if frame is None:
                 logger.warning("拍照失败")
                 return None
+
+            # 1.5. 透视校正（固定单应矩阵，~1ms，OCR/Vision/哈希全部受益）
+            if self._perspective_M is not None:
+                frame = apply_fixed_homography(frame, self._perspective_M)
 
             # 2. 编码原始帧（在线程池中执行，避免阻塞）
             # 注：OCR 子进程内部的 PaddleOCR 会通过 UVDoc 做书页矫正，无需在此重复矫正
