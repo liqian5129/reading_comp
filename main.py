@@ -113,6 +113,8 @@ class ReadingCompanion:
         self.tts_player = None
         self.feishu_bot: Optional[FeishuBot] = None
         self.summary_pusher: Optional[SummaryPusher] = None
+        self.weread_client = None
+        self.weread_storage = None
         
         # 状态
         self._running = False
@@ -198,6 +200,17 @@ class ReadingCompanion:
         else:
             logger.info("🔭 视觉分析器已禁用（vision.enabled=false，kimi-k2.5 不支持图片）")
 
+        # 4c. 微信读书客户端（可选）
+        if config.WEREAD_ENABLED and config.WEREAD_COOKIE:
+            from weread import WeReadClient
+            from weread.storage import WeReadStorage
+            self.weread_client = WeReadClient(config.WEREAD_COOKIE)
+            await self.weread_client.initialize()
+            self.weread_storage = WeReadStorage(self.storage._conn)
+            logger.info("📱 微信读书集成已启用")
+        else:
+            logger.info("📱 微信读书集成未启用（weread.enabled=false 或未配置 cookie_string）")
+
         # 5. 工具执行器（依赖 scanner 和 session_manager）
         self.tool_executor = ToolExecutor(
             session_manager=self.session_manager,
@@ -205,6 +218,8 @@ class ReadingCompanion:
             memory=self.memory,
             llm=self.llm,
             timer_manager=self.timer_manager,
+            weread_client=self.weread_client,
+            weread_storage=self.weread_storage,
         )
 
         # 6. 语音
@@ -271,6 +286,8 @@ class ReadingCompanion:
             await self.tts_player.stop()
         if self.feishu_bot:
             self.feishu_bot.stop()
+        if self.weread_client:
+            await self.weread_client.close()
         if self.storage:
             await self.storage.close()
 

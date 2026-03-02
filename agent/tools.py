@@ -15,9 +15,8 @@ logger = logging.getLogger(__name__)
 READING_NOTE_TOOL = {
     "name": "reading_note",
     "description": (
-        "记录用户的读书笔记。当用户说'记录一下'、'摘抄这段'、'记个笔记'时调用。"
-        "book_name 从对话中识别书名（如用户未提及则留空）。"
-        "tags 由用户指定或从对话中提取关键词作为标签。"
+        "保存一条读书笔记到本地。书名优先从当前阅读上下文自动获取，无需用户指定。"
+        "用户表达记录意图（摘抄、记下来、我觉得、有感想）时调用。"
     ),
     "input_schema": {
         "type": "object",
@@ -42,7 +41,7 @@ READING_NOTE_TOOL = {
 
 READING_HISTORY_TOOL = {
     "name": "reading_history",
-    "description": "查询用户的阅读历史记录。当用户问'今天读了什么'、'最近读了什么书'时调用。",
+    "description": "查询本次及近期的阅读会话记录（时长、翻页数、笔记数）。用户询问今天或近期读书情况时调用。",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -58,9 +57,8 @@ READING_HISTORY_TOOL = {
 READING_NOTES_TOOL = {
     "name": "reading_notes",
     "description": (
-        "查询用户过往的读书笔记内容，返回完整笔记列表供 AI 查看和整理。"
-        "当用户说'看看我的笔记'、'整理一下笔记'、'我之前记了什么'、'最近的读书笔记'时调用。"
-        "返回每条笔记的时间、书名、标签和完整内容。"
+        "查询本地保存的读书笔记列表（含时间、书名、标签、内容）。"
+        "用户想回顾、整理或查看之前记录的笔记时调用；可按书名或时间范围过滤。"
     ),
     "input_schema": {
         "type": "object",
@@ -81,8 +79,8 @@ READING_NOTES_TOOL = {
 BOOKMARK_CREATE_TOOL = {
     "name": "bookmark_create",
     "description": (
-        "创建书签，标记当前阅读位置。当用户说'记个书签'、'标记这里'、'记下这一页'时调用。"
-        "自动获取当前页 OCR 摘录；page_num 由视觉识别或用户指定。"
+        "创建书签，标记当前阅读位置，自动摘录当前书页内容。"
+        "用户想记录当前读到哪里（以便下次继续）时调用。"
     ),
     "input_schema": {
         "type": "object",
@@ -97,7 +95,7 @@ BOOKMARK_CREATE_TOOL = {
 
 BOOKMARK_LIST_TOOL = {
     "name": "bookmark_list",
-    "description": "查询书签列表。当用户说'我读到哪了'、'看看书签'、'列出我的书签'时调用。",
+    "description": "查询已保存的书签列表，显示每个书签的页码和摘录。用户想了解上次读到哪里或查看历史书签时调用。",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -110,8 +108,8 @@ BOOKMARK_LIST_TOOL = {
 READING_PROGRESS_UPDATE_TOOL = {
     "name": "reading_progress_update",
     "description": (
-        "更新阅读进度或状态。当用户说'告诉你我读到第X页了'、'这本书读完了'、"
-        "'我暂停读这本书'时调用。"
+        "更新本地记录的阅读进度（页码或状态）。"
+        "用户告知当前页码、标记某书已读完或暂停时调用。"
     ),
     "input_schema": {
         "type": "object",
@@ -130,8 +128,8 @@ READING_PROGRESS_UPDATE_TOOL = {
 READING_PROGRESS_QUERY_TOOL = {
     "name": "reading_progress_query",
     "description": (
-        "查询某本书的阅读进度。当用户说'我《XX》读到哪里了'、'进度怎么样'、"
-        "'我最近在读什么书'时调用。"
+        "查询本地记录的阅读进度（页码、完成度、阅读时长）。"
+        "用户问进度但未指定书名时调用（留空 book_title），可作为推断当前在读书名的依据。"
     ),
     "input_schema": {
         "type": "object",
@@ -145,8 +143,8 @@ READING_PROGRESS_QUERY_TOOL = {
 READING_LIST_MANAGE_TOOL = {
     "name": "reading_list_manage",
     "description": (
-        "管理书单（想读/在读/已读列表）。当用户说'加入书单'、'我想读XX'、"
-        "'书单里有什么'、'标记XX已读'、'从书单删除XX'时调用。"
+        "管理书单（想读/在读/已读列表）：添加、查看、更新状态或移除书目。"
+        "用户操作个人书单时调用，支持按状态过滤查看。"
     ),
     "input_schema": {
         "type": "object",
@@ -170,8 +168,8 @@ READING_LIST_MANAGE_TOOL = {
 READING_STATS_TOOL = {
     "name": "reading_stats",
     "description": (
-        "查询阅读统计数据（翻页数、时长、笔记数）。当用户说'我这周读了多少'、"
-        "'今天翻了几页'、'我最近的阅读情况'时调用。"
+        "查询阅读统计摘要（翻页数、时长、笔记数、书签数），可按天/周/月/全部统计。"
+        "用户询问阅读量或阅读习惯时调用。"
     ),
     "input_schema": {
         "type": "object",
@@ -189,11 +187,8 @@ READING_STATS_TOOL = {
 SET_TIMER_TOOL = {
     "name": "set_timer",
     "description": (
-        "设定定时器，支持两种用途（可同时使用）：\n"
-        "① 提醒休息：'提醒我X分钟后休息'、'X分钟后提醒我活动一下'\n"
-        "② 延迟发送书页内容到飞书：'X分钟后把当前书页内容发到飞书'、"
-        "'一分钟后发送我现在看书的内容'——此时设 send_current_page=true，"
-        "内容在触发时刻读取（反映最新书页）。"
+        "设定倒计时定时器，可在触发时播报提醒、发飞书卡片，或将当前书页 OCR 内容推送飞书。"
+        "用户需要延时提醒或延时发送书页内容时调用；send_current_page=true 时内容在触发时刻读取。"
     ),
     "input_schema": {
         "type": "object",
@@ -222,8 +217,8 @@ SET_TIMER_TOOL = {
 GENERATE_READING_CARD_TOOL = {
     "name": "generate_reading_card",
     "description": (
-        "生成阅读卡片（金句/知识点/摘要）并推送到飞书。当用户说'生成一张金句卡'、"
-        "'把这段做成卡片'、'发到飞书'时调用。"
+        "从当前书页内容生成阅读卡片（金句/知识点/摘要）并推送到飞书。"
+        "用户想将书页精华整理成卡片或分享到飞书时调用；内容留空则自动使用当前书页 OCR。"
     ),
     "input_schema": {
         "type": "object",
@@ -242,8 +237,8 @@ GENERATE_READING_CARD_TOOL = {
 FEISHU_SEND_MESSAGE_TOOL = {
     "name": "feishu_send_message",
     "description": (
-        "发送任意文本消息到飞书。当用户说'发消息到飞书'、'给飞书发'、'通知飞书'、"
-        "'飞书告诉我'等时调用。可发送问候、提醒、总结等任意内容。"
+        "发送任意文本消息到飞书。用户想把内容（问候、提醒、总结等）推送到飞书时调用。"
+        "若要发送书页卡片，请用 generate_reading_card；若要发送阅读卡片，也优先用该工具。"
     ),
     "input_schema": {
         "type": "object",
@@ -251,6 +246,102 @@ FEISHU_SEND_MESSAGE_TOOL = {
             "message": {"type": "string", "description": "要发送的消息内容"},
         },
         "required": ["message"],
+    }
+}
+
+WEREAD_SHELF_TOOL = {
+    "name": "weread_shelf",
+    "description": (
+        "查看或刷新微信读书书架（书目列表和阅读进度概览）。"
+        "若书架缓存为空，主动传 refresh=true 实时拉取，不要要求用户手动说刷新。"
+        "查笔记请用 weread_notebook；查某书进度请用 weread_progress。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "refresh": {
+                "type": "boolean",
+                "description": "是否实时刷新（默认 false 用本地缓存）"
+            }
+        },
+        "required": [],
+    }
+}
+
+WEREAD_NOTEBOOK_TOOL = {
+    "name": "weread_notebook",
+    "description": (
+        "列出微信读书中有笔记的书单（含划线数和笔记数）。"
+        "用户问及任何微信读书笔记/划线/想法时，无论是否提到书名，都应首先调用此工具获取全局视图。"
+        "返回后可进一步调用 weread_get_notes 查看某本书详情。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    }
+}
+
+WEREAD_GET_NOTES_TOOL = {
+    "name": "weread_get_notes",
+    "description": (
+        "获取某本书的全部微信读书笔记，分三类：划线、想法（附在划线上的评论）、点评（独立书评）。"
+        "调用前自动同步最新数据，无需用户手动触发同步。"
+        "若用户未明确书名，先调用 weread_notebook 获取书单后自行推断，不要反复询问用户。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "book_title": {
+                "type": "string",
+                "description": "书名（模糊匹配），必填"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "每类笔记的最大返回条数，默认 20"
+            }
+        },
+        "required": ["book_title"],
+    }
+}
+
+WEREAD_PROGRESS_TOOL = {
+    "name": "weread_progress",
+    "description": (
+        "实时查询微信读书某本书的阅读进度（百分比和阅读时长）。"
+        "若书名不明确，先调用 reading_progress_query 或 weread_shelf 推断后再调用本工具。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "book_title": {
+                "type": "string",
+                "description": "书名（模糊匹配），必填"
+            }
+        },
+        "required": ["book_title"],
+    }
+}
+
+WEREAD_MERGE_NOTES_TOOL = {
+    "name": "weread_merge_notes",
+    "description": (
+        "将某本书的微信读书划线/想法与本地笔记合并，生成综合摘要，可选推送飞书。"
+        "用户想对一本书做跨平台笔记整合时调用。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "book_title": {
+                "type": "string",
+                "description": "书名（模糊匹配），必填"
+            },
+            "push_to_feishu": {
+                "type": "boolean",
+                "description": "是否推送摘要到飞书（默认 false）"
+            }
+        },
+        "required": ["book_title"],
     }
 }
 
@@ -267,6 +358,11 @@ ALL_TOOLS = [
     SET_TIMER_TOOL,
     GENERATE_READING_CARD_TOOL,
     FEISHU_SEND_MESSAGE_TOOL,
+    WEREAD_SHELF_TOOL,
+    WEREAD_NOTEBOOK_TOOL,
+    WEREAD_GET_NOTES_TOOL,
+    WEREAD_PROGRESS_TOOL,
+    WEREAD_MERGE_NOTES_TOOL,
 ]
 
 
@@ -294,7 +390,9 @@ class ToolExecutor:
     执行 AI 调用的工具，并与系统各模块交互
     """
 
-    def __init__(self, session_manager, scanner, memory, llm=None, timer_manager=None, feishu_pusher=None, feishu_chat_id: str = ""):
+    def __init__(self, session_manager, scanner, memory, llm=None, timer_manager=None,
+                 feishu_pusher=None, feishu_chat_id: str = "",
+                 weread_client=None, weread_storage=None):
         self.session_manager = session_manager
         self.scanner = scanner
         self.memory = memory
@@ -302,6 +400,8 @@ class ToolExecutor:
         self.timer_manager = timer_manager
         self.feishu_pusher = feishu_pusher
         self.feishu_chat_id = feishu_chat_id
+        self.weread_client = weread_client
+        self.weread_storage = weread_storage
 
     async def execute(self, tool_name: str, tool_input: Dict) -> Dict[str, Any]:
         """执行工具"""
@@ -321,6 +421,11 @@ class ToolExecutor:
                 "set_timer": self._exec_set_timer,
                 "generate_reading_card": self._exec_generate_reading_card,
                 "feishu_send_message": self._exec_feishu_send_message,
+                "weread_shelf": self._exec_weread_shelf,
+                "weread_notebook": self._exec_weread_notebook,
+                "weread_get_notes": self._exec_weread_get_notes,
+                "weread_progress": self._exec_weread_progress,
+                "weread_merge_notes": self._exec_weread_merge_notes,
             }
             handler = dispatch.get(tool_name)
             if handler:
@@ -720,3 +825,294 @@ class ToolExecutor:
         except Exception as e:
             logger.error(f"飞书发送消息失败: {e}")
             return {"success": False, "error": str(e)}
+
+    # ==================== 微信读书工具 ====================
+
+    def _check_weread(self) -> Optional[Dict]:
+        """检查微信读书是否可用，不可用时返回友好提示 dict"""
+        if not self.weread_client or not self.weread_storage:
+            return {
+                "success": False,
+                "error": "微信读书未配置，请在 config.json 中设置 weread.enabled=true 和 weread.cookie_string"
+            }
+        return None
+
+    async def _exec_weread_shelf(self, params: Dict) -> Dict:
+        """查看/刷新书架"""
+        err = self._check_weread()
+        if err:
+            return err
+
+        refresh = params.get("refresh", False)
+
+        if refresh:
+            # 实时拉取
+            data = await self.weread_client.get_shelf()
+            books = data.get("books", [])
+            progress_list = data.get("progress", [])
+
+            if books is None:
+                return {"success": False, "error": "微信读书 Cookie 可能已过期，请更新 cookie_string"}
+
+            # 写入本地缓存
+            await self.weread_storage.upsert_books(books)
+            for prog in progress_list:
+                await self.weread_storage.upsert_progress(prog)
+        else:
+            # 读本地缓存
+            books = await self.weread_storage.list_books()
+
+        if not books:
+            return {
+                "success": True,
+                "message": "书架为空，请先说'刷新微信书架'同步数据",
+                "books": [],
+                "total": 0,
+            }
+
+        book_list = [
+            {
+                "title": b.title,
+                "author": b.author,
+                "progress": b.progress_str,
+                "reading_time": b.reading_time_str,
+                "finished": b.finish_reading,
+            }
+            for b in books
+        ]
+        return {
+            "success": True,
+            "message": f"书架共 {len(book_list)} 本书",
+            "books": book_list,
+            "total": len(book_list),
+            "refreshed": refresh,
+        }
+
+    async def _exec_weread_notebook(self, params: Dict) -> Dict:
+        """列出有笔记的书单"""
+        err = self._check_weread()
+        if err:
+            return err
+
+        raw_books = await self.weread_client.get_notebook_books()
+        if raw_books is None:
+            return {"success": False, "error": "获取笔记书单失败，Cookie 可能已过期"}
+
+        if not raw_books:
+            return {
+                "success": True,
+                "message": "暂无有笔记的书籍",
+                "books": [],
+                "total": 0,
+            }
+
+        book_list = []
+        for item in raw_books:
+            # 兼容 {"book": {...}} 和 {"bookInfo": {...}} 两种结构
+            book_info = item.get("book") or item.get("bookInfo") or item
+            title = book_info.get("title", "") if isinstance(book_info, dict) else ""
+            if not title:
+                continue
+            book_list.append({
+                "title": title,
+                "highlights": item.get("noteCount", 0),    # 划线数
+                "notes": item.get("reviewCount", 0),        # 想法+点评数
+            })
+
+        return {
+            "success": True,
+            "message": f"共 {len(book_list)} 本书有笔记，可用 weread_get_notes 查看某本书的详细内容",
+            "books": book_list,
+            "total": len(book_list),
+        }
+
+    async def _exec_weread_get_notes(self, params: Dict) -> Dict:
+        """自动同步并分类展示某本书的全部笔记（划线/想法/点评）"""
+        err = self._check_weread()
+        if err:
+            return err
+
+        book_title = params.get("book_title", "").strip()
+        if not book_title:
+            return {"success": False, "error": "请指定书名"}
+
+        limit = params.get("limit", 20)
+
+        # 先找本地缓存，没有则尝试刷新书架
+        book = await self.weread_storage.find_book_by_title(book_title)
+        if not book:
+            shelf_data = await self.weread_client.get_shelf()
+            if shelf_data:
+                await self.weread_storage.upsert_books(shelf_data.get("books", []))
+                for prog in shelf_data.get("progress", []):
+                    await self.weread_storage.upsert_progress(prog)
+            book = await self.weread_storage.find_book_by_title(book_title)
+            if not book:
+                return {
+                    "success": False,
+                    "error": f"未找到《{book_title}》，请确认书名是否正确或书是否在书架中"
+                }
+
+        # 自动从微信读书拉取最新划线和笔记
+        highlights_api = await self.weread_client.get_highlights(book.book_id, book_title=book.title)
+        if highlights_api is not None:
+            await self.weread_storage.upsert_highlights(highlights_api)
+
+        notes_api = await self.weread_client.get_notes(book.book_id)
+        if notes_api:
+            for n in notes_api:
+                if not n.book_title:
+                    n.book_title = book.title
+            await self.weread_storage.upsert_notes(notes_api)
+
+        # 从本地读取，分类返回
+        highlights = await self.weread_storage.list_highlights(book.book_id, limit=limit)
+        thoughts = await self.weread_storage.list_notes(book.book_id, limit=limit, note_type="想法")
+        reviews = await self.weread_storage.list_notes(book.book_id, limit=limit, note_type="点评")
+
+        return {
+            "success": True,
+            "book_title": book.title,
+            "message": (
+                f"《{book.title}》：划线 {len(highlights)} 条、"
+                f"想法 {len(thoughts)} 条、点评 {len(reviews)} 条"
+            ),
+            "highlights": [
+                {"chapter": h.chapter_title, "content": h.content, "time": h.created_at_str}
+                for h in highlights
+            ],
+            "thoughts": [
+                {
+                    "chapter": n.chapter_title,
+                    "abstract": n.abstract,   # 被标注的原文
+                    "content": n.content,      # 用户写的想法
+                    "time": n.created_at_str,
+                }
+                for n in thoughts
+            ],
+            "reviews": [
+                {"chapter": n.chapter_title, "content": n.content, "time": n.created_at_str}
+                for n in reviews
+            ],
+            "highlights_count": len(highlights),
+            "thoughts_count": len(thoughts),
+            "reviews_count": len(reviews),
+        }
+
+    async def _exec_weread_progress(self, params: Dict) -> Dict:
+        """查询实时阅读进度"""
+        err = self._check_weread()
+        if err:
+            return err
+
+        book_title = params.get("book_title", "").strip()
+        if not book_title:
+            return {"success": False, "error": "请指定书名"}
+
+        book = await self.weread_storage.find_book_by_title(book_title)
+        if not book:
+            return {
+                "success": False,
+                "error": f"本地未找到《{book_title}》，请先说'刷新微信书架'"
+            }
+
+        # 实时拉取（进度时效性要求高）
+        progress = await self.weread_client.get_progress(book.book_id)
+        if not progress:
+            return {"success": False, "error": f"获取《{book_title}》进度失败，Cookie 可能已过期"}
+
+        progress.book_title = book.title
+        await self.weread_storage.upsert_progress(progress)
+
+        return {
+            "success": True,
+            "message": (
+                f"《{book.title}》已读 {progress.progress_str}，"
+                f"阅读时长 {progress.reading_time_str}"
+            ),
+            "book_title": book.title,
+            "progress": progress.progress,
+            "progress_str": progress.progress_str,
+            "reading_time_str": progress.reading_time_str,
+            "chapter_uid": progress.chapter_uid,
+        }
+
+    async def _exec_weread_merge_notes(self, params: Dict) -> Dict:
+        """合并微信读书划线+想法与本地笔记"""
+        err = self._check_weread()
+        if err:
+            return err
+
+        book_title = params.get("book_title", "").strip()
+        if not book_title:
+            return {"success": False, "error": "请指定书名"}
+
+        push_to_feishu = params.get("push_to_feishu", False)
+
+        book = await self.weread_storage.find_book_by_title(book_title)
+        if not book:
+            return {
+                "success": False,
+                "error": f"本地未找到《{book_title}》，请先同步书架"
+            }
+
+        # 获取微信读书划线
+        highlights = await self.weread_storage.list_highlights(book.book_id, limit=30)
+        # 获取微信读书想法笔记
+        wr_notes = await self.weread_storage.list_notes(book.book_id, limit=20)
+        # 获取本地笔记
+        local_notes = await self.session_manager.get_recent_notes(days=30)
+        local_notes = [n for n in local_notes if book_title in (n.book_name or "")]
+
+        # 拼接摘要供 AI 整理
+        sections = []
+        if highlights:
+            hl_text = "\n".join(f"- {h.content}" for h in highlights[:20])
+            sections.append(f"【微信读书划线 {len(highlights)} 条】\n{hl_text}")
+        if wr_notes:
+            thoughts = [n for n in wr_notes if n.note_type == "想法"]
+            reviews = [n for n in wr_notes if n.note_type == "点评"]
+            if thoughts:
+                thought_text = "\n".join(
+                    f"- [原文] {n.abstract}\n  [想法] {n.content}" if n.abstract else f"- {n.content}"
+                    for n in thoughts[:10]
+                )
+                sections.append(f"【微信读书想法 {len(thoughts)} 条】\n{thought_text}")
+            if reviews:
+                review_text = "\n".join(f"- {n.content}" for n in reviews[:10])
+                sections.append(f"【微信读书点评 {len(reviews)} 条】\n{review_text}")
+        if local_notes:
+            local_text = "\n".join(f"- {n.content}" for n in local_notes[:10])
+            sections.append(f"【本地笔记 {len(local_notes)} 条】\n{local_text}")
+
+        if not sections:
+            return {
+                "success": True,
+                "message": f"《{book.title}》暂无划线、笔记数据",
+                "summary": "",
+            }
+
+        combined = "\n\n".join(sections)
+        summary = combined  # 默认直接返回合并内容，AI 自行整理
+
+        # 可选推送飞书
+        pushed = False
+        if push_to_feishu and self.feishu_pusher and self.feishu_chat_id:
+            try:
+                msg = f"📚《{book.title}》笔记合集\n\n{summary[:2000]}"
+                await self.feishu_pusher.push_text(self.feishu_chat_id, msg)
+                pushed = True
+            except Exception as e:
+                logger.error(f"飞书推送失败: {e}")
+
+        return {
+            "success": True,
+            "message": f"《{book.title}》笔记合并完成" + ("，已推送飞书" if pushed else ""),
+            "book_title": book.title,
+            "highlights_count": len(highlights),
+            "thoughts_count": len([n for n in wr_notes if n.note_type == "想法"]),
+            "reviews_count": len([n for n in wr_notes if n.note_type == "点评"]),
+            "local_notes_count": len(local_notes),
+            "summary": summary,
+            "feishu_pushed": pushed,
+        }
