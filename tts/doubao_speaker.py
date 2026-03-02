@@ -261,16 +261,16 @@ class DoubaoTTS:
 
 class DoubaoTTSPlayer:
     """
-    豆包 TTS 播放器
-    
-    特点：
-    - 异步队列，串流播放
-    - 支持打断
-    - 长文本自动分段
+    豆包 TTS 播放器 —— 合成/播放双流水线
+
+    架构：
+      speak() → _text_queue → [_synth_worker] → _audio_queue → [_play_worker]
+
+    播放 A 时合成 B 已在并发进行，段间停顿 ≈ 0。
     """
-    
-    # 豆包 TTS 单次最大字符数（官方限制约 500，留余量）
+
     MAX_TEXT_LENGTH = 400
+    MAX_AUDIO_QUEUE = 6  # 预合成音频的最大缓存段数
 
     def __init__(self,
                  appid: str,
@@ -283,19 +283,6 @@ class DoubaoTTSPlayer:
                  pitch_ratio: float = 1.0,
                  player_cmd: str = "afplay",
                  max_queue_size: int = 10):
-        """
-        Args:
-            appid: 应用 ID
-            token: Access Token
-            cluster: 集群 ID
-            voice_type: 声音类型
-            emotion: 情感
-            speed_ratio: 语速
-            volume_ratio: 音量
-            pitch_ratio: 音调
-            player_cmd: 播放器命令
-            max_queue_size: 队列大小
-        """
         self.tts = DoubaoTTS(
             appid=appid,
             token=token,
@@ -308,21 +295,30 @@ class DoubaoTTSPlayer:
         )
         self.player_cmd = player_cmd
         self.max_queue_size = max_queue_size
-        
-        # 队列和状态
-        self._queue: asyncio.Queue[TTSRequest] = asyncio.Queue(maxsize=max_queue_size)
+
+        # 文本输入队列（speak() 写入）
+        self._text_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+        # 音频就绪队列（合成完成后写入，播放协程消费）
+        # 元素格式：(audio_bytes, text_preview) 或 None（跳过）
+        self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=self.MAX_AUDIO_QUEUE)
+
         self._playing = False
         self._interrupt_event = asyncio.Event()
+
         # 合成完成信号（用于外部精确计时）
         self._synthesis_done = asyncio.Event()
         self.last_synthesis_ms: float = 0.0
 
-        # 临时文件目录
+        # 全链路时间戳（绝对 time.time()，None 表示尚未到达）
+        self.first_synth_start: Optional[float] = None   # synth_worker 开始合成首段
+        self.first_synth_end: Optional[float] = None     # 首段合成完成、音频就绪
+        self.first_play_start: Optional[float] = None    # play_worker 开始播放首段
+
         import tempfile
         self._temp_dir = tempfile.mkdtemp(prefix="reading_comp_doubao_")
-        
-        # 任务
-        self._worker_task: Optional[asyncio.Task] = None
+
+        self._synth_task: Optional[asyncio.Task] = None
+        self._play_task: Optional[asyncio.Task] = None
         self._running = False
         
     @staticmethod
@@ -399,32 +395,35 @@ class DoubaoTTSPlayer:
         return final_segments if final_segments else [text[:max_length]]
         
     async def start(self):
-        """启动播放器"""
+        """启动播放器（合成+播放两个协程并发）"""
         self._running = True
-        self._worker_task = asyncio.create_task(self._play_worker())
-        logger.info("豆包 TTS 播放器已启动")
-        
+        self._synth_task = asyncio.create_task(self._synth_worker())
+        self._play_task = asyncio.create_task(self._play_worker())
+        logger.info("豆包 TTS 播放器已启动（双流水线模式）")
+
     async def stop(self):
         """停止播放器"""
         self._running = False
         self.interrupt()
-        
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-        
+
+        for q in (self._text_queue, self._audio_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+        for task in (self._synth_task, self._play_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         self._cleanup_temp_files()
         logger.info("豆包 TTS 播放器已停止")
-    
+
     def _cleanup_temp_files(self):
         """清理临时文件"""
         try:
@@ -436,38 +435,26 @@ class DoubaoTTSPlayer:
             os.rmdir(self._temp_dir)
         except Exception as e:
             logger.warning(f"清理临时文件失败: {e}")
-    
+
     async def speak(self, text: str, interrupt: bool = False) -> bool:
-        """
-        播放文本
-        
-        Args:
-            text: 要播放的文本
-            interrupt: 是否打断当前播放
-            
-        Returns:
-            是否成功加入队列
-        """
+        """将文本送入合成队列"""
         if not text.strip():
             return False
 
-        # 重置合成完成信号
         self._synthesis_done.clear()
-
-        # 长文本分段
         segments = self._split_text(text.strip())
 
         try:
             if interrupt:
                 self.interrupt()
-                while not self._queue.empty():
-                    try:
-                        self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-            
-            # 将分段加入队列
-            for i, segment in enumerate(segments):
+                for q in (self._text_queue, self._audio_queue):
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+            for segment in segments:
                 request = TTSRequest(
                     text=segment,
                     voice_type=self.tts.voice_type,
@@ -475,93 +462,138 @@ class DoubaoTTSPlayer:
                     speed_ratio=self.tts.speed_ratio,
                     volume_ratio=self.tts.volume_ratio,
                     pitch_ratio=self.tts.pitch_ratio,
-                    interrupt=(interrupt and i == 0)
                 )
-                await self._queue.put(request)
-            
+                await self._text_queue.put(request)
+
             return True
-            
+
         except Exception as e:
             logger.error(f"添加 TTS 请求失败: {e}")
             return False
-    
+
     def interrupt(self):
         """打断当前播放"""
-        if self._playing:
-            self._interrupt_event.set()
-            logger.debug("TTS 播放被打断")
-    
+        self._interrupt_event.set()
+        logger.debug("TTS 播放被打断")
+
     def is_playing(self) -> bool:
         """是否正在播放"""
         return self._playing
 
+    def reset_timing(self):
+        """每次新消息开始前调用，清空时间戳"""
+        self.first_synth_start = None
+        self.first_synth_end = None
+        self.first_play_start = None
+        self._synthesis_done.clear()
+
     async def wait_synthesized(self, timeout: float = 30.0) -> float:
-        """等待第一段 TTS 合成完成（不等待播放），返回合成耗时 ms"""
+        """等待第一段 TTS 合成完成，返回合成耗时 ms"""
         try:
             await asyncio.wait_for(self._synthesis_done.wait(), timeout=timeout)
             return self.last_synthesis_ms
         except asyncio.TimeoutError:
             return 0.0
 
-    async def _play_worker(self):
-        """播放工作协程"""
+    # ── 合成协程 ──────────────────────────────────────────────────────────────
+    async def _synth_worker(self):
+        """
+        从文本队列取一段 → synthesize → 推入音频队列。
+        与播放协程并发运行，播放 A 的同时合成 B。
+        """
         while self._running:
             try:
-                request = await asyncio.wait_for(
-                    self._queue.get(), 
-                    timeout=1.0
-                )
+                request = await asyncio.wait_for(self._text_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
-            
-            self._interrupt_event.clear()
-            await self._synthesize_and_play(request)
-    
-    async def _synthesize_and_play(self, request: TTSRequest):
-        """合成并播放"""
-        try:
-            self._playing = True
-            
-            # 合成语音
-            import time
+
+            if self._interrupt_event.is_set():
+                # 被打断，丢弃这段文本
+                continue
+
+            # 记录首段合成开始时间
+            is_first = (self.first_synth_start is None)
+            if is_first:
+                self.first_synth_start = time.time()
+
             synth_start = time.time()
             audio_data = await self.tts.synthesize(request.text)
             synth_time = (time.time() - synth_start) * 1000
 
-            # 通知外部合成已完成（用于精确计时）
-            self.last_synthesis_ms = synth_time
-            self._synthesis_done.set()
-
+            # 记录首段合成完成时间 + 通知外部
+            if is_first:
+                self.first_synth_end = time.time()
+                self.last_synthesis_ms = synth_time
+                self._synthesis_done.set()
 
             if audio_data is None:
-                logger.error("TTS 合成失败")
-                return
-            
-            if self._interrupt_event.is_set():
-                logger.debug("TTS 被打断，跳过播放")
-                return
-            
+                logger.error("TTS 合成失败，跳过此段")
+                await self._audio_queue.put(None)
+                continue
+
             logger.info(f"🔊 豆包 TTS 合成完成: {synth_time:.0f} ms, {len(audio_data)} bytes")
-            
-            # 保存临时文件
-            temp_file = os.path.join(
-                self._temp_dir, 
-                f"tts_{asyncio.get_event_loop().time()}.mp3"
-            )
+            await self._audio_queue.put((audio_data, request.text[:20]))
+
+    # ── 播放协程 ──────────────────────────────────────────────────────────────
+    async def _play_worker(self):
+        """
+        从音频队列取已合成音频 → 写临时文件 → 播放。
+        串行播放，与合成并发。
+        """
+        while self._running:
+            try:
+                item = await asyncio.wait_for(self._audio_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            if item is None:
+                # 合成失败，跳过
+                continue
+
+            if self._interrupt_event.is_set():
+                self._interrupt_event.clear()
+                # 丢弃音频队列中剩余内容
+                while not self._audio_queue.empty():
+                    try:
+                        self._audio_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                continue
+
+            audio_data, preview = item
+
+            # 贪婪合并：把 audio_queue 中已就绪的后续段全部拼入同一个文件，
+            # 一次 afplay 调用连续播放，消除段间 ~300ms 的子进程启动停顿。
+            extra = 0
+            while True:
+                try:
+                    nxt = self._audio_queue.get_nowait()
+                    if nxt is None:
+                        break
+                    audio_data += nxt[0]
+                    extra += 1
+                except asyncio.QueueEmpty:
+                    break
+            if extra:
+                logger.debug(f"📦 贪婪合并 {extra + 1} 段音频，连续播放")
+
+            temp_file = os.path.join(self._temp_dir, f"tts_{time.monotonic_ns()}.mp3")
             with open(temp_file, "wb") as f:
                 f.write(audio_data)
-            
-            # 播放
-            await self._play_audio(temp_file)
-            
-            # 清理
+
+            # 记录首段播放开始时间
+            if self.first_play_start is None:
+                self.first_play_start = time.time()
+
+            self._playing = True
             try:
-                os.remove(temp_file)
-            except:
-                pass
-                
-        finally:
-            self._playing = False
+                await self._play_audio(temp_file)
+            finally:
+                self._playing = False
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
     
     async def _play_audio(self, audio_file: str):
         """播放音频文件"""

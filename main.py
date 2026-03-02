@@ -4,6 +4,7 @@ AI 读书搭子 - 主程序
 """
 import asyncio
 import logging
+import re
 import signal
 import sys
 import time
@@ -19,6 +20,45 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("main")
+
+# ── TTS 分块参数 ──────────────────────────────────────────────────────────────
+# TTS 单次合成约 3-4s，太短的片段得不偿失，采用句子边界 + 最小字符阈值
+_SENT_END = re.compile(r'(?<=[。！？…!?\n])\s*')
+_TTS_FIRST_MIN_CHARS = 10  # 首段门槛：遇到第一个句子边界且 ≥10 字即发，快开口
+_TTS_MIN_CHARS = 50        # 后续段门槛：积累 ≥50 字再发，配合贪婪批合并保证连续
+_TTS_MAX_CHARS = 200       # 强制切割上限
+
+
+def _extract_tts_chunk(buf: str, force: bool = False, min_chars: int = _TTS_MIN_CHARS):
+    """
+    从缓冲区提取一个 TTS 片段，返回 (片段或None, 剩余缓冲)。
+
+    策略：
+    - 找到句子边界 AND 累积字数 >= min_chars → 发出
+    - 累积字数 >= _TTS_MAX_CHARS → 强制切割
+    - force=True（流结束）→ 发出所有剩余
+    """
+    if force and buf.strip():
+        return buf.strip(), ""
+
+    if len(buf) >= _TTS_MAX_CHARS:
+        return buf[:_TTS_MAX_CHARS].strip(), buf[_TTS_MAX_CHARS:]
+
+    parts = _SENT_END.split(buf)
+    if len(parts) <= 1:
+        return None, buf  # 没找到句子边界
+
+    accumulated = ""
+    for i, part in enumerate(parts[:-1]):
+        accumulated += part
+        if len(accumulated) >= min_chars:
+            remainder = "".join(parts[i + 1:])
+            return accumulated.strip(), remainder
+
+    return None, buf  # 有边界但积累不足 min_chars，继续等
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 # 导入模块
 from config import config, Config
@@ -279,19 +319,16 @@ class ReadingCompanion:
     
     async def _process_user_message(self, text: str, channel: str = "voice"):
         """
-        处理用户消息 - 带完整链路计时
+        处理用户消息 - 流式 ReAct 多轮循环
         """
         logger.info("=" * 60)
         logger.info("🚀 开始处理用户消息")
         logger.info(f"   输入: {text[:50]}...")
         logger.info("=" * 60)
-        
-        # 整体链路计时
+
         start_time = time.time()
-        
+
         try:
-            # 1. 调用 LLM
-            logger.info("⏳ 1. 准备调用 LLM...")
             system_prompt = self.memory.build_system_prompt()
             history = self.memory.get_history()
             tools = self.tool_registry.get_tools()
@@ -299,93 +336,156 @@ class ReadingCompanion:
             logger.info(f"   历史消息数: {len(history)}, 工具数: {len(tools)}, "
                         f"书页上下文: {page_ctx_len}字"
                         + (" ✓" if page_ctx_len else " (无)"))
-            
-            response = await self.llm.chat(
+
+            MAX_ROUNDS = 5
+            round_count = 0
+            reply_parts = []
+            first_tts_enqueue_time: Optional[float] = None  # speak() 首次调用时间
+
+            # 重置 TTS 时间戳（仅 voice 通道且播放器支持）
+            if channel == "voice" and self.tts_player and hasattr(self.tts_player, "reset_timing"):
+                self.tts_player.reset_timing()
+
+            # 首轮 stream kwargs
+            stream_kwargs = dict(
                 user_message=text,
                 system_prompt=system_prompt,
                 history=history,
-                tools=tools
+                tools=tools,
             )
-            
-            llm_done_time = time.time()
-            
-            # 2. 处理工具调用
-            if response.tool_calls:
-                tool_results = []
-                for tool_call in response.tool_calls:
-                    result = await self.tool_executor.execute(
-                        tool_call["name"],
-                        tool_call["input"]
-                    )
-                    tool_results.append({
-                        "tool_use_id": tool_call["id"],
-                        "content": str(result)
-                    })
 
-                final_response = await self.llm.chat_with_tool_result(
+            while round_count < MAX_ROUNDS:
+                round_count += 1
+                tts_buf = ""
+                tool_calls = None
+                raw_assistant_msg = None
+
+                # 性能打点
+                stream_start = time.time()
+                first_token_time = None
+                total_chars = 0
+                chars_100_time = None
+
+                first_tts_sent = False  # 首段是否已发出（首段用低门槛快开口）
+
+                async for chunk in self.llm.chat_stream(**stream_kwargs):
+                    if chunk.type == "text_delta":
+                        if first_token_time is None:
+                            first_token_time = time.time()
+                            logger.info(f"🚀 流式首字: {(first_token_time - stream_start)*1000:.0f}ms")
+                        total_chars += len(chunk.content)
+                        if chars_100_time is None and total_chars >= 100:
+                            chars_100_time = time.time()
+                            logger.info(f"📊 流式100字: {(chars_100_time - stream_start)*1000:.0f}ms")
+
+                        tts_buf += chunk.content
+                        # 首段用低门槛（快开口），后续段用正常门槛
+                        min_c = _TTS_FIRST_MIN_CHARS if not first_tts_sent else _TTS_MIN_CHARS
+                        chunk_to_send, tts_buf = _extract_tts_chunk(tts_buf, min_chars=min_c)
+                        if chunk_to_send:
+                            first_tts_sent = True
+                            if first_tts_enqueue_time is None:
+                                first_tts_enqueue_time = time.time()
+                            reply_parts.append(chunk_to_send)
+                            if channel == "voice":
+                                await self.tts_player.speak(chunk_to_send, interrupt=False)
+
+                    elif chunk.type == "tool_use":
+                        # flush 剩余文本（如"好的，我来查一下"）
+                        if tts_buf.strip():
+                            reply_parts.append(tts_buf)
+                            if channel == "voice":
+                                await self.tts_player.speak(tts_buf, interrupt=False)
+                            tts_buf = ""
+                        tool_calls = chunk.tool_calls
+                        raw_assistant_msg = chunk.raw_assistant_msg
+
+                    # "done" chunk 不需要处理
+
+                # 流结束后 flush 剩余
+                if not tool_calls:
+                    tail, _ = _extract_tts_chunk(tts_buf, force=True)
+                    if tail:
+                        reply_parts.append(tail)
+                        if channel == "voice":
+                            await self.tts_player.speak(tail, interrupt=False)
+
+                logger.info(
+                    f"📊 第{round_count}轮流式: 共{total_chars}字, "
+                    f"首字={(((first_token_time or 0) - stream_start)*1000):.0f}ms, "
+                    f"百字={(((chars_100_time or 0) - stream_start)*1000):.0f}ms"
+                )
+
+                if not tool_calls:
+                    break
+
+                # 执行工具
+                tool_results = []
+                for tc in tool_calls:
+                    result = await self.tool_executor.execute(tc["name"], tc["input"])
+                    tool_results.append({"tool_use_id": tc["id"], "content": str(result)})
+
+                # 续轮 stream kwargs
+                stream_kwargs = dict(
                     user_message=text,
-                    tool_results=tool_results,
                     system_prompt=system_prompt,
                     history=history,
-                    assistant_message=response.raw_assistant_message,
+                    tools=tools,
+                    tool_results=tool_results,
+                    assistant_message=raw_assistant_msg,
                 )
-                
-                reply_text = final_response.text
-            else:
-                reply_text = response.text
-            
-            tool_done_time = time.time()
-            
+
+            reply_text = "".join(reply_parts)
+
             # 打印 AI 回复内容
             logger.info("=" * 60)
             logger.info("🤖 AI 回复内容:")
             logger.info("-" * 60)
-            # 多行显示，每行最多 58 字符
             for line in reply_text.split('\n'):
                 while line:
-                    chunk = line[:58]
+                    logger.info(f"  {line[:58]}")
                     line = line[58:]
-                    logger.info(f"  {chunk}")
             logger.info("-" * 60)
-            logger.info(f"📊 回复长度: {len(reply_text)} 字符, {len(reply_text.split())} 词")
+            logger.info(f"📊 回复长度: {len(reply_text)} 字符, 共 {round_count} 轮")
             logger.info("=" * 60)
-            
-            # 3. 记录对话历史
+
+            # 记录对话历史
             self.memory.add_message("user", text)
             self.memory.add_message("assistant", reply_text)
-            
-            # 4. 语音播报（带 TTS 时间计算）
-            if channel == "voice" and reply_text:
-                logger.info("🔊 开始 TTS 转换...")
-                await self.tts_player.speak(reply_text, interrupt=True)
-                # 等待合成完成（不等播放），获取真实合成耗时
-                if hasattr(self.tts_player, 'wait_synthesized'):
-                    tts_time = await self.tts_player.wait_synthesized(timeout=30.0)
-                else:
-                    tts_time = 0
-                logger.info(f"✅ TTS 合成完成，耗时: {tts_time:.0f} ms")
-            else:
-                tts_time = 0
-            
+
             end_time = time.time()
-            
-            # 打印完整链路分析
-            total_time = (end_time - start_time) * 1000
-            llm_time = (llm_done_time - start_time) * 1000
-            tool_time = (tool_done_time - llm_done_time) * 1000 if response.tool_calls else 0
-            
-            logger.info("╔" + "=" * 58 + "╗")
-            logger.info("║" + " 📊 完整链路耗时分析 ".center(54) + "║")
-            logger.info("╠" + "=" * 58 + "╣")
-            logger.info(f"║  LLM 推理:     {llm_time:>6.0f} ms                          ║")
-            if response.tool_calls:
-                logger.info(f"║  工具执行:     {tool_time:>6.0f} ms                          ║")
-            if tts_time > 0:
-                logger.info(f"║  TTS 转换:     {tts_time:>6.0f} ms                          ║")
-            logger.info("╠" + "=" * 58 + "╣")
-            logger.info(f"║  总耗时:       {total_time:>6.0f} ms                          ║")
-            logger.info("╚" + "=" * 58 + "╝")
-                
+
+            # ── 全链路时间轴 summary ───────────────────────────────────────────
+            ref = start_time
+
+            def _ms(t: Optional[float]) -> str:
+                return f"+{(t - ref) * 1000:6.0f} ms" if t else "  (待测) "
+
+            # 从 TTS 播放器读取时间戳（仅 DoubaoTTSPlayer 支持）
+            tp = self.tts_player if channel == "voice" else None
+            tts_synth_start  = getattr(tp, "first_synth_start",  None)
+            tts_synth_end    = getattr(tp, "first_synth_end",    None)
+            tts_play_start   = getattr(tp, "first_play_start",   None)
+
+            # 首字→开口 的端到端延迟
+            e2e_ms = (
+                f"{(tts_play_start - ref) * 1000:.0f} ms"
+                if tts_play_start else "(待测)"
+            )
+
+            logger.info("=" * 60)
+            logger.info("📊 全链路延迟（从收到用户消息开始）")
+            logger.info("-" * 60)
+            logger.info(f"  LLM 首字出现:   {_ms(first_token_time)}  ← AI 开始生成")
+            logger.info(f"  TTS 文本入队:   {_ms(first_tts_enqueue_time)}  ← 首段文字送出")
+            logger.info(f"  TTS 开始合成:   {_ms(tts_synth_start)}  ← synth_worker 拾取")
+            logger.info(f"  TTS 合成完成:   {_ms(tts_synth_end)}  ← 首段音频就绪")
+            logger.info(f"  TTS 开始播放:   {_ms(tts_play_start)}  ← 用户听到首字")
+            logger.info("-" * 60)
+            logger.info(f"  首字→开口延迟:  {e2e_ms}")
+            logger.info(f"  全程总耗时:    +{(end_time - ref) * 1000:6.0f} ms")
+            logger.info("=" * 60)
+
         except Exception as e:
             logger.error(f"处理消息失败: {e}")
             if channel == "voice":
