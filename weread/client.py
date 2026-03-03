@@ -220,6 +220,8 @@ class WeReadClient:
             chapter_uid = item.get("chapterUid", 0)
             if not mark_text or not chapter_uid:
                 continue
+            if item.get("type") == 0:  # type=0 是书签，type=1 是划线
+                continue
             highlights.append(WeReadHighlight(
                 bookmark_id=item.get("bookmarkId", ""),
                 book_id=book_id,
@@ -304,6 +306,79 @@ class WeReadClient:
             chapter_uid=book_data.get("chapterUid", 0),
             chapter_offset=book_data.get("chapterOffset", 0),
         )
+
+    async def get_bookmarks(self, book_id: str, book_title: str = "") -> List[WeReadHighlight]:
+        """
+        获取书签（纯位置标记）。
+        与划线来自同一接口 /web/book/bookmarklist，
+        区别：书签的 markText 为空字符串，划线有文字内容。
+        """
+        book_referer = f"https://weread.qq.com/web/reader/{book_id}"
+        data = await self._get(
+            "/web/book/bookmarklist",
+            {"bookId": book_id, "synckey": 0},
+            extra_headers={"Referer": book_referer},
+        )
+        if not data:
+            return []
+
+        chapters = {c["chapterUid"]: c.get("title", "") for c in data.get("chapters", [])}
+
+        bookmarks = []
+        for item in data.get("updated", []):
+            if item.get("type") != 0:  # type=0 是书签，其他跳过
+                continue
+            chapter_uid = item.get("chapterUid", 0)
+            if not chapter_uid:
+                continue
+            bookmarks.append(WeReadHighlight(
+                bookmark_id=item.get("bookmarkId", ""),
+                book_id=book_id,
+                book_title=book_title,
+                content=item.get("markText", "").strip(),  # 书签位置的文字（自动捕获）
+                chapter_uid=chapter_uid,
+                chapter_title=chapters.get(chapter_uid, _chapter_name(item)),
+                chapter_idx=item.get("chapterIdx", 0),
+                created_at=item.get("createTime", 0),
+            ))
+        return bookmarks
+
+    async def get_best_highlights(self, book_id: str) -> List[WeReadHighlight]:
+        """
+        获取热门划线（所有读者的热门标注）。
+        接口：/web/book/bestbookmarks?bookId=...
+        返回 chapters（章节映射）和 items（热门划线条目）。
+        """
+        data = await self._get(
+            "/web/book/bestbookmarks",
+            {"bookId": book_id},
+        )
+        if not data:
+            return []
+
+        # 响应格式：{"bestBookMarks": {"chapters": [...], "items"/"updated": [...], ...}}
+        payload = data.get("bestBookMarks", data)
+        chapters = {c["chapterUid"]: c.get("title", "") for c in payload.get("chapters", [])}
+        # items 字段名可能是 "items" 或 "updated"
+        raw_items = payload.get("items") or payload.get("updated") or []
+
+        results = []
+        for item in raw_items:
+            mark_text = item.get("markText", "").strip()
+            if not mark_text:
+                continue
+            chapter_uid = item.get("chapterUid", 0)
+            results.append(WeReadHighlight(
+                bookmark_id=item.get("bookmarkId", f"best_{len(results)}"),
+                book_id=book_id,
+                book_title="",
+                content=mark_text,
+                chapter_uid=chapter_uid,
+                chapter_title=chapters.get(chapter_uid, _chapter_name(item)),
+                chapter_idx=item.get("chapterIdx", 0),
+                created_at=item.get("createTime", 0),
+            ))
+        return results
 
     async def get_chapter_infos(self, book_id: str) -> Dict[int, str]:
         """

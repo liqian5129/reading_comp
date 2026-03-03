@@ -323,6 +323,24 @@ WEREAD_PROGRESS_TOOL = {
     }
 }
 
+WEREAD_BEST_HIGHLIGHTS_TOOL = {
+    "name": "weread_best_highlights",
+    "description": (
+        "获取某本书的热门划线（所有读者都标注过的精华句子）。"
+        "用于快速了解一本书的核心观点和金句，或在没有个人划线时浏览大家的共识摘录。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "book_title": {
+                "type": "string",
+                "description": "书名（模糊匹配），必填"
+            }
+        },
+        "required": ["book_title"],
+    }
+}
+
 WEREAD_MERGE_NOTES_TOOL = {
     "name": "weread_merge_notes",
     "description": (
@@ -362,6 +380,7 @@ ALL_TOOLS = [
     WEREAD_NOTEBOOK_TOOL,
     WEREAD_GET_NOTES_TOOL,
     WEREAD_PROGRESS_TOOL,
+    WEREAD_BEST_HIGHLIGHTS_TOOL,
     WEREAD_MERGE_NOTES_TOOL,
 ]
 
@@ -425,6 +444,7 @@ class ToolExecutor:
                 "weread_notebook": self._exec_weread_notebook,
                 "weread_get_notes": self._exec_weread_get_notes,
                 "weread_progress": self._exec_weread_progress,
+                "weread_best_highlights": self._exec_weread_best_highlights,
                 "weread_merge_notes": self._exec_weread_merge_notes,
             }
             handler = dispatch.get(tool_name)
@@ -965,6 +985,9 @@ class ToolExecutor:
                     n.book_title = book.title
             await self.weread_storage.upsert_notes(notes_api)
 
+        # 书签：与划线同一接口，markText 为空的项，不入库直接返回
+        bookmarks_api = await self.weread_client.get_bookmarks(book.book_id, book_title=book.title)
+
         # 从本地读取，分类返回
         highlights = await self.weread_storage.list_highlights(book.book_id, limit=limit)
         thoughts = await self.weread_storage.list_notes(book.book_id, limit=limit, note_type="想法")
@@ -974,18 +997,22 @@ class ToolExecutor:
             "success": True,
             "book_title": book.title,
             "message": (
-                f"《{book.title}》：划线 {len(highlights)} 条、"
+                f"《{book.title}》：划线 {len(highlights)} 条、书签 {len(bookmarks_api)} 个、"
                 f"想法 {len(thoughts)} 条、点评 {len(reviews)} 条"
             ),
             "highlights": [
                 {"chapter": h.chapter_title, "content": h.content, "time": h.created_at_str}
                 for h in highlights
             ],
+            "bookmarks": [
+                {"chapter": b.chapter_title, "content": b.content, "time": b.created_at_str}
+                for b in bookmarks_api
+            ],
             "thoughts": [
                 {
                     "chapter": n.chapter_title,
-                    "abstract": n.abstract,   # 被标注的原文
-                    "content": n.content,      # 用户写的想法
+                    "abstract": n.abstract,
+                    "content": n.content,
                     "time": n.created_at_str,
                 }
                 for n in thoughts
@@ -995,6 +1022,7 @@ class ToolExecutor:
                 for n in reviews
             ],
             "highlights_count": len(highlights),
+            "bookmarks_count": len(bookmarks_api),
             "thoughts_count": len(thoughts),
             "reviews_count": len(reviews),
         }
@@ -1035,6 +1063,47 @@ class ToolExecutor:
             "progress_str": progress.progress_str,
             "reading_time_str": progress.reading_time_str,
             "chapter_uid": progress.chapter_uid,
+        }
+
+    async def _exec_weread_best_highlights(self, params: Dict) -> Dict:
+        """获取热门划线"""
+        err = self._check_weread()
+        if err:
+            return err
+
+        book_title = params.get("book_title", "").strip()
+        if not book_title:
+            return {"success": False, "error": "请指定书名"}
+
+        book = await self.weread_storage.find_book_by_title(book_title)
+        if not book:
+            shelf_data = await self.weread_client.get_shelf()
+            if shelf_data:
+                await self.weread_storage.upsert_books(shelf_data.get("books", []))
+                for prog in shelf_data.get("progress", []):
+                    await self.weread_storage.upsert_progress(prog)
+            book = await self.weread_storage.find_book_by_title(book_title)
+            if not book:
+                return {"success": False, "error": f"未找到《{book_title}》，请确认书名或先同步书架"}
+
+        best = await self.weread_client.get_best_highlights(book.book_id)
+        if not best:
+            return {
+                "success": True,
+                "message": f"《{book.title}》暂无热门划线（接口可能不支持此书）",
+                "highlights": [],
+                "total": 0,
+            }
+
+        return {
+            "success": True,
+            "book_title": book.title,
+            "message": f"《{book.title}》共 {len(best)} 条热门划线",
+            "highlights": [
+                {"chapter": h.chapter_title, "content": h.content}
+                for h in best
+            ],
+            "total": len(best),
         }
 
     async def _exec_weread_merge_notes(self, params: Dict) -> Dict:

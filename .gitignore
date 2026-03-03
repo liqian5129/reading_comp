@@ -1,5 +1,5 @@
 # Config (contains secrets/credentials)
-config.json
+
 
 # Python
 __pycache__/
