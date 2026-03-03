@@ -71,6 +71,7 @@ class VoiceRecorder:
         # 回调
         self.on_text: Optional[Callable[[str], None]] = None
         self.on_segment: Optional[Callable[[VoiceSegment], None]] = None
+        self.on_interrupt: Optional[Callable[[], None]] = None
         
         # 组件
         self._stream: Optional[sd.InputStream] = None
@@ -100,6 +101,11 @@ class VoiceRecorder:
     def _on_key_press(self, key):
         """按键按下"""
         if key == self.trigger_key and self.state == RecordingState.IDLE:
+            if self.on_interrupt:
+                try:
+                    self.on_interrupt()
+                except Exception as e:
+                    logger.error(f"on_interrupt 回调错误: {e}")
             self._start_recording()
     
     def _on_key_release(self, key):
