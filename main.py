@@ -21,6 +21,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# 显式锁定我们自己的模块级别，防止第三方库修改 root logger 后被连带压制
+for _n in ["main", "config", "session", "agent", "scanner",
+           "voice", "tts", "feishu", "camera", "ocr"]:
+    logging.getLogger(_n).setLevel(logging.INFO)
+
+# 压制第三方噪音日志（propagate=False 防止它们冒泡到 root handler）
+for _n in ["jieba", "Lark", "httpx", "urllib3"]:
+    _l = logging.getLogger(_n)
+    _l.setLevel(logging.WARNING)
+    _l.propagate = False
+
+# 压制 urllib3 的 NotOpenSSLWarning（Python warnings 模块层面）
+import warnings
+warnings.filterwarnings("ignore", category=Warning, module="urllib3")
+
 # ── TTS 分块参数 ──────────────────────────────────────────────────────────────
 # TTS 单次合成约 3-4s，太短的片段得不偿失，采用句子边界 + 最小字符阈值
 _SENT_END = re.compile(r'(?<=[。！？…!?\n])\s*')
@@ -116,7 +131,7 @@ class ReadingCompanion:
         
         # 状态
         self._running = False
-        self._last_valid_ocr_ts: float = 0.0  # 上次有效 OCR 的时间戳
+        self._last_valid_ocr_ts: float = time.time()  # 上次有效 OCR 的时间戳
         
     async def initialize(self):
         """初始化所有模块"""
@@ -216,8 +231,8 @@ class ReadingCompanion:
                 device=config.FUNASR_DEVICE,
                 model=config.FUNASR_MODEL,
                 chunk_size_frames=config.FUNASR_CHUNK_SIZE_FRAMES,
+                on_ready=self._on_asr_ready,
             )
-            # 模型在后台线程加载，主流程继续；首次按键时若未就绪会自动等待
         else:
             logger.info("🎙️ 使用阿里云 NLS ASR（云端）")
             self.asr = create_asr(
@@ -307,13 +322,11 @@ class ReadingCompanion:
             # 启动录音监听
             self.recorder.start()
 
-            logger.info("=" * 60)
-            logger.info("🎉 AI 读书搭子已启动！")
-            logger.info(f"🤖 AI 提供商: {config.AI_PROVIDER}")
-            logger.info(f"🤖 AI 模型: {config.CURRENT_MODEL}")
-            logger.info(f"🔊 TTS 提供商: {config.TTS_PROVIDER}")
-            logger.info("按住 【右 Alt 键】说话与 AI 交流")
-            logger.info("=" * 60)
+            if config.ASR_PROVIDER == "funasr":
+                # FunASR 后台加载中，就绪后由 _on_asr_ready 打印横幅
+                logger.info("⏳ FunASR 模型加载中，加载完成后即可说话...")
+            else:
+                self._print_ready_banner()
         
         # 保持运行
         try:
@@ -524,6 +537,20 @@ class ReadingCompanion:
         if book_title and confidence >= 0.7:
             self.memory.update_book_context(vision_result)
             logger.info(f"📚 书名已识别: 《{book_title}》（置信度 {confidence:.2f}）")
+
+    def _print_ready_banner(self):
+        logger.info("=" * 60)
+        logger.info("🎉 AI 读书搭子已启动！")
+        logger.info(f"🤖 AI 提供商: {config.AI_PROVIDER}")
+        logger.info(f"🤖 AI 模型: {config.CURRENT_MODEL}")
+        logger.info(f"🔊 TTS 提供商: {config.TTS_PROVIDER}")
+        logger.info("按住 【右 Alt 键】说话与 AI 交流")
+        logger.info("=" * 60)
+
+    def _on_asr_ready(self, elapsed: float):
+        """FunASR 后台加载完成回调"""
+        logger.info(f"🟢 FunASR 已就绪（加载耗时 {elapsed:.1f}s）")
+        self._print_ready_banner()
 
     # OCR 连续无内容超时：超过此秒数才清空上下文
     _OCR_CLEAR_TIMEOUT_S = 60
