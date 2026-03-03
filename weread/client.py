@@ -97,7 +97,7 @@ class WeReadClient:
                     return None
                 data = await resp.json(content_type=None)
                 if isinstance(data, dict):
-                    errcode = data.get("errcode")
+                    errcode = data.get("errcode") or data.get("errCode")
                     if errcode in _AUTH_EXPIRED_CODES:
                         logger.warning(f"微信读书 Cookie 已过期（errcode={errcode}）")
                         return None
@@ -132,18 +132,28 @@ class WeReadClient:
         data = await self._get("/api/user/notebook")
         return data is not None
 
-    async def get_shelf(self) -> Dict[str, List]:
+    async def get_shelf(self) -> Optional[Dict[str, List]]:
         """
         获取书架，同时返回 books 和 bookProgress 列表。
         /web/shelf/sync 不需要 wr_vid，通过 Cookie 自动识别用户。
         返回格式: {"books": [...], "progress": [...]}
+        API 失败（Cookie 过期/网络错误）时返回 None，书架真空时返回 {"books": [], ...}
         """
         data = await self._get("/web/shelf/sync")
         if not data:
-            return {"books": [], "progress": []}
+            logger.warning("get_shelf: /web/shelf/sync 返回空（网络异常或 Cookie 失效）")
+            return None
+
+        errcode = data.get("errcode") or data.get("errCode")
+        if errcode is not None:
+            errmsg = data.get("errmsg") or data.get("errMsg") or data.get("errLog", "")
+            logger.warning(f"get_shelf: API 返回错误码 errCode={errcode}, msg={errmsg}")
+            return None
 
         raw_books = data.get("books", [])
         raw_progress = data.get("bookProgress", [])
+        if not raw_books:
+            logger.warning(f"get_shelf: API 返回 books 为空，响应 keys={list(data.keys())}")
 
         books: List[WeReadBook] = []
         for item in raw_books:

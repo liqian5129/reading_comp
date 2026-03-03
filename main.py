@@ -134,6 +134,7 @@ class ReadingCompanion:
         # 状态
         self._running = False
         self._last_valid_ocr_ts: float = time.time()  # 上次有效 OCR 的时间戳
+        self._msg_lock = asyncio.Lock()  # 防止并发处理用户消息
         
     async def initialize(self):
         """初始化所有模块"""
@@ -222,7 +223,11 @@ class ReadingCompanion:
             self.weread_client = WeReadClient(config.WEREAD_COOKIE)
             await self.weread_client.initialize()
             self.weread_storage = WeReadStorage(self.storage._conn)
-            logger.info("📱 微信读书集成已启用")
+            auth_ok = await self.weread_client.check_auth()
+            if auth_ok:
+                logger.info("📱 微信读书集成已启用（Cookie 有效）")
+            else:
+                logger.warning("⚠️  微信读书 Cookie 已过期，请更新 config.json 中的 weread.cookie_string")
         else:
             logger.info("📱 微信读书集成未启用（weread.enabled=false 或未配置 cookie_string）")
 
@@ -357,11 +362,21 @@ class ReadingCompanion:
     async def _on_voice_text(self, text: str):
         """处理语音识别结果（异步版本）"""
         logger.info(f"👤 用户: {text}")
+        if self._msg_lock.locked():
+            logger.warning("⚠️  上一条消息仍在处理中，忽略本次输入")
+            return
         await self._process_user_message(text)
     
     async def _process_user_message(self, text: str, channel: str = "voice"):
         """
         处理用户消息 - 流式 ReAct 多轮循环
+        """
+        async with self._msg_lock:
+            return await self._process_user_message_inner(text, channel)
+
+    async def _process_user_message_inner(self, text: str, channel: str = "voice"):
+        """
+        处理用户消息核心逻辑（由 _process_user_message 持锁调用）
         """
         logger.info("=" * 60)
         logger.info("🚀 开始处理用户消息")
@@ -382,6 +397,7 @@ class ReadingCompanion:
             MAX_ROUNDS = 5
             round_count = 0
             reply_parts = []
+            pending_tool_rounds = []  # 本轮工具调用暂存，用于轮结束后按序写入 history
             first_tts_enqueue_time: Optional[float] = None  # speak() 首次调用时间
 
             # 重置 TTS 时间戳（仅 voice 通道且播放器支持）
@@ -467,6 +483,9 @@ class ReadingCompanion:
                     result = await self.tool_executor.execute(tc["name"], tc["input"])
                     tool_results.append({"tool_use_id": tc["id"], "content": str(result)})
 
+                # 记录本轮工具调用（暂存，稍后按正确顺序写入 history）
+                pending_tool_rounds.append((raw_assistant_msg, tool_results))
+
                 # 续轮 stream kwargs
                 stream_kwargs = dict(
                     user_message=text,
@@ -491,8 +510,10 @@ class ReadingCompanion:
             logger.info(f"📊 回复长度: {len(reply_text)} 字符, 共 {round_count} 轮")
             logger.info("=" * 60)
 
-            # 记录对话历史
+            # 按正确顺序写入对话历史：user → tool轮... → assistant最终回复
             self.memory.add_message("user", text)
+            for raw_msg, results in pending_tool_rounds:
+                self.memory.add_tool_round(raw_msg, results)
             self.memory.add_message("assistant", reply_text)
 
             end_time = time.time()

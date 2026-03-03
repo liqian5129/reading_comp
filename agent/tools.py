@@ -95,7 +95,7 @@ BOOKMARK_CREATE_TOOL = {
 
 BOOKMARK_LIST_TOOL = {
     "name": "bookmark_list",
-    "description": "查询已保存的书签列表，显示每个书签的页码和摘录。用户想了解上次读到哪里或查看历史书签时调用。",
+    "description": "查询在本 App 内手动保存的本地书签（非微信读书书签）。用户说「记录一下读到这里」或查看本 App 历史书签时调用。若用户问的是微信读书的书签/划线/笔记，应使用 weread_get_notes。",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -217,8 +217,11 @@ SET_TIMER_TOOL = {
 GENERATE_READING_CARD_TOOL = {
     "name": "generate_reading_card",
     "description": (
-        "从当前书页内容生成阅读卡片（金句/知识点/摘要）并推送到飞书。"
-        "用户想将书页精华整理成卡片或分享到飞书时调用；内容留空则自动使用当前书页 OCR。"
+        "生成阅读卡片（金句/知识点/摘要）并推送到飞书。"
+        "用户想将微信读书笔记/划线做成卡片时：只传 book_title，不要自己填写 content，"
+        "工具会自动从微信读书数据库取用户真实的划线和笔记作为内容。"
+        "用户想将当前书页做成卡片时：只传 card_type，内容自动使用摄像头 OCR。"
+        "content 参数仅在用户明确口述了具体文字时才填写。"
     ),
     "input_schema": {
         "type": "object",
@@ -227,8 +230,8 @@ GENERATE_READING_CARD_TOOL = {
                 "type": "string",
                 "description": "卡片类型: quote（金句）/ knowledge（知识点）/ summary（摘要）",
             },
-            "content": {"type": "string", "description": "卡片内容（留空则使用当前书页 OCR 内容生成）"},
-            "book_title": {"type": "string", "description": "来源书名"},
+            "content": {"type": "string", "description": "卡片内容。仅在用户口述了具体文字时填写；其余情况留空，工具自动从微信读书或 OCR 取内容，禁止填入你推测或从训练知识生成的文字。"},
+            "book_title": {"type": "string", "description": "来源书名，提供后工具自动从微信读书数据库取该书的真实划线和笔记"},
         },
         "required": ["card_type"],
     }
@@ -285,7 +288,8 @@ WEREAD_NOTEBOOK_TOOL = {
 WEREAD_GET_NOTES_TOOL = {
     "name": "weread_get_notes",
     "description": (
-        "获取某本书的全部微信读书笔记，分三类：划线、想法（附在划线上的评论）、点评（独立书评）。"
+        "获取某本书的全部微信读书笔记，分四类：书签（位置标记）、划线、想法（附在划线上的评论）、点评（独立书评）。"
+        "用户问微信读书的书签、划线、笔记、想法时都应调用此工具。"
         "调用前自动同步最新数据，无需用户手动触发同步。"
         "若用户未明确书名，先调用 weread_notebook 获取书单后自行推断，不要反复询问用户。"
     ),
@@ -784,7 +788,24 @@ class ToolExecutor:
         content = params.get("content", "").strip()
         book_title = params.get("book_title", "").strip()
 
-        # 没有指定内容时，使用当前书页 OCR
+        # 有书名时，优先从 weread_storage 取用户真实划线/笔记，防止 AI 幻觉
+        if book_title and self.weread_storage and not content:
+            book = await self.weread_storage.find_book_by_title(book_title)
+            if book:
+                highlights = await self.weread_storage.list_highlights(book.book_id, limit=10)
+                notes = await self.weread_storage.list_notes(book.book_id, limit=10)
+                parts = []
+                for h in highlights:
+                    parts.append(h.content)
+                for n in notes:
+                    if n.abstract:
+                        parts.append(f"{n.abstract}（想法：{n.content}）")
+                    else:
+                        parts.append(n.content)
+                if parts:
+                    content = "\n".join(parts)
+
+        # 仍无内容时，使用当前书页 OCR
         if not content:
             content = self.memory.current_page_ocr[:1000]
         if not content:
@@ -868,11 +889,11 @@ class ToolExecutor:
         if refresh:
             # 实时拉取
             data = await self.weread_client.get_shelf()
+            if data is None:
+                return {"success": False, "error": "微信读书 Cookie 已过期，请在 config.json 更新 weread.cookie_string"}
+
             books = data.get("books", [])
             progress_list = data.get("progress", [])
-
-            if books is None:
-                return {"success": False, "error": "微信读书 Cookie 可能已过期，请更新 cookie_string"}
 
             # 写入本地缓存
             await self.weread_storage.upsert_books(books)
