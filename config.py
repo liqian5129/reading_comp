@@ -106,6 +106,10 @@ class Config:
         self.VISION_BASE_URL = self._get("vision", "base_url", self.CURRENT_BASE_URL)
         self.VISION_API_KEY = self._get("vision", "api_key", self.CURRENT_API_KEY)
 
+        # 微信读书集成
+        self.WEREAD_ENABLED = self._get("weread", "enabled", False)
+        self.WEREAD_COOKIE = self._get("weread", "cookie_string", "")
+
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
         self.DATA_DIR = Path(data_dir)

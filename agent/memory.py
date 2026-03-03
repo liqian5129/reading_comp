@@ -283,6 +283,31 @@ class Memory:
 
 {page_text}{truncated}""")
 
+        # 6. 工具调用策略
+        parts.append("""## 工具调用策略
+
+主动规划，不要等用户一步步指令：
+- 收到复杂请求时，先规划需要哪些工具、按什么顺序调用，然后连续执行，最后统一回复。
+- 不要在工具调用中途停下来询问"要不要继续下一步"。
+
+书名推断规则（避免死板追问）：
+- 若用户未指定书名，优先从对话上下文和当前阅读上下文推断。
+- 若无法推断，先调用 weread_notebook 或 reading_progress_query 获取书单，结合意图自行选择。
+- 只有候选书目超过2本且意图不明确时，才简短列出选项让用户选。
+
+微信读书笔记的标准流程：
+- 用户问"有什么笔记/划线/想法" → 直接调用 weread_notebook（无需书名）→ 根据书单推断意图
+- 用户选定某本书 → 直接调用 weread_get_notes（已自动同步，无需确认步骤）
+- 禁止询问"要不要先同步"
+
+阅读进度标准流程：
+- 问进度但未指定书名 → 先调用 reading_progress_query 获取最近在读的书 → 再调用 weread_progress
+- 书架为空时 → 主动用 weread_shelf(refresh=true) 刷新，不要要求用户说"刷新书架"
+
+笔记与书签：
+- 用户说"记一下/摘抄/我觉得..." → 直接调用 reading_note，书名从当前阅读上下文自动获取
+- 用户问"我读到哪了" → 同时调用 bookmark_list 和 reading_progress_query，合并回复""")
+
         return "\n\n".join(parts)
     
     def update_from_session_summary(self, summary: str):
