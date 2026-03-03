@@ -44,7 +44,8 @@ class FunasrASR:
     def __init__(self,
                  device: str = "auto",
                  model: str = "paraformer-zh-streaming",
-                 chunk_size_frames: int = 10):
+                 chunk_size_frames: int = 10,
+                 on_ready: Optional[Callable] = None):
         self._device_str = _resolve_device(device)
         self._model_name = model
         self._chunk_size_frames = chunk_size_frames
@@ -54,6 +55,7 @@ class FunasrASR:
         self._model_loaded = False
         self._model_error: Optional[str] = None
         self._model_ready = threading.Event()
+        self._on_ready_cb: Optional[Callable] = on_ready
 
         # 录音缓冲（每次 start() 重置）
         self._pcm_buffer = bytearray()
@@ -85,6 +87,11 @@ class FunasrASR:
             logger.info(f"✅ FunASR 模型加载完成 ({elapsed:.1f}s), "
                         f"device={self._device_str}")
             self._warmup()
+            if self._on_ready_cb:
+                try:
+                    self._on_ready_cb(time.time() - t0)
+                except Exception:
+                    pass
         except Exception as e:
             self._model_error = str(e)
             logger.error(f"❌ FunASR 模型加载失败: {e}")
@@ -121,18 +128,11 @@ class FunasrASR:
         return "initializing"
 
     def start(self, on_result: Optional[Callable] = None):
-        """重置缓冲区，等待模型就绪（通常模型已在后台加载完）。"""
-        if not self._model_loaded:
-            logger.info("⏳ FunASR 模型加载中，等待完成（最多 120s）...")
-            self._model_ready.wait(timeout=120)
-        if not self._model_loaded:
-            raise RuntimeError(f"FunASR 模型加载失败: {self._model_error}")
-
+        """重置缓冲区，立即返回（模型不需要在此时就绪）。"""
         with self._lock:
             self._pcm_buffer = bytearray()
             self._result_callback = on_result
-
-        logger.info("🎤 FunASR: 识别已启动（批处理模式）")
+        logger.info("🎤 FunASR: 开始录音缓冲")
 
     def send_audio(self, pcm_bytes: bytes):
         """追加 PCM 数据到缓冲区（内存操作，不做任何推理）。"""
@@ -145,6 +145,14 @@ class FunasrASR:
         典型耗时：~300-600ms（3-4s 音频，MPS RTF≈0.15）
         """
         t0 = time.time()
+
+        # 模型若还在后台加载，在此等待（录音已结束，等待不影响用户体验）
+        if not self._model_loaded:
+            logger.info("⏳ FunASR 模型加载中，等待完成...")
+            self._model_ready.wait(timeout=120)
+        if not self._model_loaded:
+            logger.error(f"FunASR 模型加载失败: {self._model_error}")
+            return ""
 
         with self._lock:
             pcm_bytes = bytes(self._pcm_buffer)
@@ -189,7 +197,9 @@ class FunasrASR:
 
 def create_local_asr(device: str = "auto",
                      model: str = "paraformer-zh-streaming",
-                     chunk_size_frames: int = 10) -> FunasrASR:
+                     chunk_size_frames: int = 10,
+                     on_ready: Optional[Callable] = None) -> FunasrASR:
     """创建本地 FunASR 实例（模型后台异步加载）。"""
     return FunasrASR(device=device, model=model,
-                     chunk_size_frames=chunk_size_frames)
+                     chunk_size_frames=chunk_size_frames,
+                     on_ready=on_ready)
