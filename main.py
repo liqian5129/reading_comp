@@ -70,7 +70,7 @@ from agent.tools import ToolRegistry, ToolExecutor
 from agent.timer_manager import ReadingTimerManager
 from scanner.vision_analyzer import VisionAnalyzer
 from scanner.auto_scanner import AutoScanner
-from voice.asr import AliyunStreamASR, create_asr
+from voice.asr import create_asr
 from voice.recorder import VoiceRecorder
 from feishu.bot import FeishuBot
 from feishu.push import SummaryPusher
@@ -108,7 +108,7 @@ class ReadingCompanion:
         self.scanner: Optional[AutoScanner] = None
         self.vision_analyzer: Optional[VisionAnalyzer] = None
         self.timer_manager: Optional[ReadingTimerManager] = None
-        self.asr: Optional[AliyunStreamASR] = None
+        self.asr: Optional[Any] = None
         self.recorder: Optional[VoiceRecorder] = None
         self.tts_player = None
         self.feishu_bot: Optional[FeishuBot] = None
@@ -208,12 +208,24 @@ class ReadingCompanion:
         )
 
         # 6. 语音
-        self.asr = create_asr(
-            app_key=config.ALIYUN_NLS_APP_KEY,
-            token=config.ALIYUN_NLS_TOKEN,
-            access_key_id=config.ALIYUN_NLS_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_NLS_ACCESS_KEY_SECRET,
-        )
+        if config.ASR_PROVIDER == "funasr":
+            from voice.funasr_asr import create_local_asr
+            logger.info(f"🎙️ 使用本地 FunASR (device={config.FUNASR_DEVICE}, "
+                        f"model={config.FUNASR_MODEL})，后台加载中...")
+            self.asr = create_local_asr(
+                device=config.FUNASR_DEVICE,
+                model=config.FUNASR_MODEL,
+                chunk_size_frames=config.FUNASR_CHUNK_SIZE_FRAMES,
+            )
+            # 模型在后台线程加载，主流程继续；首次按键时若未就绪会自动等待
+        else:
+            logger.info("🎙️ 使用阿里云 NLS ASR（云端）")
+            self.asr = create_asr(
+                app_key=config.ALIYUN_NLS_APP_KEY,
+                token=config.ALIYUN_NLS_TOKEN,
+                access_key_id=config.ALIYUN_NLS_ACCESS_KEY_ID,
+                access_key_secret=config.ALIYUN_NLS_ACCESS_KEY_SECRET,
+            )
         self.recorder = VoiceRecorder(
             self.asr,
             loop=self.loop,

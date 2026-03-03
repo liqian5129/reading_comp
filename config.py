@@ -81,6 +81,15 @@ class Config:
         self.ALIYUN_NLS_TOKEN = self._get("aliyun_nls", "token", "")
         self.ALIYUN_NLS_ACCESS_KEY_ID = self._get("aliyun_nls", "access_key_id", "")
         self.ALIYUN_NLS_ACCESS_KEY_SECRET = self._get("aliyun_nls", "access_key_secret", "")
+
+        # ASR 通用配置
+        self.ASR_PROVIDER = self._get("asr", "provider", "aliyun")  # "aliyun" | "funasr"
+
+        # FunASR 本地配置
+        self.FUNASR_DEVICE = self._get("asr", "funasr_device", "auto")  # "auto"|"mps"|"cpu"
+        self.FUNASR_MODEL = self._get("asr", "funasr_model", "paraformer-zh-streaming")
+        self.FUNASR_CHUNK_SIZE_FRAMES = self._get("asr", "funasr_chunk_size_frames", 10)
+        # 10 frames × 960 samples/frame = 9600 samples = 600ms per inference chunk
         
         # 飞书
         self.FEISHU_ENABLED = self._get("feishu", "enabled", False)
@@ -183,6 +192,11 @@ class Config:
             if not self.DOUBAO_API_KEY:
                 missing.append("ai.doubao_api_key")
         
+        # ASR 验证（funasr 本地模式无需云端 key）
+        if self.ASR_PROVIDER == "aliyun":
+            if not self.ALIYUN_NLS_APP_KEY:
+                missing.append("aliyun_nls.app_key")
+
         # TTS 验证
         if self.TTS_PROVIDER == "elevenlabs":
             if not self.ELEVENLABS_API_KEY:
