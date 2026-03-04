@@ -16,6 +16,29 @@ logger = logging.getLogger(__name__)
 # macOS 下使用 AVFoundation 后端，兼容性更好
 _BACKEND = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
 
+# 目标分辨率：4K USB 摄像头
+# 大多数 USB 4K 摄像头需要先设 MJPG 编码才能输出 4K，否则降为 1080p
+_TARGET_W = 3840
+_TARGET_H = 2160
+
+
+def _set_4k(cap: cv2.VideoCapture) -> tuple[int, int]:
+    """
+    对已打开的 VideoCapture 设置 4K 分辨率。
+    必须先设 MJPG 编码，再设分辨率，否则大多数 USB 4K 摄像头会静默回退到 1080p。
+    返回实际设置后的 (width, height)。
+    """
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  _TARGET_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _TARGET_H)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if actual_w != _TARGET_W or actual_h != _TARGET_H:
+        logger.warning(f"摄像头未能达到 {_TARGET_W}x{_TARGET_H}，实际: {actual_w}x{actual_h}")
+    else:
+        logger.info(f"摄像头分辨率已设置为 {actual_w}x{actual_h}")
+    return actual_w, actual_h
+
 
 @contextmanager
 def _suppress_stderr():
@@ -83,8 +106,7 @@ def capture_frame(device: int = 0) -> Optional[np.ndarray]:
         logger.error(f"无法打开摄像头设备 {device}")
         return None
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    _set_4k(cap)
 
     ret, frame = cap.read()
     cap.release()
@@ -119,8 +141,7 @@ class CameraCapture:
         """打开摄像头"""
         self.cap = cv2.VideoCapture(self.device, _BACKEND)
         if self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            _set_4k(self.cap)
             self._is_opened = True
             for _ in range(self._WARMUP_FRAMES):
                 self.cap.read()

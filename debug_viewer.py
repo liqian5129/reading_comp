@@ -3,13 +3,16 @@
 摄像头 + OCR 完整流水线可视化调试工具（含逐步计时）
 
 布局:
-  ┌──────────┬──────────┬──────────┬──────────┐
-  │ ①原图    │②方向矫正  │③UVDoc展平│④文字检测  │
-  │ capture  │ orient   │ unwarp   │ detect   │
-  │ [Xms]   │ [Xms]    │ [Xms]   │ [Xms]   │
-  ├──────────┴──────────┴──────────┴──────────┤
-  │     ⑤ OCR 识别文字  [recog Xms | total Xs] │
-  └──────────────────────────────────────────┘
+  ┌──────────┬──────────┬──────────┬──────────┬──────────┐
+  │ ①原图    │②透视校正  │③方向矫正  │④UVDoc展平│⑤文字检测  │
+  │ capture  │ persp    │ orient   │ unwarp   │ detect   │
+  │ [Xms]   │ [Xms]    │ [Xms]   │ [Xms]   │ [Xms]   │
+  ├──────────┴──────────┴──────────┴──────────┴──────────┤
+  │       ⑥ OCR 识别文字  [recog Xms | total Xs]          │
+  └──────────────────────────────────────────────────────┘
+
+  透视校正矩阵来自 camera/homography.npy（由 tools/calibrate_perspective.py 生成）
+  未标定时面板②显示占位图，OCR 仍使用原图
 
 快捷键:  Q/ESC 退出    S 立即扫描
 """
@@ -27,6 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, str(Path(__file__).parent))
 from config import config
 from camera.capture import CameraCapture, find_external_camera
+from camera.perspective import load_fixed_homography, apply_fixed_homography
 from ocr.engine import sort_dual_page_lines
 
 logging.basicConfig(
@@ -92,8 +96,8 @@ def draw_cn_multiline(img: np.ndarray, lines: List[str], xy: tuple,
 # ---------------------------------------------------------------------------
 # 布局常量
 # ---------------------------------------------------------------------------
-COLS        = 4
-PANEL_W     = 380
+COLS        = 5
+PANEL_W     = 304          # 1520 / 5，与原来总宽度保持一致
 PANEL_H     = 285
 TEXT_ROW_H  = 480          # 加高，容纳更多 OCR 文字
 WIN_W       = PANEL_W * COLS   # 1520
@@ -149,6 +153,17 @@ def panel_original(frame: np.ndarray, t_capture: float,
     return p
 
 
+def panel_corrected(corrected_img: Optional[np.ndarray], t: float) -> np.ndarray:
+    p = _resize(corrected_img, PANEL_W, PANEL_H)
+    if corrected_img is None:
+        p = draw_cn(p, "未标定", xy=(PANEL_W // 2 - 24, PANEL_H // 2 - 8),
+                    size=14, color=(100, 100, 100))
+        p = draw_cn(p, "运行 tools/calibrate_perspective.py",
+                    xy=(8, PANEL_H // 2 + 14), size=10, color=(80, 80, 80))
+    _label(p, "2. Perspective", f"warp {ms(t)}" if (t and corrected_img is not None) else "warp -")
+    return p
+
+
 def panel_orientation(rot_img: Optional[np.ndarray],
                       angle: Optional[int], t: float) -> np.ndarray:
     p = _resize(rot_img, PANEL_W, PANEL_H)
@@ -156,13 +171,13 @@ def panel_orientation(rot_img: Optional[np.ndarray],
     if sub:
         cv2.putText(p, sub, (8, 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 220, 80), 1)
-    _label(p, "2. Orientation", f"orient {ms(t)}" if t else "orient -")
+    _label(p, "3. Orientation", f"orient {ms(t)}" if t else "orient -")
     return p
 
 
 def panel_unwarped(output_img: Optional[np.ndarray], t: float) -> np.ndarray:
     p = _resize(output_img, PANEL_W, PANEL_H)
-    _label(p, "3. UVDoc Unwarp", f"unwarp {ms(t)}" if t else "unwarp -")
+    _label(p, "4. UVDoc Unwarp", f"unwarp {ms(t)}" if t else "unwarp -")
     return p
 
 
@@ -184,7 +199,7 @@ def panel_detection(output_img: Optional[np.ndarray],
     n = len(rec_polys)
     cv2.putText(p, f"{n} regions", (8, 42),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 220, 80), 1)
-    _label(p, "4. Text Detect", f"detect {ms(t)}" if t else "detect -")
+    _label(p, "5. Text Detect", f"detect {ms(t)}" if t else "detect -")
     return p
 
 
@@ -193,7 +208,7 @@ def panel_text(lines: List[str], status: str, t_recog: float, t_total: float,
     p = np.full((TEXT_ROW_H, WIN_W, 3), 18, dtype=np.uint8)
 
     # 状态行
-    cv2.putText(p, f"5. OCR Result  |  {status}", (10, 22),
+    cv2.putText(p, f"6. OCR Result  |  {status}", (10, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.50, (80, 160, 255), 1)
     if last_txt:
         saved_label = f"saved -> {last_txt}"
@@ -243,16 +258,18 @@ def panel_text(lines: List[str], status: str, t_recog: float, t_total: float,
 
 
 def build_display(frame, t_capture, scanning, next_in,
+                  corrected_frame, t_perspective,
                   rot_img, angle, output_img,
                   rec_polys, rec_scores, rec_texts,
                   ocr_lines, status, last_txt,
                   timings: Dict[str, float]) -> np.ndarray:
     p1 = panel_original(frame, t_capture, scanning, next_in)
-    p2 = panel_orientation(rot_img, angle,     timings.get('orientation', 0))
-    p3 = panel_unwarped(output_img,            timings.get('unwarping', 0))
-    p4 = panel_detection(output_img, rec_polys, rec_scores,
+    p2 = panel_corrected(corrected_frame, t_perspective)
+    p3 = panel_orientation(rot_img, angle,     timings.get('orientation', 0))
+    p4 = panel_unwarped(output_img,            timings.get('unwarping', 0))
+    p5 = panel_detection(output_img, rec_polys, rec_scores,
                          timings.get('detection', 0))
-    top = np.hstack([p1, p2, p3, p4])
+    top = np.hstack([p1, p2, p3, p4, p5])
 
     # 画垂直分割线
     for i in range(1, COLS):
@@ -284,16 +301,12 @@ class TimedOCR:
             lang='ch',
             use_doc_orientation_classify=True,
             use_doc_unwarping=True,
-            # server 级模型：检测+识别精度最高（已下载，无需联网）
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
-            # 与相机输出宽度一致，避免缩图损失细节
-            text_det_limit_side_len=1280,
+            text_det_limit_side_len=1920,
             text_det_limit_type='max',
-            # 降低检测阈值 → 减少漏检
-            text_det_box_thresh=0.4,
-            # 扩大文字框 → 密排书页文字更完整
-            text_det_unclip_ratio=1.8,
+            text_det_box_thresh=0.5,
+            text_det_unclip_ratio=2.0,
         )
         self.timings: Dict[str, float] = {}
         self._patch_timings()
@@ -320,19 +333,48 @@ class TimedOCR:
         timings = self.timings
 
         def timed_predict(*args, **kwargs):
+            logger.info(f"  → {name} 开始...")
             t0 = time.perf_counter()
             # predict() 返回生成器，需全量消费才能计时
             results = list(original(*args, **kwargs))
-            timings[name] = time.perf_counter() - t0
+            elapsed = time.perf_counter() - t0
+            timings[name] = elapsed
+            logger.info(f"  ✓ {name} 完成: {elapsed*1000:.0f}ms")
             return iter(results)
 
         model.predict = timed_predict
 
+    # OCR 输入在喂给模型前统一缩到此长边以内
+    # text_det_limit_side_len 只限制检测步骤，UVDoc 会处理全尺寸图，必须在这里提前缩
+    _OCR_MAX_SIDE = 1920
+
     def predict(self, frame: np.ndarray):
         # 必须 clear() 而非 self.timings = {}，否则闭包里的引用失效
         self.timings.clear()
-        t0 = time.perf_counter()
+        h, w = frame.shape[:2]
+        if max(h, w) > self._OCR_MAX_SIDE:
+            scale = self._OCR_MAX_SIDE / max(h, w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            logger.info(f"OCR 输入缩放: {w}x{h} → {frame.shape[1]}x{frame.shape[0]}")
+        else:
+            logger.info(f"OCR 输入: {w}x{h}")
+
+        # 保存实际入网图像，方便排查
+        ts = time.strftime("%H%M%S")
+        _OCR_OUT_DIR.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(_OCR_OUT_DIR / f"debug_ocr_input_{ts}.jpg"), frame)
+        logger.info(f"OCR 入网图像已保存 → data/ocr_results/debug_ocr_input_{ts}.jpg")
+
+        # 分左右两半各自 OCR（与 engine.py 保持一致）
+        margin = max(1, w // 100)
+        mid = w // 2
+        left_img  = frame[:, :mid - margin]
+        right_img = frame[:, mid + margin:]
+        logger.info(f"左页: {left_img.shape[1]}x{left_img.shape[0]}  右页: {right_img.shape[1]}x{right_img.shape[0]}")
+
         from ocr.engine import _sharpen
+        t0 = time.perf_counter()
+        # debug_viewer 需要中间图像，用完整图跑一次拿可视化结果
         result = self._ocr.predict(_sharpen(frame))
         self.timings['total'] = time.perf_counter() - t0
         return result
@@ -537,6 +579,13 @@ def main():
     print("  Q/ESC 退出   S 立即扫描")
     print("=" * 62)
 
+    # 加载透视校正矩阵（不依赖 config.PERSPECTIVE_ENABLED，直接尝试加载）
+    _M = load_fixed_homography()
+    if _M is not None:
+        logger.info("透视校正矩阵已加载 → 面板② 显示校正图，OCR 使用校正帧")
+    else:
+        logger.info("未找到 camera/homography.npy → 面板② 显示占位，OCR 使用原图")
+
     if not _FONT_PATH:
         logger.warning("未找到系统中文字体，OCR 文字可能显示为方块")
     else:
@@ -556,6 +605,8 @@ def main():
     logger.info("调试窗口已打开")
 
     t_capture = 0.0
+    t_perspective = 0.0
+    corrected_frame = None
 
     while True:
         now = time.time()
@@ -569,13 +620,25 @@ def main():
                 break
             continue
 
+        # 透视校正（有矩阵时应用，结果送入 OCR）
+        if _M is not None:
+            tp0 = time.perf_counter()
+            corrected_frame = apply_fixed_homography(frame, _M)
+            t_perspective = time.perf_counter() - tp0
+        else:
+            corrected_frame = None
+            t_perspective = 0.0
+
+        ocr_frame = corrected_frame if corrected_frame is not None else frame
+
         if now - last_scan_time >= scan_interval:
             last_scan_time = now
-            worker.trigger(frame)
+            worker.trigger(ocr_frame)
 
         next_in = max(0.0, scan_interval - (now - last_scan_time))
         display = build_display(
             frame, t_capture, worker.is_scanning, next_in,
+            corrected_frame, t_perspective,
             worker.rot_img, worker.angle, worker.output_img,
             worker.rec_polys, worker.rec_scores, worker.rec_texts,
             worker.ocr_lines, worker.status, worker.last_txt,

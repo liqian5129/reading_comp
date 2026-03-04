@@ -18,9 +18,8 @@ env/
 data/sessions.db
 data/snapshots/
 data/notes/
-data/ocr_results
-data/sessions.db
-data/*
+data/ocr_results/
+data/kimiocr_results/
 
 # logs
 logs/

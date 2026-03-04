@@ -156,7 +156,7 @@ def correct_perspective(image: np.ndarray, debug: bool = False) -> np.ndarray:
 def correct_perspective_safe(image: np.ndarray) -> Tuple[np.ndarray, bool]:
     """
     安全的透视矫正，返回是否成功
-    
+
     Returns:
         (image, success)
     """
@@ -167,3 +167,58 @@ def correct_perspective_safe(image: np.ndarray) -> Tuple[np.ndarray, bool]:
     except Exception as e:
         logger.error(f"透视矫正异常: {e}")
         return image, False
+
+
+# ---------------------------------------------------------------------------
+# 固定单应矩阵模式（用于固定挂载摄像头的一次性标定）
+# ---------------------------------------------------------------------------
+
+HOMOGRAPHY_PATH = "camera/homography.npy"
+
+
+def load_fixed_homography(path: str = HOMOGRAPHY_PATH) -> Optional[np.ndarray]:
+    """
+    加载标定好的单应矩阵。
+
+    Args:
+        path: .npy 文件路径
+
+    Returns:
+        (3, 3) float64 矩阵；文件不存在则返回 None
+    """
+    import pathlib
+    p = pathlib.Path(path)
+    if not p.exists():
+        logger.warning(f"单应矩阵文件不存在: {path}，透视校正已跳过")
+        return None
+    try:
+        M = np.load(str(p))
+        if M.shape != (3, 3):
+            logger.error(f"单应矩阵形状异常: {M.shape}，期望 (3, 3)")
+            return None
+        logger.info(f"已加载固定单应矩阵: {path}")
+        return M
+    except Exception as e:
+        logger.error(f"加载单应矩阵失败: {e}")
+        return None
+
+
+def apply_fixed_homography(
+    image: np.ndarray,
+    M: np.ndarray,
+    output_size: Optional[Tuple[int, int]] = None,
+) -> np.ndarray:
+    """
+    应用固定单应矩阵进行透视校正。
+
+    Args:
+        image: 输入图像 (BGR / 灰度)
+        M: (3, 3) 单应矩阵（由 load_fixed_homography 加载）
+        output_size: (width, height)；None 时与输入同尺寸
+
+    Returns:
+        校正后的图像
+    """
+    if output_size is None:
+        output_size = (image.shape[1], image.shape[0])
+    return cv2.warpPerspective(image, M, output_size)
