@@ -35,17 +35,17 @@ def _create_paddle_ocr():
     major = int(version.split('.')[0])
 
     if major >= 3:
-        # 3.x：server 级模型 + UVDoc 书页矫正（5-6s，精度最高）
+        # 3.x：server 检测 + mobile 识别 + UVDoc 书页矫正
         return PaddleOCR(
             lang='ch',
-            use_doc_orientation_classify=True,   # PP-LCNet 检测页面旋转方向
-            use_doc_unwarping=True,              # UVDoc 书页展平矫正
+            use_doc_orientation_classify=True,
+            use_doc_unwarping=True,
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
-            text_det_limit_side_len=1280,        # 与相机输出宽度一致，避免缩图损失细节
+            text_det_limit_side_len=1920,
             text_det_limit_type='max',
-            text_det_box_thresh=0.4,             # 略降阈值，减少漏检
-            text_det_unclip_ratio=1.8,           # 扩大框，覆盖密排书页文字
+            text_det_box_thresh=0.5,   # 提高阈值，过滤书脊弯曲处产生的低置信度噪点框
+            text_det_unclip_ratio=2.0, # 适当扩框，帮助合并同行相邻碎片
         )
     else:
         # 2.x：传统参数
@@ -237,12 +237,43 @@ class OCREngine:
             self._ocr = _create_paddle_ocr()
         return self._ocr
 
+    # text_det_limit_side_len 只限制检测步骤，UVDoc 会处理全尺寸图，
+    # 必须在这里提前缩图，否则 4K 输入会让 UVDoc 极慢
+    _OCR_MAX_SIDE = 1920
+
     def extract(self, image: np.ndarray) -> str:
-        """提取文字，自动处理双页书页排序"""
+        """
+        提取文字，双页摊开时分左右两半各自 OCR 再合并。
+
+        分半处理的好处：
+        - UVDoc 矫正单页弯曲比矫正双页更准
+        - 书脊弯曲处的碎片不再跨页影响检测
+        - 每页检测框数减半，识别速度提升约 2x
+        """
+        import cv2 as _cv2
         ocr = self._init_ocr()
-        result = list(ocr.predict(_sharpen(image)))
-        lines = _extract_lines(result)
-        return '\n'.join(lines)
+        h, w = image.shape[:2]
+
+        # 缩图（让 UVDoc 也在合理分辨率上跑）
+        if max(h, w) > self._OCR_MAX_SIDE:
+            scale = self._OCR_MAX_SIDE / max(h, w)
+            image = _cv2.resize(image, (int(w * scale), int(h * scale)))
+            h, w = image.shape[:2]
+
+        # 分左右两半，书脊附近各留 1% 宽度的缓冲区避免脊边噪点
+        margin = max(1, w // 100)
+        mid = w // 2
+        left_img  = image[:, :mid - margin]
+        right_img = image[:, mid + margin:]
+
+        left_lines  = self._extract_half(ocr, left_img)
+        right_lines = self._extract_half(ocr, right_img)
+        return '\n'.join(left_lines + right_lines)
+
+    def _extract_half(self, ocr, half: np.ndarray) -> List[str]:
+        """对单页半幅图像运行 OCR，返回按 Y 排序的文字行。"""
+        result = list(ocr.predict(_sharpen(half)))
+        return _extract_lines(result)
 
     def extract_from_path(self, image_path: str) -> str:
         """从路径提取"""

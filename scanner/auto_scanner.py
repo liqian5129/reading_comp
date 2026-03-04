@@ -105,9 +105,12 @@ class AutoScanner:
         # 回调
         self.on_page_turn: Optional[Callable] = None
         self.on_snapshot: Optional[Callable[[str, str], None]] = None
+        self.on_book_info: Optional[Callable[[dict], None]] = None
 
-        # 视觉分析器（可选）
-        self._vision_analyzer = None
+        # KimiOCR（可选，替代本地 PaddleOCR）
+        self._kimi_ocr = None
+        self._last_page_num: int = -1
+        self._last_book_title: str = ""
 
         # 语音录音器引用（用于 OCR/ASR 资源冲突规避）
         self._voice_recorder = None
@@ -172,9 +175,10 @@ class AutoScanner:
     # Session 控制
     # ------------------------------------------------------------------
 
-    def set_vision_analyzer(self, analyzer):
-        """设置视觉分析器"""
-        self._vision_analyzer = analyzer
+    def set_kimi_ocr(self, kimi_ocr):
+        """设置 KimiOCR，同时注册内部回调"""
+        self._kimi_ocr = kimi_ocr
+        kimi_ocr.on_book_info = self._on_kimi_book_info
 
     def set_voice_recorder(self, recorder):
         """绑定语音录音器，扫描时可感知 ASR 状态，避免与 OCR 争抢 CPU"""
@@ -202,6 +206,43 @@ class AutoScanner:
     async def manual_scan(self) -> Optional[Tuple[str, str, str]]:
         """手动触发一次扫描"""
         return await self._do_scan(force_save=True)
+
+    # ------------------------------------------------------------------
+    # KimiOCR 回调
+    # ------------------------------------------------------------------
+
+    def _on_kimi_book_info(self, book_info: dict, image_path: str):
+        """KimiOCR 元数据回调：翻页/换书检测"""
+        page_num   = book_info.get("page_num", -1)
+        book_title = book_info.get("book_title", "")
+
+        # 换书检测
+        if book_title and book_title != self._last_book_title:
+            self._last_book_title = book_title
+            self._last_page_num = -1
+            logger.info(f"检测到新书: 《{book_title}》")
+
+        # 翻页检测
+        if page_num > 0 and page_num != self._last_page_num:
+            self._last_page_num = page_num
+            self._page_turn_count += 1
+            logger.info(f"翻页: 第 {page_num} 页 ({self._page_turn_count} 次)")
+            if self._session_id:
+                asyncio.create_task(
+                    self.session_manager.add_snapshot(image_path, "", "")
+                )
+            if self.on_page_turn:
+                try:
+                    self.on_page_turn(self._page_turn_count)
+                except Exception as e:
+                    logger.error(f"on_page_turn 回调失败: {e}")
+
+        # 通知上层更新书籍上下文
+        if self.on_book_info:
+            try:
+                self.on_book_info(book_info)
+            except Exception as e:
+                logger.error(f"on_book_info 回调失败: {e}")
 
     # ------------------------------------------------------------------
     # 内部逻辑
@@ -247,6 +288,19 @@ class AutoScanner:
             if self._perspective_M is not None:
                 frame = apply_fixed_homography(frame, self._perspective_M)
 
+            # KimiOCR 路径：保存图片后 fire-and-forget，结果通过回调返回
+            if self._kimi_ocr is not None:
+                now = datetime.now()
+                ts = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
+                image_path = config.SNAPSHOTS_DIR / f"snapshot_{ts}.jpg"
+
+                def _save(f, p):
+                    cv2.imwrite(str(p), f)
+
+                await loop.run_in_executor(None, _save, frame, image_path)
+                self._kimi_ocr.trigger(str(image_path))
+                return None
+
             # 2. 编码原始帧（在线程池中执行，避免阻塞）
             # 注：OCR 子进程内部的 PaddleOCR 会通过 UVDoc 做书页矫正，无需在此重复矫正
             def encode_frame(f):
@@ -273,8 +327,9 @@ class AutoScanner:
                 return None
 
             # 4. 保存原始帧供回调使用
-            ts = int(datetime.now().timestamp() * 1000)
-            image_path = config.SNAPSHOTS_DIR / f"current_{ts}.jpg"
+            now = datetime.now()
+            ts = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
+            image_path = config.SNAPSHOTS_DIR / f"snapshot_{ts}.jpg"
             cv2.imwrite(str(image_path), frame)
 
             # 5. 始终通知上层（更新 AI 上下文）
@@ -286,9 +341,6 @@ class AutoScanner:
 
             # 6. Session 激活时才做翻页检测和存库
             if not self._session_id:
-                # 无 session 时也定期触发视觉分析（由内部间隔控制）
-                if self._vision_analyzer:
-                    self._vision_analyzer.trigger(str(image_path))
                 return None
 
             is_new_page = is_page_turn(self._last_fingerprint, fp)
@@ -304,18 +356,11 @@ class AutoScanner:
                 if is_new_page:
                     self._page_turn_count += 1
                     logger.info(f"检测到翻页，第 {self._page_turn_count} 页")
-                    # 翻页时用 force=True 立即触发视觉分析
-                    if self._vision_analyzer:
-                        self._vision_analyzer.trigger(str(image_path), force=True)
                     if self.on_page_turn:
                         try:
                             self.on_page_turn(self._page_turn_count)
                         except Exception as e:
                             logger.error(f"on_page_turn 回调失败: {e}")
-                else:
-                    # 非翻页也定期触发（由内部间隔控制）
-                    if self._vision_analyzer:
-                        self._vision_analyzer.trigger(str(image_path))
 
                 logger.debug(f"快照已保存: {snapshot.id}")
                 return str(image_path), ocr_text, fp

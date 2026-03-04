@@ -109,15 +109,14 @@ class Config:
         # 调试模式：跳过 ASR/AI/TTS/飞书，仅运行摄像头+OCR
         self.DEBUG_MODE = self._get("debug", "debug_mode", False)
         
-        # 视觉分析器（kimi-k2.5 原生支持图片，默认复用主模型）
-        self.VISION_ANALYZER_ENABLED = self._get("vision", "enabled", False)
-        self.VISION_MODEL = self._get("vision", "model", self.CURRENT_MODEL)
-        self.VISION_BASE_URL = self._get("vision", "base_url", self.CURRENT_BASE_URL)
-        self.VISION_API_KEY = self._get("vision", "api_key", self.CURRENT_API_KEY)
-
         # 微信读书集成
         self.WEREAD_ENABLED = self._get("weread", "enabled", False)
         self.WEREAD_COOKIE = self._get("weread", "cookie_string", "")
+
+        # KimiOCR（用 Kimi vision API 替代本地 PaddleOCR）
+        self.KIMI_OCR_ENABLED = self._get("kimi_ocr", "enabled", False)
+        self.KIMI_OCR_INTERVAL = self._get("kimi_ocr", "interval", 30)
+        self.KIMI_OCR_SAVE_RESULTS = self._get("kimi_ocr", "save_results", False)
 
         # 透视校正（固定挂载摄像头，一次标定后长期使用）
         self.PERSPECTIVE_ENABLED = self._get("perspective", "enabled", False)
@@ -131,6 +130,7 @@ class Config:
         self.SESSIONS_DB = self.DATA_DIR / "sessions.db"
         self.SNAPSHOTS_DIR = self.DATA_DIR / "snapshots"
         self.NOTES_DIR = self.DATA_DIR / "notes"
+        self.KIMI_OCR_RESULTS_DIR = self.DATA_DIR / "kimiocr_results"
         self.PERSONA_FILE = self.DATA_DIR / "persona.json"
         self.LONG_TERM_MEMORY_FILE = self.DATA_DIR / "long_term_memory.json"
     

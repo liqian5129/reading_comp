@@ -93,7 +93,6 @@ from agent.ai_client import AIClient
 from agent.memory import Memory
 from agent.tools import ToolRegistry, ToolExecutor
 from agent.timer_manager import ReadingTimerManager
-from scanner.vision_analyzer import VisionAnalyzer
 from scanner.auto_scanner import AutoScanner
 from voice.asr import create_asr
 from voice.recorder import VoiceRecorder
@@ -131,7 +130,7 @@ class ReadingCompanion:
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_executor: Optional[ToolExecutor] = None
         self.scanner: Optional[AutoScanner] = None
-        self.vision_analyzer: Optional[VisionAnalyzer] = None
+        self._kimi_ocr = None
         self.timer_manager: Optional[ReadingTimerManager] = None
         self.asr: Optional[Any] = None
         self.recorder: Optional[VoiceRecorder] = None
@@ -206,26 +205,27 @@ class ReadingCompanion:
         else:
             logger.info("📷 摄像头/OCR 扫描已禁用（camera.scanner_enabled=false）")
 
-        # 4b. 视觉分析器（需要支持图片的模型，默认关闭）
-        if config.VISION_ANALYZER_ENABLED:
-            if config.VISION_MODEL == config.CURRENT_MODEL:
-                vision_llm = self.llm  # 同一模型，复用客户端
-            else:
-                vision_llm = AIClient(
-                    provider="kimi",
-                    api_key=config.VISION_API_KEY,
-                    model=config.VISION_MODEL,
-                    base_url=config.VISION_BASE_URL,
-                )
-                logger.info(f"🔭 视觉分析器使用独立模型: {config.VISION_MODEL}")
-            self.vision_analyzer = VisionAnalyzer(
-                ai_client=vision_llm,
-                on_book_detected=self._on_book_detected,
+        # 4b. KimiOCR（用 Kimi vision API 替代本地 PaddleOCR，默认关闭）
+        if config.KIMI_OCR_ENABLED:
+            from scanner.kimi_ocr import KimiOCR
+            # 使用独立的 AIClient 实例，避免与主对话共享 HTTP 连接池
+            _kimi_ocr_client = AIClient(
+                provider="kimi",
+                api_key=config.KIMI_API_KEY,
+                model=config.KIMI_MODEL,
+                base_url=config.KIMI_BASE_URL,
             )
-            self.scanner.set_vision_analyzer(self.vision_analyzer)
-            logger.info("🔭 视觉分析器已启用")
+            self._kimi_ocr = KimiOCR(
+                _kimi_ocr_client,
+                min_interval_s=config.KIMI_OCR_INTERVAL,
+                results_dir=config.KIMI_OCR_RESULTS_DIR if config.KIMI_OCR_SAVE_RESULTS else None,
+            )
+            self._kimi_ocr.on_text_ready = self._on_snapshot
+            self.scanner.set_kimi_ocr(self._kimi_ocr)
+            self.scanner.on_book_info = self._on_book_detected
+            logger.info("🔍 KimiOCR 已启用（Kimi vision API 替代本地 OCR）")
         else:
-            logger.info("🔭 视觉分析器已禁用（vision.enabled=false，kimi-k2.5 不支持图片）")
+            logger.info("🔍 KimiOCR 未启用（使用本地 PaddleOCR）")
 
         # 4c. 微信读书客户端（可选）
         if config.WEREAD_ENABLED and config.WEREAD_COOKIE:
@@ -322,8 +322,8 @@ class ReadingCompanion:
 
         if self.timer_manager:
             self.timer_manager.cancel_all()
-        if self.vision_analyzer:
-            await self.vision_analyzer.cancel()
+        if self._kimi_ocr:
+            await self._kimi_ocr.cancel()
         if self.recorder:
             self.recorder.stop()
         if self.scanner and self.scanner.is_running():

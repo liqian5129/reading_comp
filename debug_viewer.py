@@ -301,16 +301,12 @@ class TimedOCR:
             lang='ch',
             use_doc_orientation_classify=True,
             use_doc_unwarping=True,
-            # server 级模型：检测+识别精度最高（已下载，无需联网）
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
-            # 与相机输出宽度一致，避免缩图损失细节
-            text_det_limit_side_len=1280,
+            text_det_limit_side_len=1920,
             text_det_limit_type='max',
-            # 降低检测阈值 → 减少漏检
-            text_det_box_thresh=0.4,
-            # 扩大文字框 → 密排书页文字更完整
-            text_det_unclip_ratio=1.8,
+            text_det_box_thresh=0.5,
+            text_det_unclip_ratio=2.0,
         )
         self.timings: Dict[str, float] = {}
         self._patch_timings()
@@ -337,19 +333,48 @@ class TimedOCR:
         timings = self.timings
 
         def timed_predict(*args, **kwargs):
+            logger.info(f"  → {name} 开始...")
             t0 = time.perf_counter()
             # predict() 返回生成器，需全量消费才能计时
             results = list(original(*args, **kwargs))
-            timings[name] = time.perf_counter() - t0
+            elapsed = time.perf_counter() - t0
+            timings[name] = elapsed
+            logger.info(f"  ✓ {name} 完成: {elapsed*1000:.0f}ms")
             return iter(results)
 
         model.predict = timed_predict
 
+    # OCR 输入在喂给模型前统一缩到此长边以内
+    # text_det_limit_side_len 只限制检测步骤，UVDoc 会处理全尺寸图，必须在这里提前缩
+    _OCR_MAX_SIDE = 1920
+
     def predict(self, frame: np.ndarray):
         # 必须 clear() 而非 self.timings = {}，否则闭包里的引用失效
         self.timings.clear()
-        t0 = time.perf_counter()
+        h, w = frame.shape[:2]
+        if max(h, w) > self._OCR_MAX_SIDE:
+            scale = self._OCR_MAX_SIDE / max(h, w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            logger.info(f"OCR 输入缩放: {w}x{h} → {frame.shape[1]}x{frame.shape[0]}")
+        else:
+            logger.info(f"OCR 输入: {w}x{h}")
+
+        # 保存实际入网图像，方便排查
+        ts = time.strftime("%H%M%S")
+        _OCR_OUT_DIR.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(_OCR_OUT_DIR / f"debug_ocr_input_{ts}.jpg"), frame)
+        logger.info(f"OCR 入网图像已保存 → data/ocr_results/debug_ocr_input_{ts}.jpg")
+
+        # 分左右两半各自 OCR（与 engine.py 保持一致）
+        margin = max(1, w // 100)
+        mid = w // 2
+        left_img  = frame[:, :mid - margin]
+        right_img = frame[:, mid + margin:]
+        logger.info(f"左页: {left_img.shape[1]}x{left_img.shape[0]}  右页: {right_img.shape[1]}x{right_img.shape[0]}")
+
         from ocr.engine import _sharpen
+        t0 = time.perf_counter()
+        # debug_viewer 需要中间图像，用完整图跑一次拿可视化结果
         result = self._ocr.predict(_sharpen(frame))
         self.timings['total'] = time.perf_counter() - t0
         return result

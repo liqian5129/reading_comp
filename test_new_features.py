@@ -402,8 +402,8 @@ def test_new_imports():
         from agent.timer_manager import ReadingTimerManager
         ok("agent.timer_manager")
 
-        from scanner.vision_analyzer import VisionAnalyzer
-        ok("scanner.vision_analyzer")
+        from scanner.kimi_ocr import KimiOCR
+        ok("scanner.kimi_ocr")
 
         from agent.tools import (
             BOOKMARK_CREATE_TOOL, BOOKMARK_LIST_TOOL,

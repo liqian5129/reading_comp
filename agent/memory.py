@@ -103,7 +103,7 @@ class Memory:
         self.current_page_ocr: str = ""
         self.current_page_image: Optional[str] = None
 
-        # 当前书籍视觉上下文（由 VisionAnalyzer 更新）
+        # 当前书籍上下文（由 KimiOCR 更新）
         self.current_book_context: Dict[str, Any] = {
             "book_title": "",
             "current_page_num": 0,
@@ -159,13 +159,14 @@ class Memory:
             except Exception as e:
                 logger.error(f"保存长期记忆失败: {e}")
 
-    def update_book_context(self, vision_result: dict):
-        """更新当前书籍视觉上下文（由 VisionAnalyzer 回调）"""
+    def update_book_context(self, book_info: dict):
+        """更新当前书籍上下文（由 KimiOCR 回调）"""
         self.current_book_context = {
-            "book_title": vision_result.get("book_title", ""),
-            "current_page_num": vision_result.get("current_page_num", 0),
-            "content_type": vision_result.get("content_type", ""),
-            "confidence": vision_result.get("confidence", 0.0),
+            "book_title": book_info.get("book_title", ""),
+            # KimiOCR 返回 page_num，兼容旧字段 current_page_num
+            "current_page_num": book_info.get("current_page_num") or book_info.get("page_num", 0),
+            "content_type": book_info.get("content_type", ""),
+            "confidence": book_info.get("confidence", 0.0),
         }
     
     def save_persona(self):
