@@ -21,5 +21,8 @@ data/notes/
 data/ocr_results
 data/sessions.db
 
+# logs
+logs/
+
 # OS
 .DS_Store

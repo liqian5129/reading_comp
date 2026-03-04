@@ -3,6 +3,7 @@
 AI 读书搭子 - 主程序
 """
 import asyncio
+import datetime
 import logging
 import re
 import signal
@@ -20,6 +21,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("main")
+
+# 文件日志：每次启动创建一个带时间戳的日志文件
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_FILE = _LOG_DIR / datetime.datetime.now().strftime("%Y%m%d_%H%M%S.log")
+_fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+_fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logging.getLogger().addHandler(_fh)
+logger.info(f"📝 日志文件: {_LOG_FILE}")
 
 # 显式锁定我们自己的模块级别，防止第三方库修改 root logger 后被连带压制
 for _n in ["main", "config", "session", "agent", "scanner",
@@ -135,6 +145,7 @@ class ReadingCompanion:
         self._running = False
         self._last_valid_ocr_ts: float = time.time()  # 上次有效 OCR 的时间戳
         self._msg_lock = asyncio.Lock()  # 防止并发处理用户消息
+        self._ai_task: Optional[asyncio.Task] = None
         
     async def initialize(self):
         """初始化所有模块"""
@@ -269,6 +280,9 @@ class ReadingCompanion:
             min_duration=0.3
         )
         self.recorder.on_text = self._on_voice_text
+        self.recorder.on_interrupt = self.interrupt_ai_from_thread
+        if self.scanner:
+            self.scanner.set_voice_recorder(self.recorder)
 
         # 7. TTS（支持阿里云或 ElevenLabs）
         from tts import create_tts_player
@@ -362,10 +376,10 @@ class ReadingCompanion:
     async def _on_voice_text(self, text: str):
         """处理语音识别结果（异步版本）"""
         logger.info(f"👤 用户: {text}")
-        if self._msg_lock.locked():
-            logger.warning("⚠️  上一条消息仍在处理中，忽略本次输入")
-            return
-        await self._process_user_message(text)
+        # 取消旧任务（键盘中断已触发 cancel，这里做二次保险）
+        if self._ai_task and not self._ai_task.done():
+            self._ai_task.cancel()
+        self._ai_task = asyncio.create_task(self._process_user_message(text))
     
     async def _process_user_message(self, text: str, channel: str = "voice"):
         """
@@ -549,6 +563,9 @@ class ReadingCompanion:
             logger.info(f"  全程总耗时:    +{(end_time - ref) * 1000:6.0f} ms")
             logger.info("=" * 60)
 
+        except asyncio.CancelledError:
+            logger.info("🛑 AI 处理被用户打断")
+            raise  # 必须重新抛出，让 Task 正常结束
         except Exception as e:
             logger.error(f"处理消息失败: {e}")
             if channel == "voice":
@@ -589,6 +606,19 @@ class ReadingCompanion:
         """FunASR 后台加载完成回调"""
         logger.info(f"🟢 FunASR 已就绪（加载耗时 {elapsed:.1f}s）")
         self._print_ready_banner()
+
+    def _do_interrupt_in_loop(self):
+        """在事件循环线程中执行打断（由 call_soon_threadsafe 调度）"""
+        if self.tts_player:
+            self.tts_player.interrupt()
+        if self._ai_task and not self._ai_task.done():
+            self._ai_task.cancel()
+        logger.info("🛑 [打断] 已取消 AI 任务并打断 TTS")
+
+    def interrupt_ai_from_thread(self):
+        """从键盘监听线程安全触发打断"""
+        if self.loop:
+            self.loop.call_soon_threadsafe(self._do_interrupt_in_loop)
 
     # OCR 连续无内容超时：超过此秒数才清空上下文
     _OCR_CLEAR_TIMEOUT_S = 60

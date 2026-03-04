@@ -114,8 +114,7 @@ class FeishuBot:
     def stop(self):
         """停止 WebSocket 连接"""
         self._running = False
-        if self.ws_client:
-            self.ws_client.stop()
+        # lark.ws.Client 无 stop() 方法，daemon 线程会随主进程退出自动结束
     
     async def send_text(self, chat_id: str, text: str):
         """

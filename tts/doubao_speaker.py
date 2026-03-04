@@ -536,9 +536,16 @@ class DoubaoTTSPlayer:
             return False
 
     def interrupt(self):
-        """打断当前播放"""
+        """打断当前播放，并清空待合成的文本队列"""
         self._interrupt_event.set()
-        logger.debug("TTS 播放被打断")
+        drained = 0
+        while not self._text_queue.empty():
+            try:
+                self._text_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        logger.info(f"🛑 TTS 被打断，已清除 {drained} 条待合成文本")
 
     def is_playing(self) -> bool:
         """是否正在播放"""
@@ -550,6 +557,7 @@ class DoubaoTTSPlayer:
         self.first_synth_end = None
         self.first_play_start = None
         self._synthesis_done.clear()
+        self._interrupt_event.clear()  # 防止旧 interrupt 干扰新会话
 
     async def wait_synthesized(self, timeout: float = 30.0) -> float:
         """等待第一段 TTS 合成完成，返回合成耗时 ms"""
@@ -583,6 +591,12 @@ class DoubaoTTSPlayer:
             synth_start = time.time()
             audio_data = await self.tts.synthesize(request.text)
             synth_time = (time.time() - synth_start) * 1000
+
+            # 合成期间若被打断，丢弃结果（不入 audio_queue）
+            # 这是关键修复：防止 in-flight synthesis 完成后绕过 interrupt
+            if self._interrupt_event.is_set():
+                logger.info(f"🛑 TTS 合成完成但已被打断，丢弃 {len(audio_data) if audio_data else 0} bytes")
+                continue
 
             # 记录首段合成完成时间 + 通知外部
             if is_first:
@@ -618,7 +632,8 @@ class DoubaoTTSPlayer:
                 continue
 
             if self._interrupt_event.is_set():
-                self._interrupt_event.clear()
+                # 不清除 interrupt_event，由 reset_timing() 在新对话开始时统一清除
+                # 若此处清除，in-flight synthesis 完成后会绕过 interrupt 继续播放
                 while not self._audio_queue.empty():
                     try:
                         self._audio_queue.get_nowait()
@@ -675,6 +690,12 @@ class DoubaoTTSPlayer:
 
             while True:
                 if self._interrupt_event.is_set():
+                    # abort stdin transport 丢弃写缓冲，防止 BrokenPipeError
+                    # 注意：不能用 is_closing() 判断，因为 proc.stdin.close() 已被调用
+                    try:
+                        proc.stdin.transport.abort()
+                    except Exception:
+                        pass
                     proc.terminate()
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=1.0)
