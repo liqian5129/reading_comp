@@ -159,11 +159,11 @@ class MemoryConsolidator:
         try:
             resp = await asyncio.wait_for(
                 self.llm.chat(user_message=prompt, max_tokens=400),
-                timeout=30.0,
+                timeout=12.0,
             )
             return resp.text.strip() if resp and resp.text else ""
         except asyncio.TimeoutError:
-            logger.warning("巩固摘要生成超时（30s）")
+            logger.warning("巩固摘要生成超时（12s）")
             return ""
         except Exception as e:
             logger.warning(f"巩固摘要生成失败: {e}")
@@ -175,7 +175,7 @@ class MemoryConsolidator:
         try:
             resp = await asyncio.wait_for(
                 self.llm.chat(user_message=prompt, max_tokens=100),
-                timeout=15.0,
+                timeout=5.0,
             )
             if not resp or not resp.text:
                 return []

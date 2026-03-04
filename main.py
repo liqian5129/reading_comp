@@ -5,6 +5,7 @@ AI 读书搭子 - 主程序
 import asyncio
 import datetime
 import logging
+import os
 import re
 import signal
 import sys
@@ -403,15 +404,15 @@ class ReadingCompanion:
         if self.weread_client:
             await self.weread_client.close()
 
-        # 进程终止时触发一次巩固（同步等待，最多 60s）
+        # 进程终止时触发一次巩固（最多等待 15s，超时则跳过不影响退出）
         if self.consolidator:
             try:
                 await asyncio.wait_for(
                     self.consolidator.consolidate(reason="shutdown"),
-                    timeout=60.0,
+                    timeout=15.0,
                 )
             except asyncio.TimeoutError:
-                logger.warning("shutdown 巩固超时（60s），已跳过")
+                logger.warning("shutdown 巩固超时（15s），已跳过")
             except Exception as e:
                 logger.error(f"shutdown 巩固失败: {e}")
 
@@ -448,11 +449,20 @@ class ReadingCompanion:
         # 保持运行
         try:
             while self._running:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             pass
-        
-        await self.shutdown()
+
+        # 优雅关闭（硬超时 30 秒，超时则强制退出）
+        logger.info("开始优雅关闭流程（最多等待 30 秒）...")
+        try:
+            await asyncio.wait_for(self.shutdown(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning("⚠️  关闭超时（30s），强制退出")
+            os._exit(1)
+        except Exception as e:
+            logger.error(f"关闭异常，强制退出: {e}")
+            os._exit(1)
     
     async def _on_voice_text(self, text: str):
         """处理语音识别结果（异步版本）"""
@@ -734,16 +744,24 @@ class ReadingCompanion:
 async def main():
     """入口函数"""
     app = ReadingCompanion()
-    
-    # 信号处理
-    def signal_handler(sig, frame):
-        logger.info("收到退出信号...")
-        if app.loop:
-            asyncio.run_coroutine_threadsafe(app.shutdown(), app.loop)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
+    loop = asyncio.get_running_loop()
+
+    # asyncio 原生信号处理（在事件循环线程内执行，无竞争）
+    _signal_count = 0
+
+    def _on_signal():
+        nonlocal _signal_count
+        _signal_count += 1
+        if _signal_count == 1:
+            logger.info("收到退出信号，正在优雅关闭（再按 Ctrl+C 可强制退出）...")
+            app._running = False  # 唤醒主循环，进入 shutdown 流程
+        else:
+            logger.warning("收到强制退出信号，立即终止！")
+            os._exit(1)
+
+    loop.add_signal_handler(signal.SIGINT, _on_signal)
+    loop.add_signal_handler(signal.SIGTERM, _on_signal)
+
     try:
         await app.run()
     except Exception as e:
