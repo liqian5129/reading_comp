@@ -108,6 +108,9 @@ class AutoScanner:
         # 视觉分析器（可选）
         self._vision_analyzer = None
 
+        # 语音录音器引用（用于 OCR/ASR 资源冲突规避）
+        self._voice_recorder = None
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -164,6 +167,10 @@ class AutoScanner:
         """设置视觉分析器"""
         self._vision_analyzer = analyzer
 
+    def set_voice_recorder(self, recorder):
+        """绑定语音录音器，扫描时可感知 ASR 状态，避免与 OCR 争抢 CPU"""
+        self._voice_recorder = recorder
+
     def set_session(self, session_id: str):
         """绑定阅读 session，后续扫描会存库并检测翻页"""
         self._session_id = session_id
@@ -195,7 +202,12 @@ class AutoScanner:
         """扫描主循环"""
         while self._running:
             try:
-                await self._do_scan()
+                # ASR 录音/推理期间跳过 OCR：
+                # PaddleOCR server 模型是 CPU 密集型（5-6s），会与 FunASR MPS 推理争抢 CPU
+                if self._voice_recorder and self._voice_recorder.is_busy():
+                    logger.debug("⏸️ OCR 扫描跳过（ASR 处理中，避免 CPU 竞争）")
+                else:
+                    await self._do_scan()
                 await asyncio.sleep(self.interval)
             except asyncio.CancelledError:
                 break

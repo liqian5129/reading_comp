@@ -276,6 +276,8 @@ class ReadingCompanion:
         )
         self.recorder.on_text = self._on_voice_text
         self.recorder.on_interrupt = self.interrupt_ai_from_thread
+        if self.scanner:
+            self.scanner.set_voice_recorder(self.recorder)
 
         # 7. TTS（支持阿里云或 ElevenLabs）
         from tts import create_tts_player

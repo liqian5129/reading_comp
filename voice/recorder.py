@@ -245,6 +245,10 @@ class VoiceRecorder:
         """是否正在录音"""
         return self.state == RecordingState.RECORDING
 
+    def is_busy(self) -> bool:
+        """是否正在录音或 ASR 推理中（RECORDING 或 PROCESSING 状态）"""
+        return self.state != RecordingState.IDLE
+
 
 async def create_voice_recorder(asr_engine, loop=None, **kwargs) -> VoiceRecorder:
     """异步创建录音器"""
