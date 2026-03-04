@@ -119,6 +119,25 @@ class Config:
         self.WEREAD_ENABLED = self._get("weread", "enabled", False)
         self.WEREAD_COOKIE = self._get("weread", "cookie_string", "")
 
+        # Embedding 配置（阿里云百炼 DashScope，独立 key/url，与主 AI 解耦）
+        self.EMBEDDING_ENABLED = self._get("embedding", "enabled", True)
+        self.EMBEDDING_MODEL = self._get("embedding", "model", "text-embedding-v4")
+        self.EMBEDDING_BASE_URL = self._get(
+            "embedding", "base_url",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        self.EMBEDDING_API_KEY = self._get("embedding", "api_key", "") or self.CURRENT_API_KEY
+        self.EMBEDDING_TIMEOUT_S = self._get("embedding", "timeout_s", 5)
+
+        # 记忆巩固配置
+        self.MEMORY_CONSOLIDATION_ENABLED = self._get("memory", "consolidation_enabled", True)
+        self.MEMORY_CONSOLIDATION_INTERVAL_MIN = self._get("memory", "consolidation_interval_min", 30)
+        self.MEMORY_CONSOLIDATION_TOKEN_THRESHOLD = self._get("memory", "consolidation_token_threshold", 80000)
+        self.MEMORY_CONSOLIDATION_DEBOUNCE_MIN = self._get("memory", "consolidation_debounce_min", 5)
+        self.MEMORY_SESSION_RECALL_COUNT = self._get("memory", "session_recall_count", 2)
+        self.MEMORY_DAILY_FILE_ENABLED = self._get("memory", "daily_file_enabled", True)
+        self.MEMORY_PROACTIVE_INJECT_TOP_K = self._get("memory", "proactive_inject_top_k", 3)
+
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
         self.DATA_DIR = Path(data_dir)
@@ -127,6 +146,7 @@ class Config:
         self.NOTES_DIR = self.DATA_DIR / "notes"
         self.PERSONA_FILE = self.DATA_DIR / "persona.json"
         self.LONG_TERM_MEMORY_FILE = self.DATA_DIR / "long_term_memory.json"
+        self.MEMORY_DIR = self.DATA_DIR / "memory"
     
     def _load_json_config(self):
         """从 config.json 加载配置"""
@@ -184,6 +204,7 @@ class Config:
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         self.NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        self.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     
     def validate(self) -> list[str]:
         """验证配置是否完整"""

@@ -91,6 +91,8 @@ from session.storage import Storage
 from session.manager import SessionManager
 from agent.ai_client import AIClient
 from agent.memory import Memory
+from agent.embedder import Embedder
+from agent.memory_consolidator import MemoryConsolidator
 from agent.tools import ToolRegistry, ToolExecutor
 from agent.timer_manager import ReadingTimerManager
 from scanner.vision_analyzer import VisionAnalyzer
@@ -140,9 +142,13 @@ class ReadingCompanion:
         self.summary_pusher: Optional[SummaryPusher] = None
         self.weread_client = None
         self.weread_storage = None
-        
+        self.embedder: Optional[Embedder] = None
+        self.consolidator: Optional[MemoryConsolidator] = None
+        self._periodic_task: Optional[asyncio.Task] = None
+
         # 状态
         self._running = False
+        self._shutting_down = False  # 防止 shutdown 重入
         self._last_valid_ocr_ts: float = time.time()  # 上次有效 OCR 的时间戳
         self._msg_lock = asyncio.Lock()  # 防止并发处理用户消息
         self._ai_task: Optional[asyncio.Task] = None
@@ -194,7 +200,35 @@ class ReadingCompanion:
                 base_url=config.DOUBAO_BASE_URL
             )
 
-        self.memory = Memory(config.PERSONA_FILE, long_term_file=config.LONG_TERM_MEMORY_FILE)
+        # Embedding 服务（阿里云百炼，独立 key/url）
+        if config.EMBEDDING_ENABLED and config.EMBEDDING_API_KEY:
+            self.embedder = Embedder(
+                api_key=config.EMBEDDING_API_KEY,
+                model=config.EMBEDDING_MODEL,
+                base_url=config.EMBEDDING_BASE_URL,
+                timeout_s=config.EMBEDDING_TIMEOUT_S,
+                enabled=True,
+            )
+        else:
+            logger.info("Embedding 已禁用（embedding.enabled=false 或 API key 未配置）")
+
+        self.memory = Memory(
+            config.PERSONA_FILE,
+            long_term_file=config.LONG_TERM_MEMORY_FILE,
+            embedder=self.embedder,
+            storage=self.storage,
+            proactive_top_k=config.MEMORY_PROACTIVE_INJECT_TOP_K,
+        )
+
+        # 启动时加载最近会话摘要到 session_recall
+        if config.MEMORY_CONSOLIDATION_ENABLED:
+            recent_summaries = await self.storage.load_recent_summaries(
+                n=config.MEMORY_SESSION_RECALL_COUNT
+            )
+            if recent_summaries:
+                self.memory.long_term.session_recall = "\n---\n".join(recent_summaries)
+                logger.info(f"已加载 {len(recent_summaries)} 条历史会话摘要到 session_recall")
+
         self.tool_registry = ToolRegistry()
         self.timer_manager = ReadingTimerManager()
 
@@ -251,7 +285,34 @@ class ReadingCompanion:
             timer_manager=self.timer_manager,
             weread_client=self.weread_client,
             weread_storage=self.weread_storage,
+            embedder=self.embedder,
+            storage=self.storage,
         )
+
+        # 5b. 记忆巩固器（可选）
+        if config.MEMORY_CONSOLIDATION_ENABLED and self.llm:
+            self.consolidator = MemoryConsolidator(
+                llm=self.llm,
+                embedder=self.embedder,
+                storage=self.storage,
+                memory=self.memory,
+                memory_dir=config.MEMORY_DIR,
+                debounce_min=config.MEMORY_CONSOLIDATION_DEBOUNCE_MIN,
+                daily_file_enabled=config.MEMORY_DAILY_FILE_ENABLED,
+                session_recall_count=config.MEMORY_SESSION_RECALL_COUNT,
+            )
+            # 启动定时巩固 loop
+            if config.MEMORY_CONSOLIDATION_INTERVAL_MIN > 0:
+                self._periodic_task = asyncio.create_task(
+                    self.consolidator.start_periodic_loop(
+                        config.MEMORY_CONSOLIDATION_INTERVAL_MIN
+                    )
+                )
+            logger.info(
+                f"记忆巩固器已启动（间隔 {config.MEMORY_CONSOLIDATION_INTERVAL_MIN} 分钟）"
+            )
+        else:
+            logger.info("记忆巩固已禁用（consolidation_enabled=false 或 AI 未初始化）")
 
         # 6. 语音
         if config.ASR_PROVIDER == "funasr":
@@ -316,9 +377,16 @@ class ReadingCompanion:
     
     async def shutdown(self):
         """关闭所有模块"""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
         logger.info("正在关闭...")
 
         self._running = False
+
+        # 取消定时巩固 task
+        if self._periodic_task and not self._periodic_task.done():
+            self._periodic_task.cancel()
 
         if self.timer_manager:
             self.timer_manager.cancel_all()
@@ -334,6 +402,19 @@ class ReadingCompanion:
             self.feishu_bot.stop()
         if self.weread_client:
             await self.weread_client.close()
+
+        # 进程终止时触发一次巩固（同步等待，最多 60s）
+        if self.consolidator:
+            try:
+                await asyncio.wait_for(
+                    self.consolidator.consolidate(reason="shutdown"),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("shutdown 巩固超时（60s），已跳过")
+            except Exception as e:
+                logger.error(f"shutdown 巩固失败: {e}")
+
         if self.storage:
             await self.storage.close()
 
@@ -529,6 +610,9 @@ class ReadingCompanion:
             for raw_msg, results in pending_tool_rounds:
                 self.memory.add_tool_round(raw_msg, results)
             self.memory.add_message("assistant", reply_text)
+
+            # fire-and-forget：预取下一轮相关记忆（零延迟，回答完毕后异步执行）
+            self.memory.trigger_prefetch(text)
 
             end_time = time.time()
 

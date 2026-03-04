@@ -193,6 +193,34 @@ class ReadingListItem:
 
 
 @dataclass
+class SearchResult:
+    """向量检索结果"""
+    source: str          # "notes" | "weread_highlights" | "weread_notes" | "session_summaries"
+    content: str         # 主要内容文本
+    book_name: str = ""  # 关联书名（可为空）
+    score: float = 0.0   # 余弦相似度分数
+    created_at: int = 0  # 时间戳 (ms)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class SessionSummary:
+    """会话巩固摘要"""
+    id: int = 0
+    summary_text: str = ""      # LLM 生成的结构化摘要
+    key_topics: List[str] = field(default_factory=list)  # 关键话题列表
+    embedding: Optional[List[float]] = None  # 摘要向量
+    created_at: int = 0         # 创建时间戳 (ms)
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("embedding", None)  # embedding 不序列化到普通 dict
+        return d
+
+
+@dataclass
 class DailySummary:
     """
     每日阅读摘要（用于飞书推送）

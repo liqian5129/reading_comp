@@ -23,6 +23,10 @@ class LongTermMemory:
         "current_streak_days": 0,
         "last_read_date": "",
     })
+    topic_interests: Dict[str, int] = field(default_factory=dict)
+    # {话题: 出现权重}，如 {"认知心理学": 3, "决策": 2}
+    session_recall: str = ""
+    # 最近 2 次会话摘要（启动时从 DB 加载）
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -36,6 +40,8 @@ class LongTermMemory:
                 "current_streak_days": 0,
                 "last_read_date": "",
             }),
+            topic_interests=data.get("topic_interests", {}),
+            session_recall=data.get("session_recall", ""),
         )
 
     def get_digest_for_prompt(self) -> str:
@@ -54,6 +60,13 @@ class LongTermMemory:
         streak = self.reading_streaks.get("current_streak_days", 0)
         if streak > 0:
             parts.append(f"连续阅读天数：{streak} 天")
+
+        if self.topic_interests:
+            top_topics = sorted(self.topic_interests.items(), key=lambda x: x[1], reverse=True)[:5]
+            parts.append(f"常关注话题：{'、'.join(t for t, _ in top_topics)}")
+
+        if self.session_recall:
+            parts.append(f"上次阅读摘要：\n{self.session_recall}")
 
         return "\n".join(parts)
 
@@ -86,12 +99,18 @@ class Memory:
     - 当前页面上下文
     - 当前书籍视觉上下文
     - 跨会话长期记忆 (long_term_memory.json)
+    - 向量检索主动注入（prefetch 模式）
     """
 
-    def __init__(self, persona_file: Path, long_term_file: Optional[Path] = None, max_history: int = 20):
+    def __init__(self, persona_file: Path, long_term_file: Optional[Path] = None,
+                 max_history: int = 20, embedder=None, storage=None,
+                 proactive_top_k: int = 3):
         self.persona_file = persona_file
         self.long_term_file = long_term_file
         self.max_history = max_history
+        self.embedder = embedder    # Optional[Embedder]
+        self.storage = storage      # Optional[Storage]，用于向量检索
+        self.proactive_top_k = proactive_top_k
 
         # 对话历史
         self.history: List[Dict[str, Any]] = []
@@ -117,6 +136,10 @@ class Memory:
         # 长期记忆
         self.long_term = LongTermMemory()
         self._long_term_lock = asyncio.Lock()
+
+        # 主动注入 prefetch 缓存
+        self._prefetch_cache: Optional[str] = None
+        self._prefetch_task: Optional[asyncio.Task] = None
 
         # 加载
         self._load_persona()
@@ -238,6 +261,55 @@ class Memory:
         self.current_page_ocr = ""
         self.current_page_image = None
     
+    def trigger_prefetch(self, query_text: str) -> None:
+        """
+        在 AI 回答完毕后调用（fire-and-forget），预取下一轮相关记忆。
+        第一轮 cache 为空时 build_system_prompt 跳过注入（降级），不影响功能。
+        """
+        if not self.embedder or not self.storage:
+            return
+        # 取消旧的 prefetch task（若有）
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        self._prefetch_task = asyncio.create_task(
+            self._prefetch_memories(query_text)
+        )
+
+    async def _prefetch_memories(self, query_text: str) -> None:
+        """后台预取相关记忆，存入 _prefetch_cache。任何异常静默降级。"""
+        try:
+            embedding = await self.embedder.embed(query_text)
+            if not embedding:
+                self._prefetch_cache = None
+                return
+
+            results = await self.storage.search_by_embedding(
+                embedding,
+                top_k=self.proactive_top_k,
+            )
+            if not results:
+                self._prefetch_cache = None
+                return
+
+            lines = []
+            for r in results:
+                book_hint = f"《{r.book_name}》" if r.book_name else ""
+                source_map = {
+                    "notes": "你的笔记",
+                    "weread_highlights": "微信读书划线",
+                    "weread_notes": "微信读书想法",
+                    "session_summaries": "历史会话摘要",
+                }
+                source_label = source_map.get(r.source, r.source)
+                snippet = r.content[:100].replace("\n", " ")
+                lines.append(f"- {source_label}{book_hint}：{snippet}…（相似度 {r.score:.2f}）")
+
+            self._prefetch_cache = "\n".join(lines)
+            logger.info(f"prefetch 完成: 命中 {len(results)} 条相关记忆")
+        except Exception as e:
+            logger.warning(f"prefetch_memories 失败（已降级）: {e}")
+            self._prefetch_cache = None
+
     def build_system_prompt(self) -> str:
         """
         构建系统提示词
@@ -246,8 +318,10 @@ class Memory:
         1. 角色定义
         2. 长期记忆摘要
         3. 用户偏好
-        4. 当前书籍视觉上下文
-        5. 当前页 OCR 文本
+        4. 相关历史记忆（prefetch cache，Section 2.5）
+        5. 当前书籍视觉上下文
+        6. 当前页 OCR 文本
+        7. 工具调用策略
         """
         parts = []
 
@@ -276,7 +350,11 @@ class Memory:
         if self.persona.favorite_genres:
             parts.append(f"用户喜欢的书籍类型: {', '.join(self.persona.favorite_genres)}")
 
-        # 4. 当前书籍视觉上下文
+        # 4. 相关历史记忆（prefetch cache）
+        if self._prefetch_cache:
+            parts.append(f"【相关历史记忆】\n{self._prefetch_cache}")
+
+        # 5. 当前书籍视觉上下文
         ctx = self.current_book_context
         if ctx.get("book_title") and ctx.get("confidence", 0) >= 0.7:
             page_info = f"第 {ctx['current_page_num']} 页" if ctx.get("current_page_num") else ""
@@ -285,7 +363,7 @@ class Memory:
                 + (f"（{ctx['content_type']}）" if ctx.get("content_type") else "")
             )
 
-        # 5. 当前页面 OCR 文本
+        # 6. 当前页面 OCR 文本
         if self.current_page_ocr:
             page_text = self.current_page_ocr[:2000]
             truncated = "...(内容已截断)" if len(self.current_page_ocr) > 2000 else ""

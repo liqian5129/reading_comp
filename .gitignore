@@ -20,6 +20,7 @@ data/snapshots/
 data/notes/
 data/ocr_results
 data/sessions.db
+data/*
 
 # logs
 logs/

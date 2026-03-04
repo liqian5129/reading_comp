@@ -12,6 +12,7 @@ from pathlib import Path
 from .models import (
     ReadingSession, PageSnapshot, Note, DailySummary,
     Book, BookProgress, Bookmark, ReadingListItem,
+    SearchResult, SessionSummary,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,14 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS idx_wr_highlights_book ON weread_highlights(book_id);
             CREATE INDEX IF NOT EXISTS idx_wr_notes_book ON weread_notes(book_id);
+
+            CREATE TABLE IF NOT EXISTS session_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                summary_text TEXT NOT NULL,
+                key_topics TEXT DEFAULT '[]',
+                embedding BLOB,
+                created_at INTEGER DEFAULT 0
+            );
         """)
         await self._conn.commit()
 
@@ -177,6 +186,9 @@ class Storage:
             ("notes", "book_name", "TEXT DEFAULT ''"),
             ("notes", "tags", "TEXT DEFAULT '[]'"),
             ("weread_notes", "note_type", "TEXT DEFAULT '想法'"),
+            ("notes", "embedding", "BLOB"),
+            ("weread_highlights", "embedding", "BLOB"),
+            ("weread_notes", "embedding", "BLOB"),
         ]
         for table, col, definition in migrations:
             try:
@@ -819,3 +831,140 @@ class Storage:
             "note_count": note_count,
             "bookmark_count": bookmark_count,
         }
+
+    # ==================== Embeddings ====================
+
+    async def save_embedding(self, table: str, row_id: int, embedding: list) -> bool:
+        """保存 embedding 向量到指定表"""
+        allowed = {"notes", "weread_highlights", "weread_notes"}
+        if table not in allowed:
+            logger.warning(f"save_embedding: 不支持的表 {table}")
+            return False
+        try:
+            blob = json.dumps(embedding).encode("utf-8")
+            await self._conn.execute(
+                f"UPDATE {table} SET embedding = ? WHERE id = ?", (blob, row_id)
+            )
+            await self._conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"save_embedding 失败 ({table}#{row_id}): {e}")
+            return False
+
+    async def search_by_embedding(
+        self,
+        query_vec: list,
+        tables: Optional[List[str]] = None,
+        top_k: int = 5,
+    ) -> List[SearchResult]:
+        """
+        在指定表中用余弦相似度检索最相关的记忆条目。
+        tables 默认为 ["notes", "weread_highlights", "weread_notes", "session_summaries"]
+        """
+        try:
+            import numpy as np
+        except ImportError:
+            logger.warning("search_by_embedding: numpy 未安装，跳过向量检索")
+            return []
+
+        if tables is None:
+            tables = ["notes", "weread_highlights", "weread_notes", "session_summaries"]
+
+        q = np.array(query_vec, dtype=np.float32)
+        q_norm = np.linalg.norm(q)
+        if q_norm == 0:
+            return []
+        q = q / q_norm
+
+        candidates: List[SearchResult] = []
+
+        for table in tables:
+            try:
+                rows = await self._fetch_embedding_rows(table)
+                for row in rows:
+                    emb_blob = row.get("embedding")
+                    if not emb_blob:
+                        continue
+                    try:
+                        emb = np.array(json.loads(emb_blob), dtype=np.float32)
+                        emb_norm = np.linalg.norm(emb)
+                        if emb_norm == 0:
+                            continue
+                        score = float(np.dot(q, emb / emb_norm))
+                    except Exception:
+                        continue
+
+                    content = row.get("content", "") or row.get("summary_text", "")
+                    book_name = (
+                        row.get("book_name", "")
+                        or row.get("book_title", "")
+                        or ""
+                    )
+                    candidates.append(SearchResult(
+                        source=table,
+                        content=content,
+                        book_name=book_name,
+                        score=score,
+                        created_at=row.get("created_at", 0) or row.get("ts", 0) or 0,
+                    ))
+            except Exception as e:
+                logger.warning(f"search_by_embedding: 表 {table} 检索失败: {e}")
+                continue
+
+        candidates.sort(key=lambda x: x.score, reverse=True)
+        return candidates[:top_k]
+
+    async def _fetch_embedding_rows(self, table: str) -> list:
+        """从指定表加载所有带 embedding 的行"""
+        rows = []
+        if table == "notes":
+            sql = "SELECT id, content, book_name, ts, embedding FROM notes WHERE embedding IS NOT NULL"
+        elif table == "weread_highlights":
+            sql = "SELECT id, content, book_title, created_at, embedding FROM weread_highlights WHERE embedding IS NOT NULL"
+        elif table == "weread_notes":
+            sql = "SELECT id, content, book_title, created_at, embedding FROM weread_notes WHERE embedding IS NOT NULL"
+        elif table == "session_summaries":
+            sql = "SELECT id, summary_text, created_at, embedding FROM session_summaries WHERE embedding IS NOT NULL"
+        else:
+            return []
+
+        async with self._conn.execute(sql) as cursor:
+            async for row in cursor:
+                rows.append(dict(row))
+        return rows
+
+    # ==================== Session Summaries ====================
+
+    async def save_session_summary(
+        self,
+        summary_text: str,
+        key_topics: List[str],
+        embedding: Optional[list] = None,
+    ) -> int:
+        """保存会话巩固摘要，返回 ID"""
+        try:
+            ts = int(datetime.now().timestamp() * 1000)
+            blob = json.dumps(embedding).encode("utf-8") if embedding else None
+            cursor = await self._conn.execute(
+                "INSERT INTO session_summaries (summary_text, key_topics, embedding, created_at) VALUES (?, ?, ?, ?)",
+                (summary_text, json.dumps(key_topics, ensure_ascii=False), blob, ts),
+            )
+            await self._conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"save_session_summary 失败: {e}")
+            return 0
+
+    async def load_recent_summaries(self, n: int = 2) -> List[str]:
+        """加载最近 n 次会话摘要文本"""
+        results = []
+        try:
+            async with self._conn.execute(
+                "SELECT summary_text FROM session_summaries ORDER BY created_at DESC LIMIT ?",
+                (n,),
+            ) as cursor:
+                async for row in cursor:
+                    results.append(row["summary_text"])
+        except Exception as e:
+            logger.warning(f"load_recent_summaries 失败: {e}")
+        return list(reversed(results))  # 按时间正序返回

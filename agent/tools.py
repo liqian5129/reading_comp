@@ -2,6 +2,7 @@
 工具定义和执行
 定义 AI 可调用的工具，以及执行逻辑
 """
+import asyncio
 import logging
 from typing import Dict, Any, List, Callable, Optional
 from dataclasses import dataclass
@@ -367,6 +368,30 @@ WEREAD_MERGE_NOTES_TOOL = {
     }
 }
 
+NOTE_SEARCH_TOOL = {
+    "name": "note_search",
+    "description": (
+        "用语义向量搜索笔记和微信读书划线/想法，找到与指定关键词最相关的历史记录。"
+        "用户说「找我写过/划过...的内容」「我之前记录过...」「有没有关于...的笔记」时调用。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "搜索关键词或句子（会用语义相似度检索）",
+            },
+            "source": {
+                "type": "string",
+                "description": (
+                    "搜索范围: all（全部）/ notes（本地笔记）/ weread（微信读书划线和想法），默认 all"
+                ),
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 ALL_TOOLS = [
     READING_NOTE_TOOL,
     READING_HISTORY_TOOL,
@@ -386,6 +411,7 @@ ALL_TOOLS = [
     WEREAD_PROGRESS_TOOL,
     WEREAD_BEST_HIGHLIGHTS_TOOL,
     WEREAD_MERGE_NOTES_TOOL,
+    NOTE_SEARCH_TOOL,
 ]
 
 
@@ -415,7 +441,8 @@ class ToolExecutor:
 
     def __init__(self, session_manager, scanner, memory, llm=None, timer_manager=None,
                  feishu_pusher=None, feishu_chat_id: str = "",
-                 weread_client=None, weread_storage=None):
+                 weread_client=None, weread_storage=None,
+                 embedder=None, storage=None):
         self.session_manager = session_manager
         self.scanner = scanner
         self.memory = memory
@@ -425,6 +452,8 @@ class ToolExecutor:
         self.feishu_chat_id = feishu_chat_id
         self.weread_client = weread_client
         self.weread_storage = weread_storage
+        self.embedder = embedder            # 用于 note_search
+        self.storage = storage              # 用于向量检索
 
     async def execute(self, tool_name: str, tool_input: Dict) -> Dict[str, Any]:
         """执行工具"""
@@ -450,6 +479,7 @@ class ToolExecutor:
                 "weread_progress": self._exec_weread_progress,
                 "weread_best_highlights": self._exec_weread_best_highlights,
                 "weread_merge_notes": self._exec_weread_merge_notes,
+                "note_search": self._exec_note_search,
             }
             handler = dispatch.get(tool_name)
             if handler:
@@ -487,12 +517,17 @@ class ToolExecutor:
         # 统计该书的笔记数（而非全局自增 ID）
         book_note_count = await self.session_manager.count_notes_by_book(note.book_name)
         count_scope = f"{book_hint}第 {book_note_count} 条" if note.book_name else f"第 {book_note_count} 条"
+
+        # 异步 embedding（fire-and-forget，不阻塞主流程）
+        if self.embedder and self.storage and note.id:
+            embed_text = f"{note.book_name} {' '.join(note.tags)} {note.content}"
+            asyncio.create_task(self._embed_note(note.id, embed_text))
+
         return {
             "success": True,
             "message": f"笔记已记录（{count_scope}）{tag_hint}",
             "note_id": note.id,
             "book_note_count": book_note_count,
-            "utc_datetime": note.to_json_dict()["utc_datetime"],
         }
     
     async def _exec_reading_history(self, params: Dict) -> Dict:
@@ -1205,4 +1240,75 @@ class ToolExecutor:
             "local_notes_count": len(local_notes),
             "summary": summary,
             "feishu_pushed": pushed,
+        }
+
+    # ==================== 向量笔记检索 ====================
+
+    async def _embed_note(self, note_id: int, text: str) -> None:
+        """Fire-and-forget：为 notes 表的一条记录写入 embedding"""
+        try:
+            embedding = await self.embedder.embed(text)
+            if embedding:
+                await self.storage.save_embedding("notes", note_id, embedding)
+                logger.info(f"笔记 #{note_id} embedding 已写入（维度 {len(embedding)}）")
+        except Exception as e:
+            logger.warning(f"_embed_note 失败（已降级）: {e}")
+
+    async def _exec_note_search(self, params: Dict) -> Dict:
+        """语义向量检索笔记"""
+        query = params.get("query", "").strip()
+        if not query:
+            return {"success": False, "error": "请指定搜索关键词"}
+
+        source = params.get("source", "all")
+
+        if not self.embedder or not self.storage:
+            return {
+                "success": False,
+                "error": "向量检索未启用（embedding 未配置），请改用 reading_notes 工具按时间查询",
+            }
+
+        # 根据 source 映射到要搜索的表
+        table_map = {
+            "notes": ["notes"],
+            "weread": ["weread_highlights", "weread_notes"],
+            "all": ["notes", "weread_highlights", "weread_notes"],
+        }
+        tables = table_map.get(source, ["notes", "weread_highlights", "weread_notes"])
+
+        embedding = await self.embedder.embed(query)
+        if not embedding:
+            return {
+                "success": False,
+                "error": "向量检索暂时不可用（embedding API 超时），请改用 reading_notes 工具",
+            }
+
+        results = await self.storage.search_by_embedding(embedding, tables=tables, top_k=5)
+        if not results:
+            return {
+                "success": True,
+                "message": f"未找到与「{query}」相关的笔记记录（可能还没有内容被索引）",
+                "results": [],
+                "total": 0,
+            }
+
+        source_map = {
+            "notes": "本地笔记",
+            "weread_highlights": "微信划线",
+            "weread_notes": "微信想法",
+        }
+        result_list = []
+        for r in results:
+            result_list.append({
+                "source": source_map.get(r.source, r.source),
+                "book_name": r.book_name,
+                "content": r.content[:200],
+                "score": round(r.score, 3),
+            })
+
+        return {
+            "success": True,
+            "message": f"找到 {len(result_list)} 条与「{query}」相关的记录",
+            "results": result_list,
+            "total": len(result_list),
         }
