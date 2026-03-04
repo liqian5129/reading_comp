@@ -288,8 +288,14 @@ class AutoScanner:
             if self._perspective_M is not None:
                 frame = apply_fixed_homography(frame, self._perspective_M)
 
-            # KimiOCR 路径：保存图片后 fire-and-forget，结果通过回调返回
+            # KimiOCR 路径：指纹去重后 fire-and-forget，结果通过回调返回
             if self._kimi_ocr is not None:
+                fp = fingerprint(frame)
+                if fp and not is_page_turn(self._last_fingerprint, fp):
+                    logger.debug("KimiOCR: 页面未变化（指纹相同），跳过")
+                    return None
+                self._last_fingerprint = fp
+
                 now = datetime.now()
                 ts = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
                 image_path = config.SNAPSHOTS_DIR / f"snapshot_{ts}.jpg"

@@ -136,6 +136,8 @@ class Config:
         self.KIMI_OCR_ENABLED = self._get("kimi_ocr", "enabled", False)
         self.KIMI_OCR_INTERVAL = self._get("kimi_ocr", "interval", 30)
         self.KIMI_OCR_SAVE_RESULTS = self._get("kimi_ocr", "save_results", False)
+        # 独立 API key，避免与主对话共享 rate limit；未配置时降级使用主 key
+        self.KIMI_OCR_API_KEY = self._get("kimi_ocr", "api_key", "") or self.KIMI_API_KEY
 
         # 透视校正（固定挂载摄像头，一次标定后长期使用）
         self.PERSPECTIVE_ENABLED = self._get("perspective", "enabled", False)

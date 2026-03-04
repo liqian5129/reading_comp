@@ -20,6 +20,8 @@ data/snapshots/
 data/notes/
 data/ocr_results/
 data/kimiocr_results/
+data/memory
+data/*
 
 # logs
 logs/

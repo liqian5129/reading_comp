@@ -245,7 +245,7 @@ class ReadingCompanion:
             # 使用独立的 AIClient 实例，避免与主对话共享 HTTP 连接池
             _kimi_ocr_client = AIClient(
                 provider="kimi",
-                api_key=config.KIMI_API_KEY,
+                api_key=config.KIMI_OCR_API_KEY,
                 model=config.KIMI_MODEL,
                 base_url=config.KIMI_BASE_URL,
             )

@@ -157,9 +157,8 @@ class KimiOCR:
             # 4b. 保存结果到文件（若启用）
             if self._results_dir:
                 ts = time.strftime("%Y%m%d_%H%M%S")
-                stem = Path(image_path).stem
                 result = {"meta": meta, "content": content, "image_path": image_path}
-                out_path = self._results_dir / f"{ts}_{stem}.json"
+                out_path = self._results_dir / f"{ts}.json"
                 try:
                     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
                     logger.debug(f"KimiOCR 结果已保存: {out_path.name}")
