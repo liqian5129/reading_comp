@@ -98,7 +98,6 @@ from agent.tools import ToolRegistry, ToolDispatcher
 from agent.timer_manager import ReadingTimerManager
 from agent.knowledge_linker import KnowledgeLinker
 from agent.page_analyzer import ProactivePageAnalyzer
-from agent.insight_detector import InsightDetector
 from scanner.auto_scanner import AutoScanner
 from voice.asr import create_asr
 from voice.recorder import VoiceRecorder
@@ -137,7 +136,6 @@ class ReadingCompanion:
         self.tool_dispatcher: Optional[ToolDispatcher] = None
         self.knowledge_linker: Optional[KnowledgeLinker] = None
         self.page_analyzer: Optional[ProactivePageAnalyzer] = None
-        self.insight_detector: Optional[InsightDetector] = None
         self.scanner: Optional[AutoScanner] = None
         self._kimi_ocr = None
         self.timer_manager: Optional[ReadingTimerManager] = None
@@ -238,15 +236,9 @@ class ReadingCompanion:
         self.tool_registry = ToolRegistry()
         self.timer_manager = ReadingTimerManager()
 
-        # KnowledgeLinker + ProactivePageAnalyzer + InsightDetector（依赖 embedder/storage）
+        # KnowledgeLinker + ProactivePageAnalyzer（依赖 embedder/storage）
         self.knowledge_linker = KnowledgeLinker(self.embedder, self.storage)
         self.page_analyzer = ProactivePageAnalyzer(self.llm, self.memory)
-        self.insight_detector = InsightDetector(
-            session_manager=self.session_manager,
-            embedder=self.embedder,
-            storage=self.storage,
-            knowledge_linker=self.knowledge_linker,
-        )
 
         # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
@@ -567,11 +559,6 @@ class ReadingCompanion:
         logger.info("🚀 开始处理用户消息")
         logger.info(f"   输入: {text[:50]}...")
         logger.info("=" * 60)
-
-        # 洞见检测：用户表达个人观点时自动保存为笔记候选（fire-and-forget）
-        if self.insight_detector and text:
-            book_name = self.memory.current_book_context.get("book_title", "")
-            self.insight_detector.maybe_save(text, book_name)
 
         start_time = time.time()
 

@@ -59,7 +59,7 @@ INTENT_CONFIGS = {
     ),
     Intent.GENERAL_CHAT: IntentConfig(
         needs_page_context=True, needs_memory=True, needs_prefetch=True,
-        role_hint=""
+        role_hint="若用户表达了值得记录的个人感悟、联想或新发现，可主动调用 reading_note 保存，无需等用户明确要求。"
     ),
 }
 
@@ -81,7 +81,7 @@ _INTENT_RULES: List[Tuple[Intent, List[str]]] = [
         r"有没有.*笔记", r"查.*笔记", r"笔记搜索",
     ]),
     (Intent.NOTE_TAKING, [
-        r"记下", r"摘抄", r"有感想", r"记一下", r"我觉得", r"保存.*笔记",
+        r"记下", r"摘抄", r"记一下", r"保存.*笔记",
         r"记笔记", r"记录.*想法", r"做笔记",
     ]),
     (Intent.PROGRESS, [
