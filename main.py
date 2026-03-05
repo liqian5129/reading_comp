@@ -94,8 +94,10 @@ from agent.ai_client import AIClient
 from agent.memory import Memory
 from agent.embedder import Embedder
 from agent.memory_consolidator import MemoryConsolidator
-from agent.tools import ToolRegistry, ToolExecutor
+from agent.tools import ToolRegistry, ToolDispatcher
 from agent.timer_manager import ReadingTimerManager
+from agent.knowledge_linker import KnowledgeLinker
+from agent.page_analyzer import ProactivePageAnalyzer
 from scanner.auto_scanner import AutoScanner
 from voice.asr import create_asr
 from voice.recorder import VoiceRecorder
@@ -131,7 +133,9 @@ class ReadingCompanion:
         self.llm: Optional[AIClient] = None
         self.memory: Optional[Memory] = None
         self.tool_registry: Optional[ToolRegistry] = None
-        self.tool_executor: Optional[ToolExecutor] = None
+        self.tool_dispatcher: Optional[ToolDispatcher] = None
+        self.knowledge_linker: Optional[KnowledgeLinker] = None
+        self.page_analyzer: Optional[ProactivePageAnalyzer] = None
         self.scanner: Optional[AutoScanner] = None
         self._kimi_ocr = None
         self.timer_manager: Optional[ReadingTimerManager] = None
@@ -232,6 +236,10 @@ class ReadingCompanion:
         self.tool_registry = ToolRegistry()
         self.timer_manager = ReadingTimerManager()
 
+        # KnowledgeLinker + ProactivePageAnalyzer（依赖 embedder/storage，需在其初始化后）
+        self.knowledge_linker = KnowledgeLinker(self.embedder, self.storage)
+        self.page_analyzer = ProactivePageAnalyzer(self.llm, self.memory)
+
         # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
         self.scanner.on_snapshot = self._on_snapshot
@@ -277,18 +285,23 @@ class ReadingCompanion:
         else:
             logger.info("📱 微信读书集成未启用（weread.enabled=false 或未配置 cookie_string）")
 
-        # 5. 工具执行器（依赖 scanner 和 session_manager）
-        self.tool_executor = ToolExecutor(
+        # 5. 工具调度器（依赖 scanner 和 session_manager）
+        from types import SimpleNamespace
+        _deps = SimpleNamespace(
             session_manager=self.session_manager,
             scanner=self.scanner,
             memory=self.memory,
             llm=self.llm,
             timer_manager=self.timer_manager,
+            feishu_pusher=None,
+            feishu_chat_id="",
             weread_client=self.weread_client,
             weread_storage=self.weread_storage,
             embedder=self.embedder,
             storage=self.storage,
+            knowledge_linker=self.knowledge_linker,
         )
+        self.tool_dispatcher = ToolDispatcher(_deps)
 
         # 5b. 记忆巩固器（可选）
         if config.MEMORY_CONSOLIDATION_ENABLED and self.llm:
@@ -367,10 +380,10 @@ class ReadingCompanion:
             self.feishu_bot.start()
             logger.info("飞书 Bot 已启动")
 
-            # 将飞书 pusher 注入 ToolExecutor 和 TimerManager
+            # 将飞书 pusher 注入 ToolDispatcher 和 TimerManager
             feishu_chat_id = getattr(config, "FEISHU_DEFAULT_CHAT_ID", "")
-            self.tool_executor.feishu_pusher = self.summary_pusher
-            self.tool_executor.feishu_chat_id = feishu_chat_id
+            self.tool_dispatcher.feishu_pusher = self.summary_pusher
+            self.tool_dispatcher.feishu_chat_id = feishu_chat_id
             self.timer_manager.set_tts_player(self.tts_player)
             self.timer_manager.set_feishu(self.summary_pusher, feishu_chat_id)
 
@@ -491,7 +504,7 @@ class ReadingCompanion:
         start_time = time.time()
 
         try:
-            system_prompt = self.memory.build_system_prompt()
+            system_prompt = self.memory.build_system_prompt(user_text=text)
             history = self.memory.get_history()
             tools = self.tool_registry.get_tools()
             page_ctx_len = len(self.memory.current_page_ocr)
@@ -573,10 +586,14 @@ class ReadingCompanion:
                         if channel == "voice":
                             await self.tts_player.speak(tail, interrupt=False)
 
+                _chars100_str = (
+                    f"{((chars_100_time - stream_start)*1000):.0f}ms"
+                    if chars_100_time else "N/A"
+                )
                 logger.info(
                     f"📊 第{round_count}轮流式: 共{total_chars}字, "
                     f"首字={(((first_token_time or 0) - stream_start)*1000):.0f}ms, "
-                    f"百字={(((chars_100_time or 0) - stream_start)*1000):.0f}ms"
+                    f"百字={_chars100_str}"
                 )
 
                 if not tool_calls:
@@ -585,7 +602,7 @@ class ReadingCompanion:
                 # 执行工具
                 tool_results = []
                 for tc in tool_calls:
-                    result = await self.tool_executor.execute(tc["name"], tc["input"])
+                    result = await self.tool_dispatcher.execute(tc["name"], tc["input"])
                     tool_results.append({"tool_use_id": tc["id"], "content": str(result)})
 
                 # 记录本轮工具调用（暂存，稍后按正确顺序写入 history）
@@ -675,8 +692,8 @@ class ReadingCompanion:
             if self.timer_manager and self.timer_manager._feishu_chat_id != chat_id:
                 self.timer_manager.set_feishu(self.summary_pusher, chat_id)
                 logger.debug(f"飞书 chat_id 已更新: {chat_id}")
-            if self.tool_executor:
-                self.tool_executor.feishu_chat_id = chat_id
+            if self.tool_dispatcher:
+                self.tool_dispatcher.feishu_chat_id = chat_id
         return await self._process_user_message(text, channel="feishu")
     
     def _on_book_detected(self, vision_result: dict):
@@ -734,6 +751,10 @@ class ReadingCompanion:
         preview = ocr_text[:80].replace('\n', ' ')
         logger.info(f"📖 书页上下文已注入 ({len(ocr_text)}字) → 下次 AI 对话生效")
         logger.info(f"   预览: {preview}…")
+
+        # 翻页预分析（fire-and-forget，不阻塞）
+        if self.page_analyzer and len(ocr_text) > 50:
+            self.page_analyzer.on_page_changed(ocr_text, self.memory.current_book_context)
     
     async def _check_and_push_feishu(self):
         """检查并推送飞书总结"""

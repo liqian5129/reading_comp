@@ -178,6 +178,17 @@ class Storage:
                 embedding BLOB,
                 created_at INTEGER DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS note_links (
+                note_id    INTEGER NOT NULL,
+                related_id INTEGER NOT NULL,
+                score      REAL NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (note_id, related_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_note_links_note ON note_links(note_id);
+            CREATE INDEX IF NOT EXISTS idx_note_links_related ON note_links(related_id);
         """)
         await self._conn.commit()
 
@@ -968,3 +979,52 @@ class Storage:
         except Exception as e:
             logger.warning(f"load_recent_summaries 失败: {e}")
         return list(reversed(results))  # 按时间正序返回
+
+    # ==================== Note Links ====================
+
+    async def save_note_links(self, note_id: int, related: List[tuple]) -> bool:
+        """
+        批量保存笔记关联（双向）。
+        related: [(related_id, score), ...]
+        """
+        if not related:
+            return True
+        try:
+            ts = int(datetime.now().timestamp() * 1000)
+            rows = []
+            for related_id, score in related:
+                rows.append((note_id, related_id, score, ts))
+                rows.append((related_id, note_id, score, ts))  # 双向
+            await self._conn.executemany(
+                "INSERT OR REPLACE INTO note_links (note_id, related_id, score, created_at) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            await self._conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"save_note_links 失败: {e}")
+            return False
+
+    async def get_related_notes(self, note_id: int, limit: int = 5) -> List[dict]:
+        """按笔记 ID 查询关联笔记（按相似度降序）"""
+        results = []
+        try:
+            async with self._conn.execute(
+                """SELECT nl.related_id, nl.score, n.content, n.book_name, n.ts
+                   FROM note_links nl
+                   LEFT JOIN notes n ON nl.related_id = n.id
+                   WHERE nl.note_id = ?
+                   ORDER BY nl.score DESC LIMIT ?""",
+                (note_id, limit),
+            ) as cursor:
+                async for row in cursor:
+                    results.append({
+                        "id": row["related_id"],
+                        "score": row["score"],
+                        "content": row["content"] or "",
+                        "book_name": row["book_name"] or "",
+                        "ts": row["ts"] or 0,
+                    })
+        except Exception as e:
+            logger.warning(f"get_related_notes 失败: {e}")
+        return results

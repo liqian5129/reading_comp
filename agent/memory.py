@@ -141,6 +141,9 @@ class Memory:
         self._prefetch_cache: Optional[str] = None
         self._prefetch_task: Optional[asyncio.Task] = None
 
+        # 翻页预分析 hint（由 ProactivePageAnalyzer 写入，翻页时重置）
+        self.proactive_page_hint: Optional[str] = None
+
         # 加载
         self._load_persona()
         self._load_long_term()
@@ -311,97 +314,21 @@ class Memory:
             logger.warning(f"prefetch_memories 失败（已降级）: {e}")
             self._prefetch_cache = None
 
-    def build_system_prompt(self) -> str:
+    def build_system_prompt(self, user_text: str = "") -> str:
         """
-        构建系统提示词
+        构建系统提示词（intent-aware 动态版本）
 
-        注入顺序：
-        1. 角色定义
-        2. 长期记忆摘要
-        3. 用户偏好
-        4. 相关历史记忆（prefetch cache，Section 2.5）
-        5. 当前书籍视觉上下文
-        6. 当前页 OCR 文本
-        7. 工具调用策略
+        根据用户输入文本分类意图，再由 DynamicContextBuilder 按意图选择性注入各节。
+        user_text 为空时 fallback 到 GENERAL_CHAT（行为与改造前完全相同）。
         """
-        parts = []
+        from .intent_classifier import IntentClassifier
+        from .context_builder import DynamicContextBuilder
 
-        # 1. 角色定义
-        parts.append("""你是一个陪伴用户阅读的智能助手，以读书场景为核心，同时也能回答用户的一般性问题。
+        intent = IntentClassifier.classify(user_text)
+        config = IntentClassifier.get_config(intent)
+        logger.debug(f"[Memory] 意图分类: '{user_text[:30]}' → {intent.value}")
 
-核心能力：
-1. 解释、总结和讨论当前书页内容
-2. 回答用户关于书中知识点的问题
-3. 记录读书笔记和想法
-4. 查询阅读历史和笔记
-5. 闲聊、推荐书单、回答其他日常问题
-
-回答风格：友好自然，简洁明了，适合语音播报（避免过长列举，少用 markdown 格式）。
-
-回答长度：除非用户明确要求详细说明，每次回复请控制在 350 个字以内。""")
-
-        # 2. 长期记忆摘要
-        lt_digest = self.long_term.get_digest_for_prompt()
-        if lt_digest:
-            parts.append(f"【你对这位用户的了解】\n{lt_digest}")
-
-        # 3. 用户偏好
-        if self.persona.reading_preferences:
-            parts.append(f"用户的阅读偏好: {', '.join(self.persona.reading_preferences)}")
-        if self.persona.favorite_genres:
-            parts.append(f"用户喜欢的书籍类型: {', '.join(self.persona.favorite_genres)}")
-
-        # 4. 相关历史记忆（prefetch cache）
-        if self._prefetch_cache:
-            parts.append(f"【相关历史记忆】\n{self._prefetch_cache}")
-
-        # 5. 当前书籍视觉上下文
-        ctx = self.current_book_context
-        if ctx.get("book_title") and ctx.get("confidence", 0) >= 0.7:
-            page_info = f"第 {ctx['current_page_num']} 页" if ctx.get("current_page_num") else ""
-            parts.append(
-                f"【当前正在阅读】《{ctx['book_title']}》{page_info}"
-                + (f"（{ctx['content_type']}）" if ctx.get("content_type") else "")
-            )
-
-        # 6. 当前页面 OCR 文本
-        if self.current_page_ocr:
-            page_text = self.current_page_ocr[:2000]
-            truncated = "...(内容已截断)" if len(self.current_page_ocr) > 2000 else ""
-            parts.append(f"""【当前书页内容（摄像头已自动识别）】
-以下是摄像头刚刚拍摄并 OCR 识别的书页文字，你已经看到了这些内容，请直接基于它回答用户问题，无需再次拍照：
-
-{page_text}{truncated}""")
-
-        # 6. 工具调用策略
-        parts.append("""## 工具调用策略
-
-### 基本原则
-- 收到复杂请求时，先规划需要哪些工具、按什么顺序调用，连续执行，最后统一回复。
-- 不要在工具调用中途询问"要不要继续下一步"。
-
-### 数据准确性（最重要）
-- 内容只能来自工具返回值，绝不用你对书籍的训练知识填充用户的笔记/划线。
-- 做金句卡、整理笔记时：先调 weread_get_notes 获取用户真实数据，再生成卡片。
-- generate_reading_card 的 content 参数：只在用户口述了具体文字时才填，其余情况只传 book_title。
-
-### 书名推断
-- 未指定书名 → 从对话上下文推断，推断不了再调 weread_notebook/reading_progress_query。
-- 候选书目超过2本且意图不明确 → 列出选项让用户选，否则自行推断。
-
-### 微信读书 vs 本 App 区分
-- 用户问"微信读书的书签/划线/笔记/想法" → weread_get_notes（含书签、划线、想法、点评四类）
-- 用户在本 App 手动记录的书签 → bookmark_list / bookmark_create
-- 用户说"记一下/我觉得..." → reading_note，书名从当前阅读上下文自动获取
-
-### 常用流程
-- 书架/推荐 → weread_shelf(refresh=true)，书架为空时主动刷新，不要让用户说"刷新书架"
-- 微信读书笔记 → weread_notebook 看书单 → weread_get_notes 看详情，禁止询问"要不要同步"
-- 阅读进度 → weread_progress（需书名），书名未知先查 reading_progress_query
-- 用户问"我读到哪了" → weread_get_notes 查微信书签 + reading_progress_query 查本地进度，合并回复
-- 金句卡 → weread_get_notes 取真实划线 → generate_reading_card(book_title=...) 不填 content""")
-
-        return "\n\n".join(parts)
+        return DynamicContextBuilder().build(self, intent, config)
     
     def update_from_session_summary(self, summary: str):
         """

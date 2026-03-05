@@ -411,6 +411,10 @@ class DoubaoTTSPlayer:
         text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
         # 去掉引用符号 >
         text = re.sub(r'^\s*>\s*', '', text, flags=re.MULTILINE)
+        # 去掉 emoji（4字节辅助平面字符）
+        text = re.sub(r'[\U00010000-\U0010ffff]', '', text)
+        # 去掉常见符号区 emoji（Misc Symbols / Dingbats / 变体选择符）
+        text = re.sub(r'[\u2600-\u26FF\u2700-\u27BF\uFE0F\u20E3]', '', text)
         # 合并多个空行为单个换行
         text = re.sub(r'\n{2,}', '\n', text)
         # 去掉行首行尾空白
@@ -685,13 +689,12 @@ class DoubaoTTSPlayer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            proc.stdin.write(audio_data)
-            proc.stdin.close()
+            # communicate() 内部正确处理管道关闭和 BrokenPipeError，避免 Future 泄漏
+            comm_task = asyncio.ensure_future(proc.communicate(audio_data))
 
             while True:
                 if self._interrupt_event.is_set():
-                    # abort stdin transport 丢弃写缓冲，防止 BrokenPipeError
-                    # 注意：不能用 is_closing() 判断，因为 proc.stdin.close() 已被调用
+                    comm_task.cancel()
                     try:
                         proc.stdin.transport.abort()
                     except Exception:
@@ -702,11 +705,16 @@ class DoubaoTTSPlayer:
                     except asyncio.TimeoutError:
                         proc.kill()
                     return
-                if proc.returncode is not None:
+                if comm_task.done():
                     break
                 await asyncio.sleep(0.02)
 
-            if proc.returncode != 0:
+            try:
+                await comm_task
+            except (asyncio.CancelledError, BrokenPipeError, ConnectionResetError):
+                pass
+
+            if proc.returncode is not None and proc.returncode != 0:
                 logger.warning(f"mpg123 异常退出: {proc.returncode}")
 
         except Exception as e:
