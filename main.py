@@ -98,6 +98,7 @@ from agent.tools import ToolRegistry, ToolDispatcher
 from agent.timer_manager import ReadingTimerManager
 from agent.knowledge_linker import KnowledgeLinker
 from agent.page_analyzer import ProactivePageAnalyzer
+from agent.insight_detector import InsightDetector
 from scanner.auto_scanner import AutoScanner
 from voice.asr import create_asr
 from voice.recorder import VoiceRecorder
@@ -136,6 +137,7 @@ class ReadingCompanion:
         self.tool_dispatcher: Optional[ToolDispatcher] = None
         self.knowledge_linker: Optional[KnowledgeLinker] = None
         self.page_analyzer: Optional[ProactivePageAnalyzer] = None
+        self.insight_detector: Optional[InsightDetector] = None
         self.scanner: Optional[AutoScanner] = None
         self._kimi_ocr = None
         self.timer_manager: Optional[ReadingTimerManager] = None
@@ -236,9 +238,15 @@ class ReadingCompanion:
         self.tool_registry = ToolRegistry()
         self.timer_manager = ReadingTimerManager()
 
-        # KnowledgeLinker + ProactivePageAnalyzer（依赖 embedder/storage，需在其初始化后）
+        # KnowledgeLinker + ProactivePageAnalyzer + InsightDetector（依赖 embedder/storage）
         self.knowledge_linker = KnowledgeLinker(self.embedder, self.storage)
         self.page_analyzer = ProactivePageAnalyzer(self.llm, self.memory)
+        self.insight_detector = InsightDetector(
+            session_manager=self.session_manager,
+            embedder=self.embedder,
+            storage=self.storage,
+            knowledge_linker=self.knowledge_linker,
+        )
 
         # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
@@ -250,23 +258,50 @@ class ReadingCompanion:
 
         # 4b. KimiOCR（用 Kimi vision API 替代本地 PaddleOCR，默认关闭）
         if config.KIMI_OCR_ENABLED:
-            from scanner.kimi_ocr import KimiOCR
-            # 使用独立的 AIClient 实例，避免与主对话共享 HTTP 连接池
-            _kimi_ocr_client = AIClient(
-                provider="kimi",
-                api_key=config.KIMI_OCR_API_KEY,
-                model=config.KIMI_MODEL,
-                base_url=config.KIMI_BASE_URL,
-            )
-            self._kimi_ocr = KimiOCR(
-                _kimi_ocr_client,
+            from scanner.kimi_ocr import KimiOCR, OcrChain
+
+            def _make_kimi_ocr_client():
+                return AIClient(
+                    provider="kimi",
+                    api_key=config.KIMI_OCR_API_KEY,
+                    model=config.KIMI_MODEL,
+                    base_url=config.KIMI_BASE_URL,
+                    max_retries=0,
+                )
+
+            def _make_doubao_ocr_client():
+                return AIClient(
+                    provider="doubao",
+                    api_key=config.DOUBAO_OCR_API_KEY,
+                    model=config.DOUBAO_OCR_MODEL,
+                    base_url=config.DOUBAO_BASE_URL,
+                    max_retries=0,
+                    timeout=90.0,  # 比 KimiOCR.TIMEOUT_S(120s) 小，确保 SDK 先报错而非被 asyncio 取消
+                    reasoning_effort="minimal",  # 不开启思考，避免 OCR 任务超时
+                )
+
+            kimi_ocr = KimiOCR(
+                _make_kimi_ocr_client(),
                 min_interval_s=config.KIMI_OCR_INTERVAL,
                 results_dir=config.KIMI_OCR_RESULTS_DIR if config.KIMI_OCR_SAVE_RESULTS else None,
             )
+            doubao_ocr = KimiOCR(
+                _make_doubao_ocr_client(),
+                min_interval_s=config.KIMI_OCR_INTERVAL,
+                results_dir=config.DOUBAO_OCR_RESULTS_DIR if config.KIMI_OCR_SAVE_RESULTS else None,
+            )
+
+            if config.VISION_OCR_PRIMARY == "doubao":
+                primary, fallback = doubao_ocr, kimi_ocr
+                logger.info("🔍 OCR 主链路: 豆包，备用: Kimi")
+            else:
+                primary, fallback = kimi_ocr, doubao_ocr
+                logger.info("🔍 OCR 主链路: Kimi，备用: 豆包")
+
+            self._kimi_ocr = OcrChain(primary, fallback)
             self._kimi_ocr.on_text_ready = self._on_snapshot
             self.scanner.set_kimi_ocr(self._kimi_ocr)
             self.scanner.on_book_info = self._on_book_detected
-            logger.info("🔍 KimiOCR 已启用（Kimi vision API 替代本地 OCR）")
         else:
             logger.info("🔍 KimiOCR 未启用（使用本地 PaddleOCR）")
 
@@ -387,8 +422,40 @@ class ReadingCompanion:
             self.timer_manager.set_tts_player(self.tts_player)
             self.timer_manager.set_feishu(self.summary_pusher, feishu_chat_id)
 
+        # 启动时异步补全历史 embedding（不阻塞启动）
+        if self.embedder and self.storage:
+            asyncio.create_task(self._backfill_embeddings())
+
         logger.info("初始化完成")
-    
+
+    async def _backfill_embeddings(self) -> None:
+        """启动时为历史记录中缺失 embedding 的行补全（fire-and-forget）"""
+        tables = ["notes", "weread_highlights", "weread_notes"]
+        total = 0
+        for table in tables:
+            try:
+                rows = await self.storage.get_rows_missing_embedding(table, limit=50)
+                for row in rows:
+                    try:
+                        content = row.get("content", "")
+                        book = row.get("book_name") or row.get("book_title", "")
+                        text = f"{book} {content}".strip()
+                        if not text:
+                            continue
+                        embedding = await self.embedder.embed(text)
+                        if embedding:
+                            await self.storage.save_embedding(table, row["id"], embedding)
+                            total += 1
+                        await asyncio.sleep(0.1)  # 避免 API 速率限制
+                    except Exception as e:
+                        logger.debug(f"backfill {table}#{row.get('id')}: {e}")
+            except Exception as e:
+                logger.warning(f"backfill 表 {table} 失败: {e}")
+        if total:
+            logger.info(f"✅ 启动 embedding 补全完成，共处理 {total} 条")
+        else:
+            logger.info("✅ 所有记录 embedding 已完整，无需补全")
+
     async def shutdown(self):
         """关闭所有模块"""
         if self._shutting_down:
@@ -500,6 +567,11 @@ class ReadingCompanion:
         logger.info("🚀 开始处理用户消息")
         logger.info(f"   输入: {text[:50]}...")
         logger.info("=" * 60)
+
+        # 洞见检测：用户表达个人观点时自动保存为笔记候选（fire-and-forget）
+        if self.insight_detector and text:
+            book_name = self.memory.current_book_context.get("book_title", "")
+            self.insight_detector.maybe_save(text, book_name)
 
         start_time = time.time()
 

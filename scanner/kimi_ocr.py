@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Optional, Callable, Tuple
 
+import openai
+
 logger = logging.getLogger(__name__)
 
 OCR_PROMPT = """请识别图片里拍摄的书页内容，完整整理给我。
@@ -43,10 +45,10 @@ def _compress_image(image_path: str, max_side: int) -> str:
         cv2.imwrite(compressed_path, resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
         orig_kb = Path(image_path).stat().st_size / 1024
         comp_kb = Path(compressed_path).stat().st_size / 1024
-        logger.debug(f"KimiOCR 图片压缩: {orig_kb:.0f}KB → {comp_kb:.0f}KB ({new_w}x{new_h})")
+        logger.debug(f"VisionOCR 图片压缩: {orig_kb:.0f}KB → {comp_kb:.0f}KB ({new_w}x{new_h})")
         return compressed_path
     except Exception as e:
-        logger.debug(f"KimiOCR 图片压缩失败，使用原图: {e}")
+        logger.debug(f"VisionOCR 图片压缩失败，使用原图: {e}")
         return image_path
 
 
@@ -80,7 +82,8 @@ class KimiOCR:
     """
 
     MAX_SIDE = 1280     # 压缩到此长边（书页 OCR 足够，减少请求体大小）
-    TIMEOUT_S = 60.0    # API 调用超时（含 openai SDK 重试时间）
+    TIMEOUT_S = 120.0   # 单次 API 调用超时（豆包 seed 大模型 OCR 可能需要 70-90s）
+    MAX_RETRIES = 2     # 最大重试次数（共尝试 MAX_RETRIES 次）
 
     def __init__(self, ai_client, min_interval_s: float = 30.0,
                  results_dir: Optional[Path] = None):
@@ -102,54 +105,89 @@ class KimiOCR:
         self.on_text_ready: Optional[Callable[[str, str], None]] = None   # (text, image_path)
         self.on_book_info: Optional[Callable[[dict, str], None]] = None   # (book_info, image_path)
 
-    def trigger(self, image_path: str):
+    def trigger(self, image_path: str) -> bool:
         """
         非阻塞触发一次 OCR 识别。
         若上一次识别尚未完成、或距上次触发未超过 min_interval_s，跳过本次触发。
+        返回 True 表示成功触发，False 表示被跳过。
         """
         if self._pending_task and not self._pending_task.done():
             logger.debug("KimiOCR: 上次识别尚未完成，跳过本次触发")
-            return
+            return False
         now = time.time()
         if now - self._last_trigger_ts < self._min_interval_s:
             logger.debug(f"KimiOCR: 距上次触发仅 {now - self._last_trigger_ts:.0f}s，跳过")
-            return
+            return False
         self._last_trigger_ts = now
         self._pending_task = asyncio.create_task(self._recognize(image_path))
+        return True
 
     async def _recognize(self, image_path: str):
-        """调用 Kimi vision API 识别书页内容"""
+        """调用 vision API 识别书页内容，失败自动重试"""
+        provider = getattr(self._client, 'provider', 'unknown')
+        model = getattr(self._client, 'model', 'unknown')
+        tag = f"{provider.upper()}OCR({model})"
+
+        # 1. 压缩图片（只做一次）
+        loop = asyncio.get_event_loop()
+        compressed_path = await loop.run_in_executor(
+            None, _compress_image, image_path, self.MAX_SIDE
+        )
         try:
-            # 1. 压缩图片
-            loop = asyncio.get_event_loop()
-            compressed_path = await loop.run_in_executor(
-                None, _compress_image, image_path, self.MAX_SIDE
-            )
+            img_kb = Path(compressed_path).stat().st_size / 1024
+        except Exception:
+            img_kb = 0
+        logger.info(f"{tag} 开始识别: {Path(image_path).name}, 压缩后 {img_kb:.0f}KB")
 
-            # 2. 调用 vision API（独立通道，不传 history/system_prompt）
-            response = await asyncio.wait_for(
-                self._client.chat(
-                    user_message=OCR_PROMPT,
-                    image_path=compressed_path,
-                    max_tokens=4096,
-                ),
-                timeout=self.TIMEOUT_S,
-            )
+        response = None
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                logger.debug(f"{tag} 第{attempt}次请求，超时={self.TIMEOUT_S}s")
+                t0 = time.time()
+                # 2. 调用 vision API（独立通道，不传 history/system_prompt）
+                response = await asyncio.wait_for(
+                    self._client.chat(
+                        user_message=OCR_PROMPT,
+                        image_path=compressed_path,
+                        max_tokens=4096,
+                    ),
+                    timeout=self.TIMEOUT_S,
+                )
+                elapsed = time.time() - t0
+                logger.info(f"{tag} 第{attempt}次请求完成，耗时 {elapsed:.1f}s，stop_reason={response.stop_reason}")
+                break  # 成功，跳出重试循环
+            except openai.RateLimitError as e:
+                # 429 服务过载：立即放弃，不重试（重试也大概率失败）
+                logger.warning(f"{tag}: 429 服务过载，跳过本次识别（下次翻页重试）: {e}")
+                return
+            except (asyncio.TimeoutError, Exception) as e:
+                elapsed = time.time() - t0
+                if isinstance(e, asyncio.TimeoutError):
+                    err_desc = f"超时({elapsed:.0f}s >= {self.TIMEOUT_S}s)"
+                else:
+                    err_desc = f"{type(e).__name__}: {e}"
+                if attempt < self.MAX_RETRIES:
+                    logger.warning(f"{tag} 第{attempt}次失败（{err_desc}），2s 后重试...")
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"{tag} 已重试 {self.MAX_RETRIES} 次仍失败（{err_desc}），放弃")
+                    return
 
+        try:
             # 3. 过滤 API 错误响应（stop_reason="error" 时 text 为错误信息，不能注入上下文）
             if response.stop_reason == "error":
-                logger.warning(f"KimiOCR: API 返回错误，跳过回调: {(response.text or '')[:120]}")
+                logger.warning(f"{tag}: API 返回错误，跳过回调: {(response.text or '')[:200]}")
                 return
 
             raw_text = (response.text or "").strip()
             if not raw_text:
-                logger.warning("KimiOCR: 返回空响应")
+                logger.warning(f"{tag}: 返回空响应（stop_reason={response.stop_reason}）")
                 return
 
             # 4. 解析响应
             content, meta = _parse_response(raw_text)
             logger.info(
-                f"KimiOCR 识别完成: {len(content)}字, "
+                f"{tag} 识别完成: {len(content)}字, "
                 f"书名={meta.get('book_title', '')!r}, "
                 f"页码={meta.get('page_num', '')}"
             )
@@ -181,10 +219,8 @@ class KimiOCR:
                 except Exception as e:
                     logger.error(f"KimiOCR on_book_info 回调失败: {e}")
 
-        except asyncio.TimeoutError:
-            logger.error(f"KimiOCR 调用超时 ({self.TIMEOUT_S}s)")
         except Exception as e:
-            logger.error(f"KimiOCR 识别失败: {e}")
+            logger.error(f"{tag} 后处理失败: {e}", exc_info=True)
 
     async def cancel(self):
         """取消正在进行的识别任务"""
@@ -194,3 +230,75 @@ class KimiOCR:
                 await self._pending_task
             except asyncio.CancelledError:
                 pass
+
+
+# 豆包 OCR 与 KimiOCR 共用同一套逻辑，仅 AIClient 不同
+DoubaoOCR = KimiOCR
+
+
+class OcrChain:
+    """
+    双 OCR 路由器：primary 失败时自动切换到 fallback。
+    接口与 KimiOCR 完全相同，可直接传给 scanner.set_kimi_ocr()。
+    """
+
+    def __init__(self, primary: KimiOCR, fallback: Optional[KimiOCR] = None):
+        self.primary = primary
+        self.fallback = fallback
+        self._pending_task: Optional[asyncio.Task] = None
+        self._last_trigger_ts: float = 0.0
+        self._min_interval_s = primary._min_interval_s
+
+        # 与 KimiOCR 相同的回调接口
+        self.on_text_ready: Optional[Callable[[str, str], None]] = None
+        self.on_book_info: Optional[Callable[[dict, str], None]] = None
+
+    def trigger(self, image_path: str) -> bool:
+        if self._pending_task and not self._pending_task.done():
+            logger.debug("OcrChain: 上次识别尚未完成，跳过")
+            return False
+        now = time.time()
+        if now - self._last_trigger_ts < self._min_interval_s:
+            logger.debug(f"OcrChain: 距上次触发仅 {now - self._last_trigger_ts:.0f}s，跳过")
+            return False
+        self._last_trigger_ts = now
+        self._pending_task = asyncio.create_task(self._run(image_path))
+        return True
+
+    async def _run(self, image_path: str):
+        primary_name = getattr(getattr(self.primary, '_client', None), 'provider', 'primary').upper() + "OCR"
+        fallback_name = (getattr(getattr(self.fallback, '_client', None), 'provider', 'fallback').upper() + "OCR") if self.fallback else None
+
+        # 用 flag 检测主 OCR 是否成功触发了 on_text_ready
+        success = False
+
+        def _on_text(text, path):
+            nonlocal success
+            success = True
+            if self.on_text_ready:
+                self.on_text_ready(text, path)
+
+        def _on_book(info, path):
+            if self.on_book_info:
+                self.on_book_info(info, path)
+
+        self.primary.on_text_ready = _on_text
+        self.primary.on_book_info = _on_book
+        await self.primary._recognize(image_path)
+
+        if not success and self.fallback:
+            logger.info(f"OcrChain: {primary_name} 未返回结果，切换到 {fallback_name}")
+            self.fallback.on_text_ready = self.on_text_ready
+            self.fallback.on_book_info = self.on_book_info
+            await self.fallback._recognize(image_path)
+
+    async def cancel(self):
+        if self._pending_task and not self._pending_task.done():
+            self._pending_task.cancel()
+            try:
+                await self._pending_task
+            except asyncio.CancelledError:
+                pass
+        await self.primary.cancel()
+        if self.fallback:
+            await self.fallback.cancel()

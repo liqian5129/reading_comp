@@ -182,6 +182,57 @@ class FeishuBot:
         except Exception as e:
             logger.error(f"发送卡片失败: {e}")
 
+    async def upload_image(self, image_path: str) -> Optional[str]:
+        """
+        上传图片到飞书，返回 image_key。失败返回 None。
+        """
+        try:
+            from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+            request = CreateImageRequest.builder() \
+                .request_body(
+                    CreateImageRequestBody.builder()
+                    .image_type("message")
+                    .image(image_bytes)
+                    .build()
+                ) \
+                .build()
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.im.v1.image.create(request)
+            )
+            if response.success():
+                return response.data.image_key
+            else:
+                logger.error(f"图片上传失败: {response.code} - {response.msg}")
+                return None
+        except Exception as e:
+            logger.error(f"上传图片失败: {e}")
+            return None
+
+    async def send_image(self, chat_id: str, image_key: str):
+        """发送图片消息（image_key 由 upload_image 获取）"""
+        try:
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("image")
+                    .content(json.dumps({"image_key": image_key}))
+                    .build()
+                ) \
+                .build()
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.im.v1.message.create(request)
+            )
+            if not response.success():
+                logger.error(f"图片消息发送失败: {response.code} - {response.msg}")
+        except Exception as e:
+            logger.error(f"发送图片消息失败: {e}")
+
     async def send_to_user(self, user_id: str, text: str):
         """
         给用户发送消息（Open ID）

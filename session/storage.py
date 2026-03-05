@@ -197,6 +197,7 @@ class Storage:
             ("notes", "book_name", "TEXT DEFAULT ''"),
             ("notes", "tags", "TEXT DEFAULT '[]'"),
             ("weread_notes", "note_type", "TEXT DEFAULT '想法'"),
+            ("notes", "image_path", "TEXT DEFAULT ''"),
             ("notes", "embedding", "BLOB"),
             ("weread_highlights", "embedding", "BLOB"),
             ("weread_notes", "embedding", "BLOB"),
@@ -364,8 +365,8 @@ class Storage:
     async def add_note(self, note: Note) -> int:
         """添加笔记，返回 ID，并同步写 JSON 文件"""
         cursor = await self._conn.execute(
-            """INSERT INTO notes (session_id, ts, content, book_name, tags, page_ocr_context)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO notes (session_id, ts, content, book_name, tags, page_ocr_context, image_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 note.session_id,
                 note.ts,
@@ -373,6 +374,7 @@ class Storage:
                 note.book_name,
                 json.dumps(note.tags, ensure_ascii=False),
                 note.page_ocr_context,
+                note.image_path,
             )
         )
         await self._conn.commit()
@@ -464,6 +466,7 @@ class Storage:
             book_name=row['book_name'] if row['book_name'] else "",
             tags=tags,
             page_ocr_context=row['page_ocr_context'] if row['page_ocr_context'] else "",
+            image_path=row['image_path'] if row['image_path'] else "",
         )
     
     # ==================== Statistics ====================
@@ -861,6 +864,32 @@ class Storage:
         except Exception as e:
             logger.warning(f"save_embedding 失败 ({table}#{row_id}): {e}")
             return False
+
+    async def get_rows_missing_embedding(
+        self, table: str, limit: int = 50, book_id: str = None
+    ) -> list:
+        """查询 embedding 为空的行，用于启动时或同步后补全"""
+        allowed = {"notes", "weread_highlights", "weread_notes"}
+        if table not in allowed:
+            return []
+        if table == "notes":
+            sql = "SELECT id, content, book_name FROM notes WHERE embedding IS NULL"
+            params: list = []
+            if book_id:
+                sql += " AND book_name = ?"
+                params.append(book_id)
+        else:
+            sql = f"SELECT id, content, book_title FROM {table} WHERE embedding IS NULL"
+            params = []
+            if book_id:
+                sql += " AND book_id = ?"
+                params.append(book_id)
+        sql += f" LIMIT {limit}"
+        rows = []
+        async with self._conn.execute(sql, params) as cursor:
+            async for row in cursor:
+                rows.append(dict(row))
+        return rows
 
     async def search_by_embedding(
         self,

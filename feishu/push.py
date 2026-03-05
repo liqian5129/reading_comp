@@ -3,6 +3,7 @@
 构建飞书交互卡片
 """
 import logging
+import os
 from typing import Optional, List
 from datetime import datetime
 
@@ -295,6 +296,30 @@ class SummaryPusher:
         """推送纯文本消息到飞书"""
         await self.bot.send_text(chat_id, text)
         logger.info(f"文本消息已推送到飞书: {chat_id}")
+
+    async def push_notes_images(self, chat_id: str, notes: List[Note]):
+        """
+        将笔记关联的书页截图发送到飞书，每张图片附带笔记摘要文字。
+
+        Args:
+            chat_id: 会话 ID
+            notes: 有 image_path 的笔记列表
+        """
+        for note in notes:
+            if not note.image_path or not os.path.isfile(note.image_path):
+                continue
+            try:
+                image_key = await self.bot.upload_image(note.image_path)
+                if not image_key:
+                    continue
+                await self.bot.send_image(chat_id, image_key)
+                # 图片下方跟一条笔记摘要
+                excerpt = note.content[:60] + ("…" if len(note.content) > 60 else "")
+                book_hint = f"《{note.book_name}》 · " if note.book_name else ""
+                await self.bot.send_text(chat_id, f"{book_hint}{note.created_at_str}\n{excerpt}")
+                logger.info(f"书页截图已推送: note#{note.id} → {chat_id}")
+            except Exception as e:
+                logger.error(f"推送书页截图失败: note#{note.id}: {e}")
 
     async def push_bookmark_created(self, chat_id: str, bookmark, book_title: str = ""):
         """

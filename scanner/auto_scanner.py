@@ -213,7 +213,12 @@ class AutoScanner:
 
     def _on_kimi_book_info(self, book_info: dict, image_path: str):
         """KimiOCR 元数据回调：翻页/换书检测"""
-        page_num   = book_info.get("page_num", -1)
+        page_num = book_info.get("page_num", -1)
+        # 模型可能返回 None（无页码）或列表 [302, 303]（双页），统一转为 int
+        if page_num is None:
+            page_num = -1
+        elif isinstance(page_num, list):
+            page_num = page_num[0] if page_num else -1
         book_title = book_info.get("book_title", "")
 
         # 换书检测
@@ -294,7 +299,6 @@ class AutoScanner:
                 if fp and not is_page_turn(self._last_fingerprint, fp):
                     logger.debug("KimiOCR: 页面未变化（指纹相同），跳过")
                     return None
-                self._last_fingerprint = fp
 
                 now = datetime.now()
                 ts = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
@@ -304,7 +308,12 @@ class AutoScanner:
                     cv2.imwrite(str(p), f)
 
                 await loop.run_in_executor(None, _save, frame, image_path)
-                self._kimi_ocr.trigger(str(image_path))
+                triggered = self._kimi_ocr.trigger(str(image_path))
+                if triggered:
+                    # 只有 OCR 成功触发时才更新指纹，否则下次扫描仍可重试
+                    self._last_fingerprint = fp
+                else:
+                    logger.debug("KimiOCR: trigger 被跳过，保留旧指纹以便下次重试")
                 return None
 
             # 2. 编码原始帧（在线程池中执行，避免阻塞）

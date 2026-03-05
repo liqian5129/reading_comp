@@ -2,6 +2,7 @@
 微信读书相关工具：weread_shelf, weread_notebook, weread_get_notes,
 weread_progress, weread_best_highlights, weread_merge_notes
 """
+import asyncio
 import logging
 from typing import Dict, Optional
 
@@ -138,6 +139,12 @@ class WeReadTools:
                     n.book_title = book.title
             await self.deps.weread_storage.upsert_notes(notes_api)
 
+        # 异步补全同步内容的 embedding（fire-and-forget）
+        embedder = getattr(self.deps, "embedder", None)
+        storage = getattr(self.deps, "storage", None)
+        if embedder and storage:
+            asyncio.create_task(self._embed_synced_content(book, storage, embedder))
+
         bookmarks_api = await self.deps.weread_client.get_bookmarks(book.book_id, book_title=book.title)
 
         highlights = await self.deps.weread_storage.list_highlights(book.book_id, limit=limit)
@@ -177,6 +184,33 @@ class WeReadTools:
             "thoughts_count": len(thoughts),
             "reviews_count": len(reviews),
         }
+
+    async def _embed_synced_content(self, book, storage, embedder) -> None:
+        """为刚同步的微信读书内容补写 embedding（fire-and-forget）"""
+        total = 0
+        for table in ("weread_highlights", "weread_notes"):
+            try:
+                rows = await storage.get_rows_missing_embedding(
+                    table, limit=200, book_id=book.book_id
+                )
+                for row in rows:
+                    try:
+                        content = row.get("content", "")
+                        book_title = row.get("book_title", "")
+                        text = f"{book_title} {content}".strip()
+                        if not text:
+                            continue
+                        embedding = await embedder.embed(text)
+                        if embedding:
+                            await storage.save_embedding(table, row["id"], embedding)
+                            total += 1
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        logger.debug(f"_embed_synced_content {table}#{row.get('id')}: {e}")
+            except Exception as e:
+                logger.warning(f"_embed_synced_content 表 {table} 失败: {e}")
+        if total:
+            logger.info(f"微信读书 embedding 补全完成（{book.title}）：{total} 条")
 
     async def exec_weread_progress(self, params: Dict) -> Dict:
         """查询实时阅读进度"""

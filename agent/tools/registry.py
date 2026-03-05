@@ -15,6 +15,8 @@ READING_NOTE_TOOL = {
     "description": (
         "保存一条读书笔记到本地。书名优先从当前阅读上下文自动获取，无需用户指定。"
         "用户表达记录意图（摘抄、记下来、我觉得、有感想）时调用。"
+        "仅当用户明确要求同时保存当前书页截图（如「把这页图片一起记下来」「附上截图」）时，"
+        "save_image 才传 true，否则默认 false。"
     ),
     "input_schema": {
         "type": "object",
@@ -25,6 +27,10 @@ READING_NOTE_TOOL = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "标签列表，由用户指定或从内容中提取关键词，可为空",
+            },
+            "save_image": {
+                "type": "boolean",
+                "description": "是否关联当前书页截图。仅当用户明确要求保存截图时为 true，默认 false。",
             },
         },
         "required": ["content"],
@@ -48,12 +54,18 @@ READING_NOTES_TOOL = {
     "description": (
         "查询本地保存的读书笔记列表（含时间、书名、标签、内容）。"
         "用户想回顾、整理或查看之前记录的笔记时调用；可按书名或时间范围过滤。"
+        "仅当用户明确要求发送笔记对应的书页截图（如「把截图发过来」「发图片」）时，"
+        "send_images 才传 true，否则默认 false。"
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "days": {"type": "integer", "description": "查询最近几天的笔记，默认 7 天"},
             "book_name": {"type": "string", "description": "按书名过滤，留空则返回所有书的笔记"},
+            "send_images": {
+                "type": "boolean",
+                "description": "是否同时通过飞书发送笔记关联的书页截图。仅当用户明确要求发截图时为 true，默认 false。",
+            },
         },
         "required": [],
     },

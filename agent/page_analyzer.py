@@ -59,8 +59,14 @@ class ProactivePageAnalyzer:
                 timeout=8.0,
             )
             if resp and resp.text:
-                self.memory.proactive_page_hint = resp.text.strip()
-                book_title = book_context.get("book_title", "")
+                import re
+                hint = resp.text.strip()
+                # 去掉 AI 可能返回的 Markdown 格式（**标题**、# 等）
+                hint = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', hint)
+                hint = re.sub(r'^#{1,6}\s*', '', hint, flags=re.MULTILINE)
+                self.memory.proactive_page_hint = hint
+                # 分析完成时从 memory 取最新书名（book_context 是调用时的快照，可能已过时）
+                book_title = self.memory.current_book_context.get("book_title", "")
                 logger.info(
                     f"页面预分析完成（{'《' + book_title + '》' if book_title else '未知书籍'}）: "
                     f"{self.memory.proactive_page_hint[:60]}…"

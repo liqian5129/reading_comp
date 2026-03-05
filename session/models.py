@@ -79,6 +79,7 @@ class Note:
     book_name: str = ""              # 书名（可为空）
     tags: List[str] = field(default_factory=list)  # 用户自定义标签
     page_ocr_context: str = ""       # 记录时的页面 OCR 上下文
+    image_path: str = ""             # 记录时的书页截图路径
 
     def to_dict(self) -> dict:
         return asdict(self)

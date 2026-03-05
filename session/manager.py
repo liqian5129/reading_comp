@@ -144,6 +144,7 @@ class SessionManager:
         page_context: str = "",
         book_name: str = "",
         tags: list = None,
+        image_path: str = "",
     ) -> Note:
         """
         添加笔记（无需活跃会话）
@@ -169,6 +170,7 @@ class SessionManager:
             book_name=book_name,
             tags=tags or [],
             page_ocr_context=page_context,
+            image_path=image_path,
         )
 
         note_id = await self.storage.add_note(note)

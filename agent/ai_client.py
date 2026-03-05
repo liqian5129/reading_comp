@@ -40,12 +40,15 @@ class AIClient:
     支持 Kimi (Moonshot) 和豆包 (Volces/字节)
     """
     
-    def __init__(self, 
+    def __init__(self,
                  provider: str = "kimi",
                  api_key: str = "",
                  model: str = "",
                  base_url: str = "",
-                 enable_thinking: bool = False):
+                 enable_thinking: bool = False,
+                 max_retries: int = 2,
+                 timeout: float = 60.0,
+                 reasoning_effort: Optional[str] = None):
         """
         Args:
             provider: 提供商 - "kimi" 或 "doubao"
@@ -53,18 +56,23 @@ class AIClient:
             model: 模型名称
             base_url: API 基础 URL
             enable_thinking: 是否启用思考模式（仅 Kimi K2.5 有效）
+            timeout: HTTP 请求超时秒数，应比外层 asyncio.wait_for 小
+            reasoning_effort: 豆包 seed 系列思考强度 "minimal"|"low"|"medium"|"high"，
+                              None 表示不传（模型默认）；OCR 等任务建议 "minimal"
         """
         self.provider = provider.lower()
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
         self.enable_thinking = enable_thinking
-        
-        # 创建 OpenAI 客户端，添加详细的 HTTP 日志
+        self.reasoning_effort = reasoning_effort
+
+        # 创建 OpenAI 客户端
         self.client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=60.0,
+            timeout=timeout,
+            max_retries=max_retries,
         )
         
         logger.info(f"🤖 AI 客户端初始化: {provider} / {model}")
@@ -164,6 +172,62 @@ class AIClient:
             })
         return converted
     
+    async def _chat_responses_api(self,
+                                  user_message: str,
+                                  image_path: str,
+                                  max_tokens: int) -> LLMResponse:
+        """
+        豆包 seed 系列专用：使用 Responses API（非 Chat Completions）。
+        格式：input_image / input_text，接口：client.responses.create()
+        """
+        image_data = self._encode_image(image_path)
+        content = []
+        if image_data:
+            content.append({"type": "input_image", "image_url": image_data})
+        content.append({"type": "input_text", "text": user_message})
+
+        request_json = json.dumps({"model": self.model, "input": [{"role": "user", "content": content}]})
+        request_size_kb = len(request_json.encode("utf-8")) / 1024
+
+        logger.info("=" * 60)
+        logger.info(f"📤 AI 请求开始 [Responses API]")
+        logger.info(f"   模型: {self.model}")
+        logger.info(f"   请求大小: {request_size_kb:.2f} KB")
+        logger.info("-" * 60)
+
+        t0 = time.time()
+        try:
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[{"role": "user", "content": content}],
+                max_output_tokens=max_tokens,
+            )
+            elapsed_ms = (time.time() - t0) * 1000
+
+            # 提取文本：output[0].content[0].text
+            text = ""
+            try:
+                text = response.output[0].content[0].text or ""
+            except (AttributeError, IndexError):
+                # 兜底：尝试 output_text 属性
+                text = getattr(response, "output_text", "") or ""
+
+            logger.info(f"📥 AI 响应完成 [Responses API]")
+            logger.info(f"   总耗时: {elapsed_ms:.0f} ms")
+            logger.info(f"   响应大小: {len(text.encode('utf-8')) / 1024:.2f} KB")
+            logger.info("=" * 60)
+
+            return LLMResponse(text=text, tool_calls=[], stop_reason="stop")
+
+        except Exception as e:
+            elapsed_ms = (time.time() - t0) * 1000
+            logger.error(f"❌ Responses API 调用失败 ({elapsed_ms:.0f} ms): {type(e).__name__}: {e}")
+            return LLMResponse(
+                text=f"抱歉，我遇到了一些问题: {str(e)}",
+                tool_calls=[],
+                stop_reason="error",
+            )
+
     async def chat(self,
                    user_message: str,
                    system_prompt: str = "",
@@ -174,7 +238,7 @@ class AIClient:
         """与 AI 对话 - 带详细计时"""
         if history is None:
             history = []
-        
+
         messages = self._build_messages(
             system_prompt, history, user_message, image_path
         )
@@ -199,11 +263,14 @@ class AIClient:
             extra_body = self._get_extra_body()
             if extra_body:
                 kwargs["extra_body"] = extra_body
-            
+
+            if self.reasoning_effort:
+                kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), "reasoning_effort": self.reasoning_effort}
+
             if tools:
                 kwargs["tools"] = self._convert_tools(tools)
                 kwargs["tool_choice"] = "auto"
-            
+
             logger.info("=" * 60)
             logger.info(f"📤 AI 请求开始")
             logger.info(f"   模型: {self.model}")

@@ -44,16 +44,19 @@ POINT_COLORS = [
 ]
 
 
+DISPLAY_MAX_W = 1280  # 显示窗口最大宽度，防止超出屏幕导致鼠标回调坐标错乱
+
+
 class CalibrationUI:
     def __init__(self, camera: CameraCapture, output_w: int, output_h: int):
         self.camera = camera
         self.output_w = output_w
         self.output_h = output_h
-        # 窗口尺寸 = 帧尺寸，鼠标坐标直接就是图像坐标，无需换算
-        self.points = []
+        self.points = []  # 存储原始图像坐标
         self.preview_mode = False
         self.M = None
         self._win_initialized = False
+        self._display_scale = 1.0  # 显示缩放比例（原图→显示窗口）
 
     def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
         """在原始分辨率帧上绘制已选点、连线、提示文字"""
@@ -105,8 +108,12 @@ class CalibrationUI:
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(self.points) < 4:
-            self.points.append((x, y))
-            print(f"  已选 {len(self.points)}/4: {POINT_LABELS[len(self.points)-1]} ({x}, {y})")
+            # 将显示坐标转换回原始图像坐标
+            orig_x = int(x / self._display_scale)
+            orig_y = int(y / self._display_scale)
+            self.points.append((orig_x, orig_y))
+            print(f"  已选 {len(self.points)}/4: {POINT_LABELS[len(self.points)-1]} "
+                  f"显示({x}, {y}) → 原图({orig_x}, {orig_y})")
 
     def run(self):
         win = "透视校正标定 (点击4个角点)"
@@ -128,14 +135,26 @@ class CalibrationUI:
             last_frame = frame
             h, w = frame.shape[:2]
 
-            # 首帧时把窗口设为摄像头原始分辨率
+            # 首帧时计算显示缩放比例，确保窗口不超出屏幕
             if not self._win_initialized:
-                cv2.resizeWindow(win, w, h)
+                if w > DISPLAY_MAX_W:
+                    self._display_scale = DISPLAY_MAX_W / w
+                else:
+                    self._display_scale = 1.0
+                disp_w = int(w * self._display_scale)
+                disp_h = int(h * self._display_scale)
+                cv2.resizeWindow(win, disp_w, disp_h)
                 self._win_initialized = True
-                print(f"显示窗口: {w} x {h}（原始分辨率，可拖拽窗口边缘缩放）")
+                print(f"摄像头分辨率: {w}x{h}，显示窗口: {disp_w}x{disp_h}"
+                      f"（缩放比例 {self._display_scale:.2f}，点击坐标已自动换算）")
 
             if self.preview_mode and self.M is not None:
                 warped = cv2.warpPerspective(frame, self.M, (self.output_w, self.output_h))
+                # 预览也缩放显示
+                prev_scale = min(1.0, DISPLAY_MAX_W / self.output_w)
+                if prev_scale < 1.0:
+                    warped = cv2.resize(warped, (int(self.output_w * prev_scale),
+                                                 int(self.output_h * prev_scale)))
                 out_h, out_w = warped.shape[:2]
                 bar_h = max(50, int(80 * out_w / 1280))
                 fs = max(0.4, 0.65 * out_w / 1280)
@@ -148,7 +167,13 @@ class CalibrationUI:
                             cv2.FONT_HERSHEY_SIMPLEX, fs, COLOR_TEXT, lw)
                 cv2.imshow(win, warped)
             else:
-                cv2.imshow(win, self._draw_overlay(frame))
+                display_frame = self._draw_overlay(frame)
+                if self._display_scale < 1.0:
+                    display_frame = cv2.resize(
+                        display_frame,
+                        (int(w * self._display_scale), int(h * self._display_scale))
+                    )
+                cv2.imshow(win, display_frame)
 
             key = cv2.waitKey(30) & 0xFF
 

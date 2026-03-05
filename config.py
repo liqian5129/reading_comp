@@ -139,6 +139,14 @@ class Config:
         # 独立 API key，避免与主对话共享 rate limit；未配置时降级使用主 key
         self.KIMI_OCR_API_KEY = self._get("kimi_ocr", "api_key", "") or self.KIMI_API_KEY
 
+        # 双 OCR 链路配置
+        self.VISION_OCR_PRIMARY = self._get("vision_ocr", "primary", "kimi")  # "kimi" | "doubao"
+        # 豆包 OCR 接入点 ID（ep-xxxxxxxxx）和 API Key，与主对话豆包配置相互独立
+        self.DOUBAO_OCR_MODEL   = self._get("vision_ocr", "doubao_model", "") or self.DOUBAO_MODEL
+        self.DOUBAO_OCR_API_KEY = (
+            self._get("vision_ocr", "doubao_api_key", "") or self.DOUBAO_API_KEY
+        )
+
         # 透视校正（固定挂载摄像头，一次标定后长期使用）
         self.PERSPECTIVE_ENABLED = self._get("perspective", "enabled", False)
         self.PERSPECTIVE_HOMOGRAPHY_FILE = self._get(
@@ -152,6 +160,7 @@ class Config:
         self.SNAPSHOTS_DIR = self.DATA_DIR / "snapshots"
         self.NOTES_DIR = self.DATA_DIR / "notes"
         self.KIMI_OCR_RESULTS_DIR = self.DATA_DIR / "kimiocr_results"
+        self.DOUBAO_OCR_RESULTS_DIR = self.DATA_DIR / "doubaoocr_results"
         self.PERSONA_FILE = self.DATA_DIR / "persona.json"
         self.LONG_TERM_MEMORY_FILE = self.DATA_DIR / "long_term_memory.json"
         self.MEMORY_DIR = self.DATA_DIR / "memory"

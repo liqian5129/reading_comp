@@ -21,12 +21,16 @@ class NoteTools:
         book_name = params.get("book_name", "")
         tags = params.get("tags") or []
         page_context = self.deps.memory.current_page_ocr
+        image_path = ""
+        if params.get("save_image"):
+            image_path = getattr(self.deps.memory, "current_page_image", "") or ""
 
         note = await self.deps.session_manager.add_note(
             content=content,
             page_context=page_context,
             book_name=book_name,
             tags=tags,
+            image_path=image_path,
         )
 
         book_hint = f"《{note.book_name}》" if note.book_name else ""
@@ -119,6 +123,17 @@ class NoteTools:
                 "tags": n.tags,
                 "content": n.content,
             })
+
+        # 仅当用户明确要求发截图时才推送
+        if params.get("send_images"):
+            feishu_pusher = getattr(self.deps, "feishu_pusher", None)
+            feishu_chat_id = getattr(self.deps, "feishu_chat_id", None)
+            if feishu_pusher and feishu_chat_id:
+                notes_with_image = [n for n in notes if n.image_path]
+                if notes_with_image:
+                    asyncio.create_task(
+                        feishu_pusher.push_notes_images(feishu_chat_id, notes_with_image)
+                    )
 
         scope = f"《{book_filter}》" if book_filter else f"最近 {days} 天"
         return {
