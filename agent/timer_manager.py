@@ -18,11 +18,15 @@ class ReadingTimerManager:
         self._tasks: Dict[int, asyncio.Task] = {}  # timer_id -> Task
         self._next_id = 1
         self._tts_player = None        # 由外部注入
+        self._recorder = None          # 由外部注入（VoiceRecorder）
         self._feishu_pusher = None     # 由外部注入
         self._feishu_chat_id: str = ""
 
     def set_tts_player(self, player):
         self._tts_player = player
+
+    def set_recorder(self, recorder):
+        self._recorder = recorder
 
     def set_feishu(self, pusher, chat_id: str):
         self._feishu_pusher = pusher
@@ -74,9 +78,21 @@ class ReadingTimerManager:
 
             logger.info(f"⏰ 定时器触发: {timer_id} - {message}")
 
-            # TTS 播报
+            # TTS 播报（等待 TTS 播放结束 & 用户未在录音时再播）
             if self._tts_player and message:
                 try:
+                    wait_timeout = 120  # 最多等 120s
+                    waited = 0.0
+                    interval = 0.3
+                    while waited < wait_timeout:
+                        tts_busy = self._tts_player.is_playing() if hasattr(self._tts_player, "is_playing") else False
+                        rec_busy = self._recorder.is_busy() if self._recorder and hasattr(self._recorder, "is_busy") else False
+                        if not tts_busy and not rec_busy:
+                            break
+                        await asyncio.sleep(interval)
+                        waited += interval
+                    if waited >= wait_timeout:
+                        logger.warning(f"⏰ 定时器 {timer_id}: 等待播放窗口超时，强制播报")
                     await self._tts_player.speak(message, interrupt=False)
                 except Exception as e:
                     logger.error(f"TTS 播报失败: {e}")

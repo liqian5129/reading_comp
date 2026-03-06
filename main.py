@@ -392,6 +392,7 @@ class ReadingCompanion:
         await self.tts_player.start()
         # 把 TTS 注入定时器（无论飞书是否启用都能播报）
         self.timer_manager.set_tts_player(self.tts_player)
+        self.timer_manager.set_recorder(self.recorder)
 
         # 8. 飞书 Bot（可选）
         if config.FEISHU_ENABLED and config.FEISHU_APP_ID and config.FEISHU_APP_SECRET:
