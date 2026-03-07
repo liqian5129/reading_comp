@@ -16,13 +16,16 @@ READING_NOTE_TOOL = {
         "保存一条读书笔记到本地。书名优先从当前阅读上下文自动获取，无需用户指定。"
         "用户明确要求记录（摘抄、记下来、做笔记）时调用；"
         "用户表达值得记录的个人感悟、联想或新发现时也可主动调用。"
+        "【多句合并】若用户要求把多个句子/段落「存在一起」「一起记下来」，"
+        "必须从 OCR 文本中依次找到这些句子并拼接为一条 content，只调用一次工具，不要拆分成多次调用。"
+        "「这句话的后面这句话」「后面那段」等指 OCR 文本中紧跟当前句子之后的内容，需从 OCR 原文中提取。"
         "仅当用户明确要求同时保存当前书页截图（如「把这页图片一起记下来」「附上截图」）时，"
         "save_image 才传 true，否则默认 false。"
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "content": {"type": "string", "description": "笔记内容"},
+            "content": {"type": "string", "description": "笔记内容。可包含多个句子或段落，当用户要求合并保存时在此字段中拼接全部内容"},
             "book_name": {"type": "string", "description": "书名，从对话上下文中识别，用户未提及则留空"},
             "tags": {
                 "type": "array",
@@ -40,11 +43,11 @@ READING_NOTE_TOOL = {
 
 READING_HISTORY_TOOL = {
     "name": "reading_history",
-    "description": "查询本次及近期的阅读会话记录（时长、翻页数、笔记数）。用户询问今天或近期读书情况时调用。",
+    "description": "查询阅读历史记录（时长、翻页数、笔记数、阅读内容摘要）。用户询问某段时间的读书情况时调用。",
     "input_schema": {
         "type": "object",
         "properties": {
-            "days": {"type": "integer", "description": "查询最近几天的记录，默认 7 天"},
+            "days": {"type": "integer", "description": "查询最近几天的记录。今天=1，近3天=3，这周=7，这月=30，全部历史=0。默认1"},
         },
         "required": [],
     },
@@ -164,15 +167,15 @@ READING_LIST_MANAGE_TOOL = {
 READING_STATS_TOOL = {
     "name": "reading_stats",
     "description": (
-        "查询阅读统计摘要（翻页数、时长、笔记数、书签数），可按天/周/月/全部统计。"
+        "查询阅读统计摘要（翻页数、时长、笔记数、书签数）。"
         "用户询问阅读量或阅读习惯时调用。"
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "period": {
-                "type": "string",
-                "description": "统计周期: today（今天）/ week（近7天）/ month（近30天）/ all（全部），默认 today",
+            "days": {
+                "type": "integer",
+                "description": "统计最近几天。今天=1，近3天=3，这周=7，这月=30，全部历史=0。默认1",
             },
             "book_title": {"type": "string", "description": "按书名过滤，留空则统计全部书"},
         },
@@ -208,6 +211,8 @@ GENERATE_READING_CARD_TOOL = {
     "name": "generate_reading_card",
     "description": (
         "生成阅读卡片（金句/知识点/摘要）并推送到飞书。"
+        "用户想整理今天/本次阅读内容、生成阅读摘要发飞书时：传 card_type='summary'，不传 content，"
+        "工具会自动使用本次会话累积的阅读摘要作为内容。"
         "用户想将微信读书笔记/划线做成卡片时：只传 book_title，不要自己填写 content，"
         "工具会自动从微信读书数据库取用户真实的划线和笔记作为内容。"
         "用户想将当前书页做成卡片时：只传 card_type，内容自动使用摄像头 OCR。"
@@ -219,6 +224,10 @@ GENERATE_READING_CARD_TOOL = {
             "card_type": {
                 "type": "string",
                 "description": "卡片类型: quote（金句）/ knowledge（知识点）/ summary（摘要）",
+            },
+            "days": {
+                "type": "integer",
+                "description": "summary 类型时的时间范围（天数）。今天=1，近3天=3，这周=7，这月=30，以此类推。默认1",
             },
             "content": {"type": "string", "description": "卡片内容。仅在用户口述了具体文字时填写；其余情况留空，工具自动从微信读书或 OCR 取内容，禁止填入你推测或从训练知识生成的文字。"},
             "book_title": {"type": "string", "description": "来源书名，提供后工具自动从微信读书数据库取该书的真实划线和笔记"},
@@ -383,6 +392,12 @@ class ToolRegistry:
     def get_tools(self) -> List[Dict]:
         """获取所有工具定义"""
         return list(self.tools.values())
+
+    def get_tools_for_names(self, names: Optional[List[str]]) -> List[Dict]:
+        """按名称列表返回工具定义；names=None 返回全量"""
+        if names is None:
+            return list(self.tools.values())
+        return [self.tools[n] for n in names if n in self.tools]
 
     def get_tool(self, name: str) -> Optional[Dict]:
         """获取单个工具定义"""

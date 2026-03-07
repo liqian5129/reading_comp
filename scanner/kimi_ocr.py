@@ -21,10 +21,16 @@ logger = logging.getLogger(__name__)
 OCR_PROMPT = """请识别图片里拍摄的书页内容，完整整理给我。
 请严格按以下格式返回，不要输出其他内容：
 
-<meta>{"book_title":"书名","page_num":页码数字,"chapter":"章节名（无则留空）"}</meta>
+<meta>{"book_title":"书名","page_num":页码数字,"page_num_confidence":0.0到1.0,"visible_pages":1或2,"chapter":"章节名（无则留空）","is_reading":true/false}</meta>
 <content>
 （书页完整正文，双页时左页在前右页在后，保持原文换行和段落）
-</content>"""
+</content>
+
+字段说明：
+- page_num: 页面上印刷的页码数字（双页时填左页页码），找不到则填 0
+- page_num_confidence: 页码识别置信度。清晰可见=1.0，模糊/部分遮挡=0.5，猜测/推断=0.2，无页码=0
+- visible_pages: 画面中可见的书页数量。书摊开露出左右两页=2，只有单页=1
+- is_reading: 书本打开且能看到正文内容=true；书本合上、没有书、空桌面、画面模糊无法阅读=false。画面中能看到手指、笔、荧光笔等互动痕迹也视为 true"""
 
 
 def _compress_image(image_path: str, max_side: int) -> str:
@@ -210,10 +216,11 @@ class KimiOCR:
                 except Exception as e:
                     logger.error(f"KimiOCR on_text_ready 回调失败: {e}")
 
-            # 6. 回调书籍元数据（→ 翻页/换书检测）
-            if meta and meta.get("book_title") and self.on_book_info:
-                # 补充 confidence 字段以兼容 _on_book_detected 的置信度检查
+            # 6. 回调书籍元数据（→ 阅读活动记录 + 翻页检测）
+            #    只要有 meta 就回调（is_reading 用于计算阅读时长，page_num/book_title 用于翻页统计）
+            if meta and self.on_book_info:
                 meta.setdefault("confidence", 1.0)
+                meta["ocr_chars"] = len(content)
                 try:
                     self.on_book_info(meta, image_path)
                 except Exception as e:

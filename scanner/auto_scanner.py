@@ -5,10 +5,7 @@
 1. 拍照（持久化摄像头连接，无开关开销）
 2. OCR 识别（独立子进程，不阻塞主程序；PaddleOCR 内置 UVDoc 书页矫正）
 3. 若识别到文字 → 调用 on_snapshot 更新 AI 上下文
-
-阅读 session 激活后额外执行：
-4. 翻页检测
-5. 存数据库
+4. 翻页/换书检测 → 调用 on_book_info 记录阅读活动
 """
 import asyncio
 import logging
@@ -75,15 +72,13 @@ class AutoScanner:
     """
     自动扫描器
 
-    始终在后台运行（无需阅读 session）：
+    始终在后台运行：
     - on_snapshot 在每次 OCR 有结果时被调用，供上层更新 AI 上下文
-
-    阅读 session 期间（set_session 后）：
-    - 检测翻页并将快照存入数据库
+    - on_book_info 在识别到页码/书名时被调用，供上层记录阅读活动
     """
 
-    def __init__(self, session_manager):
-        self.session_manager = session_manager
+    def __init__(self, session_manager=None):
+        self.session_manager = session_manager  # 保留引用兼容，但不用于 session 管理
         self.interval = config.AUTO_SCAN_INTERVAL
 
         # 持久化摄像头（避免每次开关的开销）
@@ -96,16 +91,13 @@ class AutoScanner:
         self._running = False
         self._scan_task: Optional[asyncio.Task] = None
 
-        # 会话相关（可选）
-        self._session_id: Optional[str] = None
         self._last_fingerprint: Optional[str] = None
-        self._last_snapshot_id: Optional[int] = None
         self._page_turn_count = 0
 
         # 回调
         self.on_page_turn: Optional[Callable] = None
         self.on_snapshot: Optional[Callable[[str, str], None]] = None
-        self.on_book_info: Optional[Callable[[dict], None]] = None
+        self.on_book_info: Optional[Callable[[dict, str], None]] = None
 
         # KimiOCR（可选，替代本地 PaddleOCR）
         self._kimi_ocr = None
@@ -166,13 +158,11 @@ class AutoScanner:
             self._executor.shutdown(wait=False)
             self._executor = None
 
-        self._session_id = None
         self._last_fingerprint = None
-        self._last_snapshot_id = None
         logger.info("自动扫描已停止")
 
     # ------------------------------------------------------------------
-    # Session 控制
+    # 配置
     # ------------------------------------------------------------------
 
     def set_kimi_ocr(self, kimi_ocr):
@@ -183,21 +173,6 @@ class AutoScanner:
     def set_voice_recorder(self, recorder):
         """绑定语音录音器，扫描时可感知 ASR 状态，避免与 OCR 争抢 CPU"""
         self._voice_recorder = recorder
-
-    def set_session(self, session_id: str):
-        """绑定阅读 session，后续扫描会存库并检测翻页"""
-        self._session_id = session_id
-        self._last_fingerprint = None
-        self._last_snapshot_id = None
-        self._page_turn_count = 0
-        logger.info(f"扫描器已绑定 session: {session_id}")
-
-    def clear_session(self):
-        """解绑 session，扫描器继续运行但不再存库"""
-        self._session_id = None
-        self._last_fingerprint = None
-        self._last_snapshot_id = None
-        logger.info("扫描器已解绑 session，仍继续后台扫描")
 
     # ------------------------------------------------------------------
     # 手动触发
@@ -232,20 +207,16 @@ class AutoScanner:
             self._last_page_num = page_num
             self._page_turn_count += 1
             logger.info(f"翻页: 第 {page_num} 页 ({self._page_turn_count} 次)")
-            if self._session_id:
-                asyncio.create_task(
-                    self.session_manager.add_snapshot(image_path, "", "")
-                )
             if self.on_page_turn:
                 try:
                     self.on_page_turn(self._page_turn_count)
                 except Exception as e:
                     logger.error(f"on_page_turn 回调失败: {e}")
 
-        # 通知上层更新书籍上下文
+        # 通知上层（记录阅读活动 + 更新书籍上下文）
         if self.on_book_info:
             try:
-                self.on_book_info(book_info)
+                self.on_book_info(book_info, image_path)
             except Exception as e:
                 logger.error(f"on_book_info 回调失败: {e}")
 
@@ -354,34 +325,7 @@ class AutoScanner:
                 except Exception as e:
                     logger.error(f"on_snapshot 回调失败: {e}")
 
-            # 6. Session 激活时才做翻页检测和存库
-            if not self._session_id:
-                return None
-
-            is_new_page = is_page_turn(self._last_fingerprint, fp)
-            should_save = force_save or is_new_page or self._last_fingerprint is None
-
-            if should_save:
-                snapshot = await self.session_manager.add_snapshot(
-                    str(image_path), ocr_text, fp
-                )
-                self._last_snapshot_id = snapshot.id
-                self._last_fingerprint = fp
-
-                if is_new_page:
-                    self._page_turn_count += 1
-                    logger.info(f"检测到翻页，第 {self._page_turn_count} 页")
-                    if self.on_page_turn:
-                        try:
-                            self.on_page_turn(self._page_turn_count)
-                        except Exception as e:
-                            logger.error(f"on_page_turn 回调失败: {e}")
-
-                logger.debug(f"快照已保存: {snapshot.id}")
-                return str(image_path), ocr_text, fp
-            else:
-                logger.debug("页面未变化，跳过保存")
-                return None
+            return str(image_path), ocr_text, fp
 
         except Exception as e:
             logger.error(f"扫描失败: {e}")
@@ -397,7 +341,6 @@ class AutoScanner:
     def get_stats(self) -> dict:
         return {
             "running": self._running,
-            "session_id": self._session_id,
             "page_turn_count": self._page_turn_count,
             "last_fingerprint": self._last_fingerprint,
         }

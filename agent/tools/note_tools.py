@@ -66,39 +66,52 @@ class NoteTools:
             logger.warning(f"_embed_note 失败（已降级）: {e}")
 
     async def exec_reading_history(self, params: Dict) -> Dict:
-        """查询阅读历史"""
-        days = params.get("days", 7)
+        """查询阅读历史（基于 OCR 事件流统计）"""
+        days = max(0, int(params.get("days", 1) or 1))
 
-        sessions = await self.deps.session_manager.get_today_sessions()
-        summary = await self.deps.session_manager.get_today_summary()
+        stats = await self.deps.session_manager.get_reading_stats(days=days)
 
-        if not sessions:
-            return {
-                "success": True,
-                "message": "今天还没有阅读记录",
-                "sessions": [],
-                "total_duration": "0 分钟",
-                "total_pages": 0,
-            }
-
-        session_infos = []
-        for s in sessions:
-            notes = await self.deps.session_manager.get_session_notes(s.id)
-            session_infos.append({
-                "book": s.book_name or "未命名书籍",
-                "duration": s.duration_str,
-                "pages": s.total_pages,
-                "notes_count": len(notes),
-            })
-
-        return {
+        result = {
             "success": True,
-            "message": f"今天共阅读 {len(sessions)} 个会话，总计 {summary.duration_str}",
-            "sessions": session_infos,
-            "total_duration": summary.duration_str,
-            "total_pages": summary.total_pages,
-            "total_notes": summary.total_notes,
+            "total_pages": stats.get("total_pages", 0),
+            "total_duration": stats.get("duration_str", "0 分钟"),
+            "note_count": stats.get("note_count", 0),
+            "bookmark_count": stats.get("bookmark_count", 0),
+            "books_read": stats.get("books_read", []),
+            "ocr_events": stats.get("ocr_events", 0),
         }
+
+        period_label = "全部时间" if days == 0 else ("今天" if days == 1 else f"近{days}天")
+        if stats.get("total_pages", 0) == 0 and stats.get("ocr_events", 0) == 0:
+            result["message"] = f"{period_label}还没有阅读记录"
+        else:
+            books_str = "、".join(f"《{b}》" for b in stats.get("books_read", []) if b) or "未知书籍"
+            result["message"] = (
+                f"{period_label}阅读了 {books_str}，"
+                f"翻页 {stats['total_pages']} 页，"
+                f"阅读 {stats['duration_str']}，"
+                f"笔记 {stats['note_count']} 条"
+            )
+
+        # 附加历史阅读摘要
+        storage = getattr(self.deps, "storage", None)
+        if storage:
+            try:
+                recent_digests = await storage.get_recent_digests(days=days)
+                if recent_digests:
+                    from datetime import datetime
+                    result["reading_digests"] = [
+                        {
+                            "book": d["book_title"],
+                            "summary": d["digest_text"][:200],
+                            "date": datetime.fromtimestamp(d["created_at"] / 1000).strftime("%m-%d %H:%M"),
+                        }
+                        for d in recent_digests[:5]
+                    ]
+            except Exception as e:
+                logger.debug(f"reading_history: 获取历史摘要失败（已降级）: {e}")
+
+        return result
 
     async def exec_reading_notes(self, params: Dict) -> Dict:
         """查询笔记内容列表"""

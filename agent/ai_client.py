@@ -543,7 +543,7 @@ class AIClient:
                             tc_accum[idx]["arguments"] += tc.function.arguments
         except Exception as e:
             logger.error(f"流式 AI 请求失败: {e}")
-            yield LLMStreamChunk(type="text_delta", content=f"抱歉，出错了：{e}")
+            yield LLMStreamChunk(type="text_delta", content="抱歉，我没有理解，请再说一遍。")
             yield LLMStreamChunk(type="done")
             return
 

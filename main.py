@@ -95,9 +95,9 @@ from agent.memory import Memory
 from agent.embedder import Embedder
 from agent.memory_consolidator import MemoryConsolidator
 from agent.tools import ToolRegistry, ToolDispatcher
+from agent.tool_selector import ToolSelector, SIMPLE_TOOL_REPLIES
 from agent.timer_manager import ReadingTimerManager
 from agent.knowledge_linker import KnowledgeLinker
-from agent.page_analyzer import ProactivePageAnalyzer
 from scanner.auto_scanner import AutoScanner
 from voice.asr import create_asr
 from voice.recorder import VoiceRecorder
@@ -134,8 +134,8 @@ class ReadingCompanion:
         self.memory: Optional[Memory] = None
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_dispatcher: Optional[ToolDispatcher] = None
+        self.tool_selector: Optional[ToolSelector] = None
         self.knowledge_linker: Optional[KnowledgeLinker] = None
-        self.page_analyzer: Optional[ProactivePageAnalyzer] = None
         self.scanner: Optional[AutoScanner] = None
         self._kimi_ocr = None
         self.timer_manager: Optional[ReadingTimerManager] = None
@@ -156,6 +156,7 @@ class ReadingCompanion:
         self._last_valid_ocr_ts: float = time.time()  # 上次有效 OCR 的时间戳
         self._msg_lock = asyncio.Lock()  # 防止并发处理用户消息
         self._ai_task: Optional[asyncio.Task] = None
+        self._last_page_text: str = ""  # 上一次 OCR 文本（用于内容比对翻页检测）
         
     async def initialize(self):
         """初始化所有模块"""
@@ -233,12 +234,18 @@ class ReadingCompanion:
                 self.memory.long_term.session_recall = "\n---\n".join(recent_summaries)
                 logger.info(f"已加载 {len(recent_summaries)} 条历史会话摘要到 session_recall")
 
+        # 启动时恢复今日阅读摘要（跨会话连续）
+        today_digests = await self.storage.get_recent_digests(days=1)
+        if today_digests:
+            self.memory.session_reading_digest = today_digests[0]["digest_text"]
+            logger.info(f"已恢复今日阅读摘要（{len(self.memory.session_reading_digest)}字）")
+
         self.tool_registry = ToolRegistry()
+        self.tool_selector = ToolSelector(self.llm)
         self.timer_manager = ReadingTimerManager()
 
-        # KnowledgeLinker + ProactivePageAnalyzer（依赖 embedder/storage）
+        # KnowledgeLinker（依赖 embedder/storage）
         self.knowledge_linker = KnowledgeLinker(self.embedder, self.storage)
-        self.page_analyzer = ProactivePageAnalyzer(self.llm, self.memory)
 
         # 4. 扫描器
         self.scanner = AutoScanner(self.session_manager)
@@ -489,6 +496,14 @@ class ReadingCompanion:
             except Exception as e:
                 logger.error(f"shutdown 巩固失败: {e}")
 
+        # 确保未满10页的 buffer 内容也被压缩保存
+        if self.memory and self.memory._new_pages_buffer and self.llm and self.storage:
+            logger.info("Shutdown: 压缩剩余阅读 buffer...")
+            try:
+                await asyncio.wait_for(self._compress_reading_digest(), timeout=8.0)
+            except Exception:
+                pass
+
         if self.storage:
             await self.storage.close()
 
@@ -564,13 +579,19 @@ class ReadingCompanion:
         start_time = time.time()
 
         try:
+            # Stage 0：LLM 选择工具；超时/失败时降级为纯文本回答
+            selected_names = await self.tool_selector.select(text)
+            if selected_names is None:
+                selected_names = []
+            tools = self.tool_registry.get_tools_for_names(selected_names)
             system_prompt = self.memory.build_system_prompt(user_text=text)
             history = self.memory.get_history()
-            tools = self.tool_registry.get_tools()
             page_ctx_len = len(self.memory.current_page_ocr)
-            logger.info(f"   历史消息数: {len(history)}, 工具数: {len(tools)}, "
-                        f"书页上下文: {page_ctx_len}字"
-                        + (" ✓" if page_ctx_len else " (无)"))
+            total_tools = len(self.tool_registry.get_tools())
+            logger.info(
+                f"   工具选择: {selected_names} ({len(tools)}/{total_tools}个), "
+                f"书页上下文: {page_ctx_len}字" + (" ✓" if page_ctx_len else " (无)")
+            )
 
             MAX_ROUNDS = 5
             round_count = 0
@@ -661,14 +682,35 @@ class ReadingCompanion:
 
                 # 执行工具
                 tool_results = []
+                raw_results = []
                 for tc in tool_calls:
                     result = await self.tool_dispatcher.execute(tc["name"], tc["input"])
+                    raw_results.append(result)
                     tool_results.append({"tool_use_id": tc["id"], "content": str(result)})
 
                 # 记录本轮工具调用（暂存，稍后按正确顺序写入 history）
                 pending_tool_rounds.append((raw_assistant_msg, tool_results))
 
-                # 续轮 stream kwargs
+                # 简单工具：跳过 Round 2，直接返回确认文案
+                if all(tc["name"] in SIMPLE_TOOL_REPLIES for tc in tool_calls):
+                    confirmations = []
+                    for tc, result in zip(tool_calls, raw_results):
+                        template = SIMPLE_TOOL_REPLIES[tc["name"]]
+                        if template is None:
+                            msg = result.get("message", "完成。") if isinstance(result, dict) else "完成。"
+                            confirmations.append(msg)
+                        else:
+                            confirmations.append(template)
+                    reply = "".join(confirmations)
+                    reply_parts.append(reply)
+                    if first_tts_enqueue_time is None:
+                        first_tts_enqueue_time = time.time()
+                    if channel == "voice":
+                        await self.tts_player.speak(reply, interrupt=False)
+                    logger.info(f"⚡ 简单工具，跳过 Round 2: {reply}")
+                    break
+
+                # 续轮 stream kwargs（复杂工具继续走 Round 2）
                 stream_kwargs = dict(
                     user_message=text,
                     system_prompt=system_prompt,
@@ -756,12 +798,84 @@ class ReadingCompanion:
                 self.tool_dispatcher.feishu_chat_id = chat_id
         return await self._process_user_message(text, channel="feishu")
     
-    def _on_book_detected(self, vision_result: dict):
-        """视觉分析回调：更新书籍上下文"""
-        book_title = vision_result.get("book_title", "")
-        confidence = vision_result.get("confidence", 0)
+    @staticmethod
+    def _is_content_page_turn(old_text: str, new_text: str) -> bool:
+        """基于 OCR 文本内容比对判断是否翻页（Jaccard 字符集相似度）"""
+        if not old_text:
+            return True  # 首次有内容，算第一页
+        # 取前 150 字比较（页首最稳定，避免 OCR 尾部噪声）
+        old_chars = set(old_text[:150])
+        new_chars = set(new_text[:150])
+        if not old_chars or not new_chars:
+            return True
+        jaccard = len(old_chars & new_chars) / len(old_chars | new_chars)
+        return jaccard < 0.4  # 相似度 < 40% 视为新页
+
+    def _on_book_detected(self, book_info: dict, image_path: str = ""):
+        """OCR 元数据回调：记录阅读活动 + 更新书籍上下文"""
+        import time as _time
+        book_title = book_info.get("book_title", "")
+        page_num = book_info.get("page_num", -1)
+        if isinstance(page_num, list):
+            page_num = page_num[0] if page_num else -1
+        if page_num is None:
+            page_num = -1
+        ocr_chars = book_info.get("ocr_chars", 0)
+
+        # is_reading=false 时不记录阅读活动（书合上/空桌面）
+        is_reading = book_info.get("is_reading", True)
+        if not is_reading:
+            logger.debug("📖 画面非阅读状态（is_reading=false），跳过记录")
+            return
+
+        # 每帧可见页数（书摊开双页=2，单页=1）
+        visible_pages = book_info.get("visible_pages", 1)
+        if not isinstance(visible_pages, int) or visible_pages not in (1, 2):
+            visible_pages = 1
+
+        # 内容比对翻页检测：当前 OCR 文本 vs 上一次
+        current_text = self.memory.current_page_ocr if self.memory else ""
+        pages_turned = 0
+        if current_text:
+            if self._is_content_page_turn(self._last_page_text, current_text):
+                pages_turned = visible_pages  # 双页拍摄翻一次 = 2 页
+                self._last_page_text = current_text
+                logger.info(f"📄 内容比对检测到翻页（+{visible_pages} 页）")
+            elif not self._last_page_text:
+                self._last_page_text = current_text
+
+        now_ts = int(_time.time() * 1000)
+
+        # 每次 is_reading=true 都记录到 reading_activity（用于计算阅读时长）
+        if self.session_manager:
+            asyncio.create_task(
+                self.session_manager.record_reading_activity(
+                    ts=now_ts,
+                    page_num=page_num if page_num > 0 else None,
+                    book_title=book_title,
+                    ocr_chars=ocr_chars,
+                    is_page_turn=pages_turned,
+                )
+            )
+
+        # 翻页时：将完整书页内容持久化到 reading_pages
+        if pages_turned > 0 and current_text and self.session_manager:
+            chapter = book_info.get("chapter", "")
+            asyncio.create_task(
+                self.session_manager.record_reading_page(
+                    ts=now_ts,
+                    book_title=book_title,
+                    page_num=page_num,
+                    chapter=chapter,
+                    visible_pages=visible_pages,
+                    ocr_text=current_text,
+                )
+            )
+
+        # 更新书籍上下文（仅供显示，不用于逻辑判断）
+        confidence = book_info.get("confidence", 0)
         if book_title and confidence >= 0.7:
-            self.memory.update_book_context(vision_result)
+            self.memory.update_book_context(book_info)
             logger.info(f"📚 书名已识别: 《{book_title}》（置信度 {confidence:.2f}）")
 
     def _print_ready_banner(self):
@@ -812,10 +926,48 @@ class ReadingCompanion:
         logger.info(f"📖 书页上下文已注入 ({len(ocr_text)}字) → 下次 AI 对话生效")
         logger.info(f"   预览: {preview}…")
 
-        # 翻页预分析（fire-and-forget，不阻塞）
-        if self.page_analyzer and len(ocr_text) > 50:
-            self.page_analyzer.on_page_changed(ocr_text, self.memory.current_book_context)
+        # 阅读内容积累：去重 + 计数 + 触发压缩
+        if self.memory and len(ocr_text.strip()) > 80:
+            ocr_hash = hash(ocr_text[:200])
+            if ocr_hash != self.memory._last_buffer_hash:
+                self.memory._last_buffer_hash = ocr_hash
+                page_num = self.memory.current_book_context.get("current_page_num", 0)
+                preview = ocr_text[:300].replace('\n', ' ')
+                self.memory._new_pages_buffer.append(f"第{page_num}页: {preview}")
+                self.memory._valid_page_count += 1
+                if self.memory._valid_page_count % 5 == 0:
+                    asyncio.create_task(self._compress_reading_digest())
     
+    async def _compress_reading_digest(self):
+        """将 buffer 中的新页内容压缩融入 session_reading_digest（fire-and-forget）"""
+        if not self.memory or not self.memory._new_pages_buffer:
+            return
+        new_pages = "\n".join(self.memory._new_pages_buffer)
+        current = self.memory.session_reading_digest
+        book_title = self.memory.current_book_context.get("book_title", "")
+
+        prompt = (
+            "请将以下阅读进度记录更新压缩（300字以内），保留内容脉络和重要概念，"
+            "直接输出压缩后的记录，不要说明：\n"
+            + (f"当前摘要：\n{current}\n\n" if current else "")
+            + f"新读到的书页：\n{new_pages}"
+        )
+        try:
+            resp = await asyncio.wait_for(
+                self.llm.chat(user_message=prompt, max_tokens=400),
+                timeout=8.0,
+            )
+            if resp and resp.text:
+                self.memory.session_reading_digest = resp.text.strip()
+                self.memory._new_pages_buffer = []
+                await self.storage.save_reading_digest(
+                    self.memory.session_reading_digest,
+                    book_title=book_title,
+                )
+                logger.info(f"阅读摘要已更新并持久化（{len(self.memory.session_reading_digest)}字）")
+        except Exception as e:
+            logger.debug(f"阅读摘要压缩失败（已降级）: {e}")
+
     async def _check_and_push_feishu(self):
         """检查并推送飞书总结"""
         if not self.feishu_bot or not self.summary_pusher:

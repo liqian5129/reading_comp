@@ -66,12 +66,11 @@ class ProgressTools:
 
     async def exec_reading_stats(self, params: Dict) -> Dict:
         """阅读统计"""
-        period = params.get("period", "today")
+        days = max(0, int(params.get("days", 1) or 1))
         book_title = params.get("book_title", "")
-        stats = await self.deps.session_manager.get_reading_stats(period=period, book_title=book_title)
+        stats = await self.deps.session_manager.get_reading_stats(days=days, book_title=book_title)
 
-        period_map = {"today": "今天", "week": "本周", "month": "本月", "all": "全部"}
-        period_label = period_map.get(period, period)
+        period_label = "全部" if days == 0 else (f"今天" if days == 1 else f"近{days}天")
         book_hint = f"《{book_title}》" if book_title else ""
 
         return {

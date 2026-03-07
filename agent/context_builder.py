@@ -70,11 +70,16 @@ class DynamicContextBuilder:
                 + (f"（{ctx['content_type']}）" if ctx.get("content_type") else "")
             )
 
-        # 5. 页面预分析 hint（仅 PAGE_CONTENT / GENERAL_CHAT 时注入）
-        if intent in (Intent.PAGE_CONTENT, Intent.GENERAL_CHAT):
-            page_hint = getattr(memory, "proactive_page_hint", None)
-            if page_hint:
-                parts.append(f"【页面预分析】\n{page_hint}")
+        # 5. 本次阅读内容积累（PAGE_CONTENT / GENERAL_CHAT / SHARING 时注入）
+        if intent in (Intent.PAGE_CONTENT, Intent.GENERAL_CHAT, Intent.SHARING):
+            digest = getattr(memory, "session_reading_digest", "")
+            buffer = getattr(memory, "_new_pages_buffer", [])
+            if digest:
+                parts.append(f"【本次阅读内容积累】\n{digest}")
+            elif buffer:
+                # 摘要尚未生成（不足5页），直接注入原始缓冲作为兜底
+                raw = "\n".join(buffer[-8:])  # 最近8页，避免超长
+                parts.append(f"【本次已读书页记录】\n{raw}")
 
         # 6. 当前页面 OCR 文本（按需）
         if config.needs_page_context and memory.current_page_ocr:
@@ -112,7 +117,9 @@ class DynamicContextBuilder:
 - 微信读书笔记 → weread_notebook 看书单 → weread_get_notes 看详情，禁止询问"要不要同步"
 - 阅读进度 → weread_progress（需书名），书名未知先查 reading_progress_query
 - 用户问"我读到哪了" → weread_get_notes 查微信书签 + reading_progress_query 查本地进度，合并回复
-- 金句卡 → weread_get_notes 取真实划线 → generate_reading_card(book_title=...) 不填 content""")
+- 金句卡 → weread_get_notes 取真实划线 → generate_reading_card(book_title=...) 不填 content
+- 整理/总结阅读内容发飞书 → 读取【本次阅读内容积累】（已在本提示词中）→ 调 reading_notes 取笔记 → 整合后调 generate_reading_card(card_type='summary', content=<综合摘要>, book_title=...)
+- 用户要一周/近期阅读总结 → 调 reading_history(days=7) 获取包含历史摘要的记录，再整合生成""")
 
         prompt = "\n\n".join(parts)
 
@@ -124,8 +131,6 @@ class DynamicContextBuilder:
             injected.append("prefetch")
         if config.needs_page_context and memory.current_page_ocr:
             injected.append(f"OCR({len(memory.current_page_ocr)}字)")
-        if intent in (Intent.PAGE_CONTENT, Intent.GENERAL_CHAT) and getattr(memory, "proactive_page_hint", None):
-            injected.append("预分析")
         logger.debug(
             f"[DynamicContext] intent={intent.value}, 注入节: {', '.join(injected) or '仅角色+工具策略'}, "
             f"prompt总长={len(prompt)}字"

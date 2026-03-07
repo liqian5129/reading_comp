@@ -14,8 +14,64 @@ class ShareTools:
     async def exec_generate_reading_card(self, params: Dict) -> Dict:
         """生成阅读卡片并推送飞书"""
         card_type = params.get("card_type", "quote")
+        days = max(1, int(params.get("days", 1) or 1))
         content = params.get("content", "").strip()
         book_title = params.get("book_title", "").strip()
+
+        # summary 类型：按时间窗口拉取阅读摘要 + 笔记
+        if not content and card_type == "summary":
+            # 从 DB 取该时间窗口内最新的累积摘要
+            digest = ""
+            storage = getattr(self.deps, "storage", None)
+            if storage:
+                try:
+                    digests = await storage.get_recent_digests(days=days)
+                    if digests:
+                        digest = digests[0]["digest_text"]
+                except Exception as e:
+                    logger.warning(f"加载阅读摘要失败: {e}")
+            # 若 DB 里没有（本次会话尚未触发压缩），退回内存中的 digest
+            if not digest:
+                digest = getattr(self.deps.memory, "session_reading_digest", "")
+
+            # 拉取该时间窗口的笔记
+            notes_text = ""
+            sm = getattr(self.deps, "session_manager", None)
+            if sm:
+                try:
+                    notes = await sm.get_recent_notes(days=days, limit=50)
+                    if notes:
+                        notes_text = "\n".join(f"- {n.content}" for n in notes)
+                except Exception as e:
+                    logger.warning(f"加载笔记失败: {e}")
+
+            # 拉取该时间窗口内的书页记录（跨会话，永久存储）
+            pages_text = ""
+            if storage:
+                try:
+                    pages = await storage.get_reading_pages(days=days)
+                    if pages:
+                        from datetime import datetime
+                        lines = []
+                        for p in pages:
+                            time_str = datetime.fromtimestamp(p["ts"] / 1000).strftime("%H:%M")
+                            book_hint = f"《{p['book_title']}》" if p["book_title"] else ""
+                            page_hint = f"第{p['page_num']}页" if p["page_num"] else ""
+                            chapter_hint = f"【{p['chapter']}】" if p["chapter"] else ""
+                            header = f"[{time_str} {book_hint}{page_hint}{chapter_hint}]"
+                            lines.append(f"{header}\n{p['ocr_text']}")
+                        pages_text = "\n\n".join(lines)[:4000]
+                except Exception as e:
+                    logger.warning(f"加载书页记录失败: {e}")
+
+            parts = []
+            if digest:
+                parts.append(f"【阅读摘要】\n{digest}")
+            if pages_text:
+                parts.append(f"【书页内容】\n{pages_text}")
+            if notes_text:
+                parts.append(f"【笔记】\n{notes_text}")
+            content = "\n\n".join(parts)
 
         # 有书名时，优先从 weread_storage 取用户真实划线/笔记，防止 AI 幻觉
         if book_title and self.deps.weread_storage and not content:
@@ -48,10 +104,11 @@ class ShareTools:
 
         card_content = content
         if self.deps.llm:
+            source_hint = f"近{days}天阅读内容" if (card_type == "summary" and days > 1) else ("今日阅读内容" if card_type == "summary" else "书页内容")
             prompt = (
-                f"请从以下书页内容中提炼一张「{type_label}卡片」，"
-                f"用简洁、有力的语言表达核心内容，100字以内。"
-                f"直接输出卡片内容，不要额外说明。\n\n书页内容：\n{content[:800]}"
+                f"请从以下{source_hint}中提炼一张「{type_label}卡片」，"
+                f"用简洁、有力的语言表达核心内容，200字以内。"
+                f"直接输出卡片内容，不要额外说明。\n\n{source_hint}：\n{content[:1500]}"
             )
             try:
                 resp = await self.deps.llm.chat(user_message=prompt, max_tokens=200)

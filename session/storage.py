@@ -10,7 +10,7 @@ from typing import Optional, List
 from pathlib import Path
 
 from .models import (
-    ReadingSession, PageSnapshot, Note, DailySummary,
+    Note,
     Book, BookProgress, Bookmark, ReadingListItem,
     SearchResult, SessionSummary,
 )
@@ -47,27 +47,6 @@ class Storage:
     async def _create_tables(self):
         """创建表结构"""
         await self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                book_name TEXT DEFAULT '',
-                start_at INTEGER NOT NULL,
-                end_at INTEGER,
-                camera_device INTEGER DEFAULT 0,
-                total_pages INTEGER DEFAULT 0,
-                total_snapshots INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                ts INTEGER NOT NULL,
-                image_path TEXT NOT NULL,
-                ocr_text TEXT DEFAULT '',
-                fingerprint TEXT DEFAULT '',
-                dwell_ms INTEGER DEFAULT 0,
-                FOREIGN KEY (session_id) REFERENCES sessions(id)
-            );
-
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT DEFAULT '',
@@ -126,11 +105,30 @@ class Storage:
                 finished_at INTEGER
             );
 
-            CREATE INDEX IF NOT EXISTS idx_snapshots_session ON snapshots(session_id);
-            CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id);
-            CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_at);
+            CREATE TABLE IF NOT EXISTS reading_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                page_num INTEGER,
+                book_title TEXT DEFAULT '',
+                ocr_chars INTEGER DEFAULT 0,
+                is_page_turn INTEGER DEFAULT 0,
+                page_text TEXT DEFAULT ''
+            );
+
             CREATE INDEX IF NOT EXISTS idx_bookmarks_book ON bookmarks(book_id);
             CREATE INDEX IF NOT EXISTS idx_progress_book ON reading_progress(book_id);
+            CREATE INDEX IF NOT EXISTS idx_reading_activity_ts ON reading_activity(ts);
+
+            CREATE TABLE IF NOT EXISTS reading_pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                book_title TEXT DEFAULT '',
+                page_num INTEGER DEFAULT 0,
+                chapter TEXT DEFAULT '',
+                visible_pages INTEGER DEFAULT 1,
+                ocr_text TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reading_pages_ts ON reading_pages(ts);
 
             CREATE TABLE IF NOT EXISTS weread_books (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,6 +187,13 @@ class Storage:
 
             CREATE INDEX IF NOT EXISTS idx_note_links_note ON note_links(note_id);
             CREATE INDEX IF NOT EXISTS idx_note_links_related ON note_links(related_id);
+
+            CREATE TABLE IF NOT EXISTS reading_digests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_title TEXT DEFAULT '',
+                digest_text TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
         """)
         await self._conn.commit()
 
@@ -201,6 +206,8 @@ class Storage:
             ("notes", "embedding", "BLOB"),
             ("weread_highlights", "embedding", "BLOB"),
             ("weread_notes", "embedding", "BLOB"),
+            ("reading_activity", "is_page_turn", "INTEGER DEFAULT 0"),
+            ("reading_activity", "page_text", "TEXT DEFAULT ''"),
         ]
         for table, col, definition in migrations:
             try:
@@ -210,156 +217,60 @@ class Storage:
             except Exception:
                 pass  # 列已存在
     
-    # ==================== Sessions ====================
-    
-    async def create_session(self, session: ReadingSession) -> bool:
-        """创建会话"""
-        try:
-            await self._conn.execute(
-                """INSERT INTO sessions (id, book_name, start_at, camera_device)
-                   VALUES (?, ?, ?, ?)""",
-                (session.id, session.book_name, session.start_at, session.camera_device)
-            )
-            await self._conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"创建会话失败: {e}")
-            return False
-    
-    async def end_session(self, session_id: str, end_at: int) -> bool:
-        """结束会话"""
-        try:
-            # 更新统计信息
-            await self._conn.execute(
-                """UPDATE sessions 
-                   SET end_at = ?,
-                       total_snapshots = (SELECT COUNT(*) FROM snapshots WHERE session_id = ?),
-                       total_pages = (SELECT COUNT(DISTINCT fingerprint) FROM snapshots WHERE session_id = ?)
-                   WHERE id = ?""",
-                (end_at, session_id, session_id, session_id)
-            )
-            await self._conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"结束会话失败: {e}")
-            return False
-    
-    async def get_session(self, session_id: str) -> Optional[ReadingSession]:
-        """获取会话"""
-        async with self._conn.execute(
-            "SELECT * FROM sessions WHERE id = ?", (session_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return ReadingSession(
-                    id=row['id'],
-                    book_name=row['book_name'],
-                    start_at=row['start_at'],
-                    end_at=row['end_at'],
-                    camera_device=row['camera_device'],
-                    total_pages=row['total_pages'],
-                    total_snapshots=row['total_snapshots']
-                )
-            return None
-    
-    async def list_sessions(self, limit: int = 10, offset: int = 0) -> List[ReadingSession]:
-        """列出会话"""
-        sessions = []
-        async with self._conn.execute(
-            "SELECT * FROM sessions ORDER BY start_at DESC LIMIT ? OFFSET ?",
-            (limit, offset)
-        ) as cursor:
-            async for row in cursor:
-                sessions.append(ReadingSession(
-                    id=row['id'],
-                    book_name=row['book_name'],
-                    start_at=row['start_at'],
-                    end_at=row['end_at'],
-                    camera_device=row['camera_device'],
-                    total_pages=row['total_pages'],
-                    total_snapshots=row['total_snapshots']
-                ))
-        return sessions
-    
-    async def get_today_sessions(self) -> List[ReadingSession]:
-        """获取今日会话"""
-        today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-        sessions = []
-        async with self._conn.execute(
-            "SELECT * FROM sessions WHERE start_at >= ? ORDER BY start_at DESC",
-            (today_start,)
-        ) as cursor:
-            async for row in cursor:
-                sessions.append(ReadingSession(
-                    id=row['id'],
-                    book_name=row['book_name'],
-                    start_at=row['start_at'],
-                    end_at=row['end_at'],
-                    camera_device=row['camera_device'],
-                    total_pages=row['total_pages'],
-                    total_snapshots=row['total_snapshots']
-                ))
-        return sessions
-    
-    # ==================== Snapshots ====================
-    
-    async def add_snapshot(self, snapshot: PageSnapshot) -> int:
-        """添加快照，返回 ID"""
+    # ==================== Reading Activity ====================
+
+    async def record_reading_activity(
+        self, ts: int, page_num: int = None, book_title: str = "",
+        ocr_chars: int = 0, is_page_turn: int = 0,
+    ) -> int:
+        """记录一次 OCR 识别事件。is_page_turn 为本次翻过的页数（0=未翻页，1=单页，2=双页）"""
         cursor = await self._conn.execute(
-            """INSERT INTO snapshots (session_id, ts, image_path, ocr_text, fingerprint)
-               VALUES (?, ?, ?, ?, ?)""",
-            (snapshot.session_id, snapshot.ts, snapshot.image_path, 
-             snapshot.ocr_text, snapshot.fingerprint)
+            "INSERT INTO reading_activity (ts, page_num, book_title, ocr_chars, is_page_turn) VALUES (?, ?, ?, ?, ?)",
+            (ts, page_num, book_title, ocr_chars, int(is_page_turn)),
         )
         await self._conn.commit()
         return cursor.lastrowid
-    
-    async def update_snapshot_dwell(self, snapshot_id: int, dwell_ms: int):
-        """更新快照停留时长"""
-        await self._conn.execute(
-            "UPDATE snapshots SET dwell_ms = ? WHERE id = ?",
-            (dwell_ms, snapshot_id)
+
+    async def record_reading_page(
+        self,
+        ts: int,
+        book_title: str,
+        page_num: int,
+        chapter: str,
+        visible_pages: int,
+        ocr_text: str,
+    ) -> int:
+        """记录一次翻页时的完整书页内容（永久保存）"""
+        cursor = await self._conn.execute(
+            """INSERT INTO reading_pages
+               (ts, book_title, page_num, chapter, visible_pages, ocr_text)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (ts, book_title, page_num, chapter, visible_pages, ocr_text),
         )
         await self._conn.commit()
-    
-    async def get_last_snapshot(self, session_id: str) -> Optional[PageSnapshot]:
-        """获取会话的最新快照"""
+        return cursor.lastrowid
+
+    async def get_reading_pages(self, days: int = 1) -> List[dict]:
+        """查询指定天数内的书页记录，按时间正序返回"""
+        import time as _t
+        since_ts = int((_t.time() - days * 86400) * 1000) if days > 0 else 0
+        results = []
         async with self._conn.execute(
-            "SELECT * FROM snapshots WHERE session_id = ? ORDER BY ts DESC LIMIT 1",
-            (session_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return PageSnapshot(
-                    id=row['id'],
-                    session_id=row['session_id'],
-                    ts=row['ts'],
-                    image_path=row['image_path'],
-                    ocr_text=row['ocr_text'],
-                    fingerprint=row['fingerprint'],
-                    dwell_ms=row['dwell_ms']
-                )
-            return None
-    
-    async def get_session_snapshots(self, session_id: str) -> List[PageSnapshot]:
-        """获取会话的所有快照"""
-        snapshots = []
-        async with self._conn.execute(
-            "SELECT * FROM snapshots WHERE session_id = ? ORDER BY ts ASC",
-            (session_id,)
+            """SELECT ts, book_title, page_num, chapter, visible_pages, ocr_text
+               FROM reading_pages WHERE ts >= ? ORDER BY ts""",
+            (since_ts,),
         ) as cursor:
             async for row in cursor:
-                snapshots.append(PageSnapshot(
-                    id=row['id'],
-                    session_id=row['session_id'],
-                    ts=row['ts'],
-                    image_path=row['image_path'],
-                    ocr_text=row['ocr_text'],
-                    fingerprint=row['fingerprint'],
-                    dwell_ms=row['dwell_ms']
-                ))
-        return snapshots
-    
+                results.append({
+                    "ts": row["ts"],
+                    "book_title": row["book_title"],
+                    "page_num": row["page_num"],
+                    "chapter": row["chapter"],
+                    "visible_pages": row["visible_pages"],
+                    "ocr_text": row["ocr_text"],
+                })
+        return results
+
     # ==================== Notes ====================
     
     async def add_note(self, note: Note) -> int:
@@ -399,17 +310,6 @@ class Storage:
         except Exception as e:
             logger.error(f"写入笔记 JSON 失败: {e}")
     
-    async def get_session_notes(self, session_id: str, limit: int = 100) -> List[Note]:
-        """获取会话的笔记"""
-        notes = []
-        async with self._conn.execute(
-            "SELECT * FROM notes WHERE session_id = ? ORDER BY ts ASC LIMIT ?",
-            (session_id, limit)
-        ) as cursor:
-            async for row in cursor:
-                notes.append(self._row_to_note(row))
-        return notes
-
     async def get_today_notes(self, limit: int = 100) -> List[Note]:
         """获取今日笔记（按 notes.ts 判断，不依赖 session）"""
         today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
@@ -469,64 +369,6 @@ class Storage:
             image_path=row['image_path'] if row['image_path'] else "",
         )
     
-    # ==================== Statistics ====================
-    
-    async def get_daily_summary(self, date: Optional[datetime] = None) -> DailySummary:
-        """获取每日阅读摘要"""
-        if date is None:
-            date = datetime.now()
-        
-        date_str = date.strftime("%Y-%m-%d")
-        day_start = int(date.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-        day_end = int((date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-        
-        summary = DailySummary(date=date_str)
-        
-        # 获取今日会话
-        sessions = []
-        longest_duration = 0
-        
-        async with self._conn.execute(
-            "SELECT * FROM sessions WHERE start_at >= ? AND start_at < ? ORDER BY start_at DESC",
-            (day_start, day_end)
-        ) as cursor:
-            async for row in cursor:
-                session = ReadingSession(
-                    id=row['id'],
-                    book_name=row['book_name'],
-                    start_at=row['start_at'],
-                    end_at=row['end_at'],
-                    camera_device=row['camera_device'],
-                    total_pages=row['total_pages'],
-                    total_snapshots=row['total_snapshots']
-                )
-                sessions.append(session)
-                
-                # 统计
-                summary.total_sessions += 1
-                summary.total_duration_ms += session.duration_ms
-                summary.total_pages += session.total_pages
-                
-                if session.book_name and session.book_name not in summary.book_names:
-                    summary.book_names.append(session.book_name)
-                
-                # 最长会话
-                if session.duration_ms > longest_duration:
-                    longest_duration = session.duration_ms
-                    summary.longest_session = session
-        
-        # 统计笔记数
-        async with self._conn.execute(
-            """SELECT COUNT(*) as count FROM notes n
-               JOIN sessions s ON n.session_id = s.id
-               WHERE s.start_at >= ? AND s.start_at < ?""",
-            (day_start, day_end)
-        ) as cursor:
-            row = await cursor.fetchone()
-            summary.total_notes = row['count'] if row else 0
-        
-        return summary
-
     # ==================== Books ====================
 
     async def get_or_create_book(self, title: str, author: str = "") -> Book:
@@ -780,41 +622,61 @@ class Storage:
 
     # ==================== Reading Stats ====================
 
+    _ACTIVE_GAP_MS = 5 * 60 * 1000  # 两次 OCR 间隔 < 5 分钟视为连续阅读
+
     async def get_reading_stats(
         self,
-        period: str = "today",
+        days: int = 1,
         book_title: str = "",
     ) -> dict:
-        """阅读统计：翻页数 / 时长 / 笔记数"""
-        now = datetime.now()
-        if period == "today":
-            since_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-        elif period == "week":
-            since_ts = int((now - timedelta(days=7)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).timestamp() * 1000)
-        elif period == "month":
-            since_ts = int((now - timedelta(days=30)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).timestamp() * 1000)
-        else:  # all
+        """
+        基于 reading_activity（OCR 事件流）统计阅读数据。
+        - 页数：SUM(is_page_turn)
+        - 时长：相邻 OCR 事件间隔 < 5 分钟则计为阅读时间
+        days=0 表示全部历史。
+        """
+        import time as _t
+        if days <= 0:
             since_ts = 0
+        else:
+            since_ts = int((_t.time() - days * 86400) * 1000)
 
-        # 会话筛选
-        book_filter = " AND book_name = ?" if book_title else ""
-        params_base = [since_ts] + ([book_title] if book_title else [])
+        book_filter = " AND book_title = ?" if book_title else ""
+        params = [since_ts] + ([book_title] if book_title else [])
 
+        # 1. 页数：基于内容变化的翻页检测计数
         async with self._conn.execute(
-            f"SELECT COUNT(*) as cnt, SUM(total_pages) as pages, SUM(end_at - start_at) as duration_ms"
-            f" FROM sessions WHERE start_at >= ? AND end_at IS NOT NULL{book_filter}",
-            params_base,
+            f"""SELECT SUM(is_page_turn) as page_count
+                FROM reading_activity
+                WHERE ts >= ?{book_filter}""",
+            params,
         ) as cursor:
             row = await cursor.fetchone()
-            total_pages = row['pages'] or 0
-            total_duration_ms = row['duration_ms'] or 0
-            session_count = row['cnt'] or 0
+            total_pages = row['page_count'] or 0
 
-        # 笔记数
+        # 1b. 阅读过的书籍列表
+        async with self._conn.execute(
+            f"""SELECT DISTINCT book_title
+                FROM reading_activity
+                WHERE ts >= ? AND book_title != ''{book_filter}""",
+            params,
+        ) as cursor:
+            books_read = [row['book_title'] async for row in cursor]
+
+        # 2. 阅读时长：相邻事件间隔 < 5 分钟则累加
+        async with self._conn.execute(
+            f"SELECT ts FROM reading_activity WHERE ts >= ?{book_filter} ORDER BY ts",
+            params,
+        ) as cursor:
+            timestamps = [row['ts'] async for row in cursor]
+
+        active_ms = 0
+        for i in range(1, len(timestamps)):
+            gap = timestamps[i] - timestamps[i - 1]
+            if gap <= self._ACTIVE_GAP_MS:
+                active_ms += gap
+
+        # 3. 笔记数
         note_filter = " AND book_name = ?" if book_title else ""
         async with self._conn.execute(
             f"SELECT COUNT(*) as cnt FROM notes WHERE ts >= ?{note_filter}",
@@ -823,7 +685,7 @@ class Storage:
             row = await cursor.fetchone()
             note_count = row['cnt'] or 0
 
-        # 书签数
+        # 4. 书签数
         bm_filter = " AND book_title = ?" if book_title else ""
         async with self._conn.execute(
             f"SELECT COUNT(*) as cnt FROM bookmarks WHERE ts >= ?{bm_filter}",
@@ -832,18 +694,19 @@ class Storage:
             row = await cursor.fetchone()
             bookmark_count = row['cnt'] or 0
 
-        minutes = total_duration_ms // 60000
+        minutes = active_ms // 60000
         duration_str = f"{minutes} 分钟" if minutes < 60 else f"{minutes // 60} 小时 {minutes % 60} 分钟"
 
         return {
             "period": period,
             "book_title": book_title,
-            "session_count": session_count,
             "total_pages": total_pages,
-            "total_duration_ms": total_duration_ms,
+            "total_duration_ms": active_ms,
             "duration_str": duration_str,
             "note_count": note_count,
             "bookmark_count": bookmark_count,
+            "books_read": books_read,
+            "ocr_events": len(timestamps),
         }
 
     # ==================== Embeddings ====================
@@ -1033,6 +896,32 @@ class Storage:
         except Exception as e:
             logger.warning(f"save_note_links 失败: {e}")
             return False
+
+    # ==================== Reading Digests ====================
+
+    async def save_reading_digest(self, digest_text: str, book_title: str = "") -> int:
+        """保存本次阅读内容压缩摘要，返回 ID"""
+        import time as _time
+        ts = int(_time.time() * 1000)
+        cursor = await self._conn.execute(
+            "INSERT INTO reading_digests (book_title, digest_text, created_at) VALUES (?, ?, ?)",
+            (book_title, digest_text, ts),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def get_recent_digests(self, days: int = 7) -> List[dict]:
+        """查询最近 N 天的阅读摘要"""
+        import time as _time
+        cutoff = int((_time.time() - days * 86400) * 1000)
+        result = []
+        async with self._conn.execute(
+            "SELECT book_title, digest_text, created_at FROM reading_digests WHERE created_at >= ? ORDER BY created_at DESC LIMIT 20",
+            (cutoff,),
+        ) as cursor:
+            async for row in cursor:
+                result.append({"book_title": row[0], "digest_text": row[1], "created_at": row[2]})
+        return result
 
     async def get_related_notes(self, note_id: int, limit: int = 5) -> List[dict]:
         """按笔记 ID 查询关联笔记（按相似度降序）"""

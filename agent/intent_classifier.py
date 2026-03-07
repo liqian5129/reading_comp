@@ -54,7 +54,7 @@ INTENT_CONFIGS = {
         role_hint="请直接调用 set_timer 工具，不要询问确认。"
     ),
     Intent.SHARING: IntentConfig(
-        needs_page_context=False, needs_memory=True, needs_prefetch=False,
+        needs_page_context=True, needs_memory=True, needs_prefetch=False,
         role_hint="请使用 generate_reading_card 或 feishu_send_message 工具。"
     ),
     Intent.GENERAL_CHAT: IntentConfig(

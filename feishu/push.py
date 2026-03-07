@@ -7,7 +7,7 @@ import os
 from typing import Optional, List
 from datetime import datetime
 
-from session.models import ReadingSession, Note, DailySummary
+from session.models import Note
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ class SummaryPusher:
     def __init__(self, bot):
         self.bot = bot
     
-    def build_summary_card(self, summary: DailySummary, 
+    def build_summary_card(self, summary,
                           notes: List[Note],
                           user_id: Optional[str] = None) -> dict:
         """
@@ -127,8 +127,8 @@ class SummaryPusher:
         
         return card
     
-    async def push_daily_summary(self, chat_id: str, 
-                                  summary: DailySummary,
+    async def push_daily_summary(self, chat_id: str,
+                                  summary,
                                   notes: List[Note]):
         """
         推送每日总结到飞书
@@ -143,7 +143,7 @@ class SummaryPusher:
         logger.info(f"每日总结已推送到飞书: {chat_id}")
     
     async def push_session_end_summary(self, chat_id: str,
-                                        session: ReadingSession,
+                                        session,
                                         notes: List[Note]):
         """
         推送会话结束总结

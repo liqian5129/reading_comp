@@ -144,6 +144,12 @@ class Memory:
         # 翻页预分析 hint（由 ProactivePageAnalyzer 写入，翻页时重置）
         self.proactive_page_hint: Optional[str] = None
 
+        # 本次会话滚动阅读摘要
+        self.session_reading_digest: str = ""
+        self._new_pages_buffer: list = []   # 待压缩的新页摘录
+        self._valid_page_count: int = 0     # 有效新页计数（用于触发）
+        self._last_buffer_hash: int = 0     # 去重用：上次加入 buffer 的 OCR hash
+
         # 加载
         self._load_persona()
         self._load_long_term()
@@ -241,8 +247,25 @@ class Memory:
             self.history = self.history[-self.max_history:]
     
     def get_history(self) -> List[Dict[str, str]]:
-        """获取历史消息（用于 LLM 请求）"""
-        return self.history
+        """
+        获取历史消息（用于 LLM 请求）。
+        自动清理孤立的 tool 结果消息，防止 history 被 max_history 截断后
+        出现 tool_call_id 找不到对应 assistant tool_calls 的 API 400 错误。
+        """
+        # 收集所有 assistant 消息中声明的 tool_call_id
+        valid_ids: set = set()
+        for msg in self.history:
+            if msg.get("role") == "assistant":
+                for tc in (msg.get("tool_calls") or []):
+                    cid = tc.get("id") or tc.get("tool_use_id", "")
+                    if cid:
+                        valid_ids.add(cid)
+
+        # 过滤掉 tool_call_id 不在 valid_ids 中的孤立 tool 结果
+        return [
+            msg for msg in self.history
+            if not (msg.get("role") == "tool" and msg.get("tool_call_id", "") not in valid_ids)
+        ]
     
     def clear_history(self):
         """清空历史"""
