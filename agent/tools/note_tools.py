@@ -20,6 +20,7 @@ class NoteTools:
 
         book_name = params.get("book_name", "")
         tags = params.get("tags") or []
+        user_comment = params.get("user_comment", "").strip()
         page_context = self.deps.memory.current_page_ocr
         image_path = ""
         if params.get("save_image"):
@@ -31,6 +32,7 @@ class NoteTools:
             book_name=book_name,
             tags=tags,
             image_path=image_path,
+            user_comment=user_comment,
         )
 
         book_hint = f"《{note.book_name}》" if note.book_name else ""

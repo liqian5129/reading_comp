@@ -61,7 +61,7 @@ _SELECTION_SYSTEM = f"""你是工具路由器，只负责判断需要调用哪�
 # ── 简单工具执行后直接返回固定文案，跳过 Round 2 ─────────────────────────────
 # None 表示从工具返回的 result["message"] 取文案
 SIMPLE_TOOL_REPLIES: Dict[str, Optional[str]] = {
-    "reading_note":            "已记录。",
+    # reading_note 不在此列：用户分享想法时需要 AI 温暖回应，走 Round 2
     "set_timer":               None,
     "bookmark_create":         "书签已保存。",
     "reading_progress_update": "进度已更新。",

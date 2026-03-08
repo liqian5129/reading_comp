@@ -185,28 +185,49 @@ class FeishuBot:
     async def upload_image(self, image_path: str) -> Optional[str]:
         """
         上传图片到飞书，返回 image_key。失败返回 None。
+        
+        使用 requests 直接调用 API，因为 SDK 的字节上传方式有兼容性问题。
         """
+        import requests
+        import os
+        
         try:
-            from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
-            with open(image_path, "rb") as f:
-                image_bytes = f.read()
-            request = CreateImageRequest.builder() \
-                .request_body(
-                    CreateImageRequestBody.builder()
-                    .image_type("message")
-                    .image(image_bytes)
-                    .build()
-                ) \
-                .build()
-            response = await asyncio.get_event_loop().run_in_executor(
+            # 获取 tenant_access_token
+            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            token_resp = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.client.im.v1.image.create(request)
+                lambda: requests.post(
+                    token_url,
+                    json={"app_id": self.app_id, "app_secret": self.app_secret}
+                )
             )
-            if response.success():
-                return response.data.image_key
-            else:
-                logger.error(f"图片上传失败: {response.code} - {response.msg}")
+            token_data = token_resp.json()
+            if token_data.get("code") != 0:
+                logger.error(f"获取 token 失败: {token_data}")
                 return None
+            token = token_data.get("tenant_access_token")
+            
+            # 上传图片
+            upload_url = "https://open.feishu.cn/open-apis/im/v1/images"
+            headers = {"Authorization": f"Bearer {token}"}
+            
+            with open(image_path, "rb") as f:
+                files = {"image": (os.path.basename(image_path), f, "image/jpeg")}
+                data = {"image_type": "message"}
+                upload_resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: requests.post(upload_url, headers=headers, files=files, data=data)
+                )
+            
+            upload_data = upload_resp.json()
+            if upload_data.get("code") == 0:
+                image_key = upload_data.get("data", {}).get("image_key")
+                logger.debug(f"图片上传成功: {image_key}")
+                return image_key
+            else:
+                logger.error(f"图片上传失败: {upload_data}")
+                return None
+                
         except Exception as e:
             logger.error(f"上传图片失败: {e}")
             return None

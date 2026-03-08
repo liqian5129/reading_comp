@@ -56,6 +56,7 @@ class SessionManager:
         book_name: str = "",
         tags: list = None,
         image_path: str = "",
+        user_comment: str = "",
     ) -> Note:
         """添加笔记"""
         note = Note(
@@ -66,6 +67,7 @@ class SessionManager:
             tags=tags or [],
             page_ocr_context=page_context,
             image_path=image_path,
+            user_comment=user_comment,
         )
 
         note_id = await self.storage.add_note(note)

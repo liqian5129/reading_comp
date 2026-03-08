@@ -93,7 +93,11 @@ class ReadingTimerManager:
                         waited += interval
                     if waited >= wait_timeout:
                         logger.warning(f"⏰ 定时器 {timer_id}: 等待播放窗口超时，强制播报")
-                    await self._tts_player.speak(message, interrupt=False)
+                    # 短词组消息（≤10字且不以句末标点结尾）包装成自然提醒句
+                    speak_text = message
+                    if len(message) <= 10 and message[-1] not in "。！？.!?~～":
+                        speak_text = f"时间到啦，提醒你：{message}。"
+                    await self._tts_player.speak(speak_text, interrupt=False)
                 except Exception as e:
                     logger.error(f"TTS 播报失败: {e}")
 

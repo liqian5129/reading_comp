@@ -35,7 +35,7 @@ INTENT_CONFIGS = {
     ),
     Intent.NOTE_TAKING: IntentConfig(
         needs_page_context=True, needs_memory=True, needs_prefetch=False,
-        role_hint="请调用 reading_note 工具记录笔记，并简短确认。"
+        role_hint="请调用 reading_note 工具记录笔记。记录后判断用户是指令式录入还是在分享感受——前者一句确认，后者简短呼应。"
     ),
     Intent.NOTE_RECALL: IntentConfig(
         needs_page_context=False, needs_memory=True, needs_prefetch=True,

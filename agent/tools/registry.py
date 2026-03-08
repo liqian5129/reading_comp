@@ -32,6 +32,10 @@ READING_NOTE_TOOL = {
                 "items": {"type": "string"},
                 "description": "标签列表，由用户指定或从内容中提取关键词，可为空",
             },
+            "user_comment": {
+                "type": "string",
+                "description": "用户对笔记内容的批注或个人想法。从用户话语中提取——用户请求记录某段话时，若同时表达了自己的看法、联想或感受，将这部分提取到此字段；没有则留空。",
+            },
             "save_image": {
                 "type": "boolean",
                 "description": "是否关联当前书页截图。仅当用户明确要求保存截图时为 true，默认 false。",

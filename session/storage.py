@@ -54,7 +54,8 @@ class Storage:
                 content TEXT NOT NULL,
                 book_name TEXT DEFAULT '',
                 tags TEXT DEFAULT '[]',
-                page_ocr_context TEXT DEFAULT ''
+                page_ocr_context TEXT DEFAULT '',
+                user_comment TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS books (
@@ -208,6 +209,7 @@ class Storage:
             ("weread_notes", "embedding", "BLOB"),
             ("reading_activity", "is_page_turn", "INTEGER DEFAULT 0"),
             ("reading_activity", "page_text", "TEXT DEFAULT ''"),
+            ("notes", "user_comment", "TEXT DEFAULT ''"),
         ]
         for table, col, definition in migrations:
             try:
@@ -276,8 +278,8 @@ class Storage:
     async def add_note(self, note: Note) -> int:
         """添加笔记，返回 ID，并同步写 JSON 文件"""
         cursor = await self._conn.execute(
-            """INSERT INTO notes (session_id, ts, content, book_name, tags, page_ocr_context, image_path)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO notes (session_id, ts, content, book_name, tags, page_ocr_context, image_path, user_comment)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 note.session_id,
                 note.ts,
@@ -286,6 +288,7 @@ class Storage:
                 json.dumps(note.tags, ensure_ascii=False),
                 note.page_ocr_context,
                 note.image_path,
+                note.user_comment,
             )
         )
         await self._conn.commit()

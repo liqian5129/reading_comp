@@ -18,23 +18,55 @@ class ShareTools:
         content = params.get("content", "").strip()
         book_title = params.get("book_title", "").strip()
 
-        # summary 类型：按时间窗口拉取阅读摘要 + 笔记
+        # summary 类型：用 digest + notes 生成摘要
         if not content and card_type == "summary":
-            # 从 DB 取该时间窗口内最新的累积摘要
-            digest = ""
             storage = getattr(self.deps, "storage", None)
+
+            # 若 buffer 未压缩（今日读了但不足5页），先强制压缩一次
+            buffer = getattr(self.deps.memory, "_new_pages_buffer", [])
+            if buffer and self.deps.llm:
+                import asyncio as _asyncio
+                new_pages = "\n".join(buffer)
+                current = getattr(self.deps.memory, "session_reading_digest", "")
+                prompt = (
+                    f"请将以下阅读进度压缩为300字以内的摘要，保留内容脉络和重要概念，"
+                    f"合并到已有摘要中，直接输出新摘要。\n\n已有摘要：{current}\n\n新增内容：{new_pages}"
+                ) if current else (
+                    f"请将以下阅读内容压缩为300字以内的摘要，保留内容脉络和重要概念，直接输出摘要。\n\n{new_pages}"
+                )
+                try:
+                    resp = await _asyncio.wait_for(
+                        self.deps.llm.chat(user_message=prompt, max_tokens=400),
+                        timeout=10.0,
+                    )
+                    if resp and resp.text:
+                        self.deps.memory.session_reading_digest = resp.text.strip()
+                        self.deps.memory._new_pages_buffer = []
+                        if storage:
+                            await storage.save_reading_digest(
+                                self.deps.memory.session_reading_digest,
+                                book_title=self.deps.memory.current_book_context.get("book_title", ""),
+                            )
+                        logger.info("summary 前强制压缩 buffer 完成")
+                except Exception as e:
+                    logger.warning(f"强制压缩 digest 失败: {e}")
+
+            # 取时间窗口内所有 digest（可能跨会话有多条）
+            digests_text = ""
             if storage:
                 try:
                     digests = await storage.get_recent_digests(days=days)
                     if digests:
-                        digest = digests[0]["digest_text"]
+                        # 多条 digest 按时间正序拼接（最近的在后）
+                        digests_text = "\n\n".join(
+                            d["digest_text"] for d in reversed(digests)
+                        )
                 except Exception as e:
                     logger.warning(f"加载阅读摘要失败: {e}")
-            # 若 DB 里没有（本次会话尚未触发压缩），退回内存中的 digest
-            if not digest:
-                digest = getattr(self.deps.memory, "session_reading_digest", "")
+            if not digests_text:
+                digests_text = getattr(self.deps.memory, "session_reading_digest", "")
 
-            # 拉取该时间窗口的笔记
+            # 取时间窗口内的笔记
             notes_text = ""
             sm = getattr(self.deps, "session_manager", None)
             if sm:
@@ -45,30 +77,9 @@ class ShareTools:
                 except Exception as e:
                     logger.warning(f"加载笔记失败: {e}")
 
-            # 拉取该时间窗口内的书页记录（跨会话，永久存储）
-            pages_text = ""
-            if storage:
-                try:
-                    pages = await storage.get_reading_pages(days=days)
-                    if pages:
-                        from datetime import datetime
-                        lines = []
-                        for p in pages:
-                            time_str = datetime.fromtimestamp(p["ts"] / 1000).strftime("%H:%M")
-                            book_hint = f"《{p['book_title']}》" if p["book_title"] else ""
-                            page_hint = f"第{p['page_num']}页" if p["page_num"] else ""
-                            chapter_hint = f"【{p['chapter']}】" if p["chapter"] else ""
-                            header = f"[{time_str} {book_hint}{page_hint}{chapter_hint}]"
-                            lines.append(f"{header}\n{p['ocr_text']}")
-                        pages_text = "\n\n".join(lines)[:4000]
-                except Exception as e:
-                    logger.warning(f"加载书页记录失败: {e}")
-
             parts = []
-            if digest:
-                parts.append(f"【阅读摘要】\n{digest}")
-            if pages_text:
-                parts.append(f"【书页内容】\n{pages_text}")
+            if digests_text:
+                parts.append(f"【阅读摘要】\n{digests_text}")
             if notes_text:
                 parts.append(f"【笔记】\n{notes_text}")
             content = "\n\n".join(parts)
@@ -108,7 +119,7 @@ class ShareTools:
             prompt = (
                 f"请从以下{source_hint}中提炼一张「{type_label}卡片」，"
                 f"用简洁、有力的语言表达核心内容，200字以内。"
-                f"直接输出卡片内容，不要额外说明。\n\n{source_hint}：\n{content[:1500]}"
+                f"直接输出卡片内容，不要额外说明。\n\n{source_hint}：\n{content[:3000]}"
             )
             try:
                 resp = await self.deps.llm.chat(user_message=prompt, max_tokens=200)
