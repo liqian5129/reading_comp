@@ -213,40 +213,11 @@ SET_TIMER_TOOL = {
     },
 }
 
-GENERATE_READING_CARD_TOOL = {
-    "name": "generate_reading_card",
-    "description": (
-        "生成阅读卡片（金句/知识点/摘要）并推送到飞书。"
-        "用户想整理今天/本次阅读内容、生成阅读摘要发飞书时：传 card_type='summary'，不传 content，"
-        "工具会自动使用本次会话累积的阅读摘要作为内容。"
-        "用户想将微信读书笔记/划线做成卡片时：只传 book_title，不要自己填写 content，"
-        "工具会自动从微信读书数据库取用户真实的划线和笔记作为内容。"
-        "用户想将当前书页做成卡片时：只传 card_type，内容自动使用摄像头 OCR。"
-        "content 参数仅在用户明确口述了具体文字时才填写。"
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "card_type": {
-                "type": "string",
-                "description": "卡片类型: quote（金句）/ knowledge（知识点）/ summary（摘要）",
-            },
-            "days": {
-                "type": "integer",
-                "description": "summary 类型时的时间范围（天数）。今天=1，近3天=3，这周=7，这月=30，以此类推。默认1",
-            },
-            "content": {"type": "string", "description": "卡片内容。仅在用户口述了具体文字时填写；其余情况留空，工具自动从微信读书或 OCR 取内容，禁止填入你推测或从训练知识生成的文字。"},
-            "book_title": {"type": "string", "description": "来源书名，提供后工具自动从微信读书数据库取该书的真实划线和笔记"},
-        },
-        "required": ["card_type"],
-    },
-}
-
 FEISHU_SEND_MESSAGE_TOOL = {
     "name": "feishu_send_message",
     "description": (
         "发送任意文本消息到飞书。用户想把内容（问候、提醒、总结等）推送到飞书时调用。"
-        "若要发送书页卡片，请用 generate_reading_card；若要发送阅读卡片，也优先用该工具。"
+        "若要发送图片卡片，请用 generate_quote_image 或 generate_summary_image。"
     ),
     "input_schema": {
         "type": "object",
@@ -347,6 +318,120 @@ WEREAD_MERGE_NOTES_TOOL = {
     },
 }
 
+GENERATE_QUOTE_IMAGE_TOOL = {
+    "name": "generate_quote_image",
+    "description": (
+        "将金句或笔记渲染为精美的图片卡片（日历风格），可根据内容情景自动选配色。"
+        "生成的图片可推送飞书。用户说「做成卡片图」「生成金句图片」「做张好看的图」时调用。"
+        "生成真实的图片文件并推送飞书，效果比纯文字卡片更精美。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "金句或笔记内容。留空则使用当前书页 OCR 由 AI 提炼"},
+            "book_title": {"type": "string", "description": "书名"},
+            "author": {"type": "string", "description": "作者"},
+            "mood": {
+                "type": "string",
+                "description": "情景标签: warm(历史/哲学)/cool(科技/科学)/literary(文学/自然)/art(心理/艺术)/neutral(通用)，留空自动判断",
+            },
+            "template": {
+                "type": "string",
+                "description": "强制指定模板: classic/warm/cool/literary/purple，留空按 mood 自动选择",
+            },
+        },
+        "required": [],
+    },
+}
+
+GENERATE_SUMMARY_IMAGE_TOOL = {
+    "name": "generate_summary_image",
+    "description": (
+        "生成带 AI 插图的阅读摘要卡片。先用 AI 文生图生成与内容意境相关的插图，"
+        "再与摘要文字合成为图文卡片。用户说「配张图」「生成摘要卡」「插画风的总结」时调用。"
+        "需要即梦 API 配置（config.json jimeng 节）。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary_text": {"type": "string", "description": "摘要内容。留空则自动使用最近阅读摘要"},
+            "title": {"type": "string", "description": "卡片标题，默认用书名"},
+            "days": {"type": "integer", "description": "summary 为空时拉取最近 N 天的摘要，默认 1"},
+            "illustration_prompt": {
+                "type": "string",
+                "description": "自定义插图 prompt（留空由 AI 根据内容自动生成）",
+            },
+            "mood": {"type": "string", "description": "情景标签"},
+        },
+        "required": [],
+    },
+}
+
+STYLIZE_PAGE_TOOL = {
+    "name": "stylize_page",
+    "description": (
+        "将当前书页照片转换为插画风格（水彩/线描/手绘等）。"
+        "使用即梦图生图 API 将书页重新渲染为艺术风格图片。"
+        "用户说「把这页变成插画」「书页转艺术风」「来个手绘版」时调用。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "style": {
+                "type": "string",
+                "description": "风格: watercolor(水彩)/sketch(素描)/comic(漫画)/ghibli(吉卜力)/ink(水墨)，默认 watercolor",
+            },
+            "strength": {
+                "type": "number",
+                "description": "变化强度 0.3-0.9，越大越偏离原图，默认 0.6",
+            },
+        },
+        "required": [],
+    },
+}
+
+EXPORT_PPT_TOOL = {
+    "name": "export_ppt",
+    "description": (
+        "将笔记/摘要/金句导出为 PPT 演示文稿。"
+        "用户说「生成 PPT」「做个幻灯片」「导出演示文稿」时调用。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "book_title": {"type": "string", "description": "书名（按书名过滤笔记），留空导出全部"},
+            "days": {"type": "integer", "description": "导出最近 N 天的笔记，默认 7"},
+            "theme": {
+                "type": "string",
+                "description": "PPT 主题: light(浅色)/warm(暖色)/dark(深色)，默认 light",
+            },
+            "include_summary": {"type": "boolean", "description": "是否包含 AI 摘要页，默认 true"},
+        },
+        "required": [],
+    },
+}
+
+EXPORT_MARKDOWN_TOOL = {
+    "name": "export_markdown",
+    "description": (
+        "将笔记/摘要/金句导出为格式化的 Markdown 文件。"
+        "用户说「导出 Markdown」「生成 MD」「导出笔记文件」时调用。"
+        "支持三种模板：notes(读书笔记)/daily(每日摘要)/quotes(金句集锦)。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "template": {
+                "type": "string",
+                "description": "模板类型: notes(读书笔记)/daily(每日摘要)/quotes(金句集锦)，默认 notes",
+            },
+            "book_title": {"type": "string", "description": "书名过滤，留空导出全部"},
+            "days": {"type": "integer", "description": "时间范围（天），默认 7"},
+        },
+        "required": [],
+    },
+}
+
 NOTE_SEARCH_TOOL = {
     "name": "note_search",
     "description": (
@@ -377,7 +462,11 @@ ALL_TOOLS = [
     READING_LIST_MANAGE_TOOL,
     READING_STATS_TOOL,
     SET_TIMER_TOOL,
-    GENERATE_READING_CARD_TOOL,
+    GENERATE_QUOTE_IMAGE_TOOL,
+    GENERATE_SUMMARY_IMAGE_TOOL,
+    STYLIZE_PAGE_TOOL,
+    EXPORT_PPT_TOOL,
+    EXPORT_MARKDOWN_TOOL,
     FEISHU_SEND_MESSAGE_TOOL,
     WEREAD_SHELF_TOOL,
     WEREAD_NOTEBOOK_TOOL,
@@ -448,7 +537,11 @@ class ToolDispatcher:
             "reading_stats": self._progress.exec_reading_stats,
             "reading_list_manage": self._list.exec_reading_list_manage,
             "set_timer": self._timer.exec_set_timer,
-            "generate_reading_card": self._share.exec_generate_reading_card,
+            "generate_quote_image": self._share.exec_generate_quote_image,
+            "generate_summary_image": self._share.exec_generate_summary_image,
+            "stylize_page": self._share.exec_stylize_page,
+            "export_ppt": self._share.exec_export_ppt,
+            "export_markdown": self._share.exec_export_markdown,
             "feishu_send_message": self._share.exec_feishu_send_message,
             "weread_shelf": self._weread.exec_weread_shelf,
             "weread_notebook": self._weread.exec_weread_notebook,

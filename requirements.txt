@@ -29,5 +29,11 @@ aiosqlite
 # Feishu
 lark-oapi>=1.5.0
 
+# PPT Generation
+python-pptx
+
+# Templating (for markdown export)
+Jinja2
+
 # Config (optional)
 python-dotenv

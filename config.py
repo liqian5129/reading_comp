@@ -153,6 +153,29 @@ class Config:
             "perspective", "homography_file", "camera/homography.npy"
         )
 
+        # 即梦文生图配置（火山引擎 Ark 平台）
+        self.JIMENG_ENABLED = self._get("jimeng", "enabled", False)
+        self.JIMENG_API_KEY = self._get("jimeng", "api_key", "") or self.DOUBAO_API_KEY
+        self.JIMENG_MODEL = self._get("jimeng", "model", "")  # Seedream 端点 ep-xxxxxxx
+        self.JIMENG_BASE_URL = self._get(
+            "jimeng", "base_url", "https://ark.cn-beijing.volces.com/api/v3"
+        )
+        self.JIMENG_TIMEOUT = self._get("jimeng", "timeout", 60)
+
+        # 插图 prompt 生成专用 LLM（豆包，不复用主模型）
+        self.ILLUSTRATION_LLM_API_KEY = (
+            self._get("illustration_llm", "api_key", "")
+            or self.DOUBAO_API_KEY          # 降级：复用豆包 api_key
+        )
+        self.ILLUSTRATION_LLM_MODEL = self._get(
+            "illustration_llm", "model",
+            "ep-xxxxxxxx"                   # 用户填自己的豆包端点
+        )
+        self.ILLUSTRATION_LLM_BASE_URL = self._get(
+            "illustration_llm", "base_url",
+            "https://ark.cn-beijing.volces.com/api/v3"
+        )
+
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
         self.DATA_DIR = Path(data_dir)
@@ -161,6 +184,10 @@ class Config:
         self.NOTES_DIR = self.DATA_DIR / "notes"
         self.KIMI_OCR_RESULTS_DIR = self.DATA_DIR / "kimiocr_results"
         self.DOUBAO_OCR_RESULTS_DIR = self.DATA_DIR / "doubaoocr_results"
+        self.CARDS_DIR = self.DATA_DIR / "cards"
+        self.JIMENG_DIR = self.DATA_DIR / "jimeng"
+        self.PPT_DIR = self.DATA_DIR / "ppt"
+        self.MARKDOWN_DIR = self.DATA_DIR / "markdown"
         self.PERSONA_FILE = self.DATA_DIR / "persona.json"
         self.LONG_TERM_MEMORY_FILE = self.DATA_DIR / "long_term_memory.json"
         self.MEMORY_DIR = self.DATA_DIR / "memory"
@@ -222,6 +249,11 @@ class Config:
         self.SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         self.NOTES_DIR.mkdir(parents=True, exist_ok=True)
         self.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        self.CARDS_DIR.mkdir(parents=True, exist_ok=True)
+        self.PPT_DIR.mkdir(parents=True, exist_ok=True)
+        self.MARKDOWN_DIR.mkdir(parents=True, exist_ok=True)
+        if self.JIMENG_ENABLED:
+            self.JIMENG_DIR.mkdir(parents=True, exist_ok=True)
     
     def validate(self) -> list[str]:
         """验证配置是否完整"""

@@ -33,8 +33,12 @@ TOOL_CATALOG: Dict[str, str] = {
     "reading_stats":           "查询阅读统计汇总（翻页数/时长/笔记数），可按今天/本周/本月/全部",
     "reading_history":         "查询每次阅读会话的详细记录（每条含具体时长和翻页数）",
     "set_timer":               "设置倒计时提醒；触发时可 TTS 播报、发飞书卡片或推送当前书页内容",
-    "generate_reading_card":   "生成金句/知识点/摘要卡片推送飞书；可整理今天/这周/这个月阅读的内容摘要发飞书；可自动取微信读书划线或当前书页 OCR",
-    "feishu_send_message":     "发送任意文本消息到飞书（卡片推送请用 generate_reading_card）",
+    "generate_quote_image":    "将金句/摘抄渲染为精美图片卡片（含背景/排版），完成后推送飞书图片",
+    "generate_summary_image":  "生成带 AI 插图的摘要图片卡片（图文混排），完成后推送飞书图片；用户说「生成卡片/做成卡片/摘要图/摘要卡/做成图」时优先选此工具",
+    "stylize_page":            "将当前书页照片转换为水彩/素描/漫画/吉卜力/水墨等插画风格，完成后推送飞书",
+    "export_ppt":              "将笔记/摘要/金句导出为 PPT 演示文稿（.pptx）",
+    "export_markdown":         "将笔记/摘要/金句导出为格式化 Markdown 文件（.md）",
+    "feishu_send_message":     "发送任意文本消息到飞书；图片卡片请用 generate_quote_image 或 generate_summary_image",
     "weread_shelf":            "查看微信读书书架（书目列表和阅读进度概览）",
     "weread_notebook":         "列出微信读书中有笔记的书单（含划线数和想法数）",
     "weread_get_notes":        "获取某书的微信读书书签/划线/想法/点评（微信读书的书签在这里，不在 bookmark_list）",
@@ -53,9 +57,31 @@ _SELECTION_SYSTEM = f"""你是工具路由器，只负责判断需要调用哪�
 规则：
 - 分析用户请求，列出需要调用的工具名（可多个）
 - 若用户只是提问/聊天/让你解释内容，无需任何工具，tools 返回空列表
-- 只输出 JSON，不要有任何其他文字
+- 只输出 JSON，绝对不要有任何其他文字，不要提问，不要解释
 
-输出格式：{{"tools": ["tool_name1", "tool_name2"]}}"""
+输出格式：{{"tools": ["tool_name1", "tool_name2"]}}
+
+示例：
+用户：帮我记下来
+输出：{{"tools": ["reading_note"]}}
+
+用户：今天读了多久
+输出：{{"tools": ["reading_stats"]}}
+
+用户：这段话什么意思
+输出：{{"tools": []}}
+
+用户：帮我把今天的笔记做成摘要图片卡发飞书
+输出：{{"tools": ["generate_summary_image"]}}
+
+用户：把今天读的内容整理成摘要卡片发飞书
+输出：{{"tools": ["generate_summary_image"]}}
+
+用户：把这句话做成金句图片
+输出：{{"tools": ["generate_quote_image"]}}
+
+用户：导出 PPT
+输出：{{"tools": ["export_ppt"]}}"""
 
 
 # ── 简单工具执行后直接返回固定文案，跳过 Round 2 ─────────────────────────────
@@ -72,7 +98,10 @@ SIMPLE_TOOL_REPLIES: Dict[str, Optional[str]] = {
 # ── 超时兜底：仅用于 LLM 超时时的最后安全网 ─────────────────────────────────
 # key: 工具名  value: 触发关键词列表（命中任意一个即选该工具）
 _TIMEOUT_FALLBACK: Dict[str, List[str]] = {
-    "generate_reading_card": ["整理今天", "总结发飞书", "阅读摘要", "摘要发飞书", "读的内容发飞书", "读的内容整理"],
+    "generate_summary_image":  ["摘要图片", "摘要图", "图片卡", "做成图", "图文卡", "摘要卡", "生成卡片", "做成卡片", "读书卡片", "发张卡片", "卡片发飞书", "整理今天", "总结发飞书", "阅读摘要", "摘要发飞书", "读的内容发飞书"],
+    "generate_quote_image":    ["金句图片", "金句图", "做成金句图", "金句卡"],
+    "export_ppt":              ["生成ppt", "生成PPT", "导出PPT", "导出ppt", "幻灯片", "演示文稿"],
+    "export_markdown":         ["导出markdown", "导出md", "导出笔记文件", "生成md"],
     "reading_stats":   ["读了多久", "多长时间", "阅读时间", "阅读时长", "读了多少页", "翻了多少", "统计", "今天读了", "这周读", "本周读", "本月读"],
     "reading_history": ["阅读记录", "读书记录", "历史记录", "读了什么"],
     "reading_notes":   ["我的笔记", "查笔记", "看笔记", "列笔记"],
@@ -111,11 +140,14 @@ class ToolSelector:
                 self._llm.chat(
                     user_message=user_message,
                     system_prompt=_SELECTION_SYSTEM,
-                    max_tokens=100,
+                    max_tokens=200,
                 ),
                 timeout=self.TIMEOUT_S,
             )
             result = self._parse(resp.text)
+            if result is None:
+                # LLM 返回非 JSON（如问询文字），降级到关键词匹配
+                result = _timeout_fallback(user_message) or None
             logger.info(f"[ToolSelector] '{user_message[:40]}' → {result}")
             return result
         except asyncio.TimeoutError:

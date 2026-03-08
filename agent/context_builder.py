@@ -105,8 +105,6 @@ class DynamicContextBuilder:
 ### 数据准确性（最重要）
 - 内容只能来自工具返回值，绝不用你对书籍的训练知识填充用户的笔记/划线。
 - 做金句卡、整理笔记时：先调 weread_get_notes 获取用户真实数据，再生成卡片。
-- generate_reading_card 的 content 参数：只在用户口述了具体文字时才填，其余情况只传 book_title。
-
 ### 书名推断
 - 未指定书名 → 从对话上下文推断，推断不了再调 weread_notebook/reading_progress_query。
 - 候选书目超过2本且意图不明确 → 列出选项让用户选，否则自行推断。
@@ -121,8 +119,8 @@ class DynamicContextBuilder:
 - 微信读书笔记 → weread_notebook 看书单 → weread_get_notes 看详情，禁止询问"要不要同步"
 - 阅读进度 → weread_progress（需书名），书名未知先查 reading_progress_query
 - 用户问"我读到哪了" → weread_get_notes 查微信书签 + reading_progress_query 查本地进度，合并回复
-- 金句卡 → weread_get_notes 取真实划线 → generate_reading_card(book_title=...) 不填 content
-- 整理/总结阅读内容发飞书 → 读取【本次阅读内容积累】（已在本提示词中）→ 调 reading_notes 取笔记 → 整合后调 generate_reading_card(card_type='summary', content=<综合摘要>, book_title=...)
+- 金句卡/图片卡 → weread_get_notes 取真实划线 → generate_quote_image(text=<划线内容>)
+- 整理/总结阅读内容发飞书 → 读取【本次阅读内容积累】→ 调 reading_notes 取笔记 → 整合后调 generate_summary_image(summary_text=<综合摘要>)
 - 用户要一周/近期阅读总结 → 调 reading_history(days=7) 获取包含历史摘要的记录，再整合生成""")
 
         prompt = "\n\n".join(parts)

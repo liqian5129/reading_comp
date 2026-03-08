@@ -55,7 +55,7 @@ INTENT_CONFIGS = {
     ),
     Intent.SHARING: IntentConfig(
         needs_page_context=True, needs_memory=True, needs_prefetch=False,
-        role_hint="请使用 generate_reading_card 或 feishu_send_message 工具。"
+        role_hint="请使用 generate_quote_image、generate_summary_image 或 feishu_send_message 工具。"
     ),
     Intent.GENERAL_CHAT: IntentConfig(
         needs_page_context=True, needs_memory=True, needs_prefetch=True,

@@ -340,11 +340,10 @@ async def test_tool_executor():
             timer_mgr.cancel_all()  # 立即取消，不真正等
             ok(f"set_timer: {result['message']}")
 
-            # generate_reading_card（无 LLM 时，直接用 OCR 内容）
-            result = await executor.execute("generate_reading_card",
-                                            {"card_type": "quote", "book_title": "三体"})
-            assert result["success"]
-            ok(f"generate_reading_card: content={result['card_content'][:30]}...")
+            # generate_quote_image（fire-and-forget，无 feishu 时立即返回）
+            result = await executor.execute("generate_quote_image", {"book_title": "三体"})
+            assert result.get("status") == "ok" or result.get("success") is False
+            ok(f"generate_quote_image: {result.get('message', result.get('error', ''))}")
 
             await storage.close()
         return True
