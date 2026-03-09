@@ -1,26 +1,17 @@
 """
-LLM 驱动的工具选择器
+工具选择器
 
-两阶段调用：
-  Stage 0 — 用轻量工具目录让 LLM 返回需要哪些工具（tiny prompt，无完整 schema）
-  Stage 1 — 只加载选中工具的完整 schema 进行正式调用
-
-边界情况：
-  - 多工具请求：LLM 可返回多个，全部加载
-  - 无需工具：返回 []，Stage 1 以纯文本回答
-  - 超时/解析失败：返回 None，调用方降级为 []（纯文本回答）
-  - LLM 幻觉出未知工具名：过滤掉，不影响已知工具
+正则规则（0ms）：基于关键词和句式匹配，无 API 依赖。
+供 Sub Agent 内部正则兜底使用（LLM 超时时调用 _regex_select）。
 """
-import asyncio
-import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-# ── 轻量工具目录：name → 一句话说明 ──────────────────────────────────────────
+# ── 工具目录（LLM 模式和日志使用） ────────────────────────────────────────────
 TOOL_CATALOG: Dict[str, str] = {
     "reading_note":            "保存读书笔记（摘抄/感悟/联想）到本地，支持多句合并为一条",
     "reading_notes":           "查看/列出本地保存的历史笔记，可按书名或时间过滤",
@@ -47,140 +38,220 @@ TOOL_CATALOG: Dict[str, str] = {
     "weread_merge_notes":      "合并某书的微信读书划线/想法与本地笔记，生成综合摘要，可推飞书",
 }
 
-_CATALOG_TEXT = "\n".join(f"- {k}: {v}" for k, v in TOOL_CATALOG.items())
 
-_SELECTION_SYSTEM = f"""你是工具路由器，只负责判断需要调用哪些工具。
+# ══════════════════════════════════════════════════════════════════════════════
+# 正则规则表
+# ──────────────────────────────────────────────────────────────────────────────
+# 规则按优先级从高到低排列。select() 扫描全部规则、收集所有命中工具，
+# 再通过互斥规则做最终裁剪，因此多工具请求也能正确处理。
+#
+# 设计原则：
+#   1. 图片生成工具最高优先，防止「发飞书」「笔记」等宽泛词干扰
+#   2. weread 系工具需有明确的「微信读书/weread」前缀或专有词（划线/想法）
+#      以区分本地书签/本地笔记
+#   3. 数字支持阿拉伯数字和中文数字（ASR 输出不确定）
+#   4. 飞书 ASR 有时识别为「飞叔」，两者均覆盖
+# ══════════════════════════════════════════════════════════════════════════════
 
-可用工具：
-{_CATALOG_TEXT}
+# 通用数字：阿拉伯 + 中文
+_NUM = r"[零一二三四五六七八九十百\d]+"
+# 飞书（含 ASR 误识别「飞叔」）
+_FS = r"(?:飞书|飞叔)"
 
-规则：
-- 分析用户请求，列出需要调用的工具名（可多个）
-- 若用户只是提问/聊天/让你解释内容，无需任何工具，tools 返回空列表
-- 只输出 JSON，绝对不要有任何其他文字，不要提问，不要解释
+_REGEX_RULES: List[Tuple[str, str]] = [
 
-输出格式：{{"tools": ["tool_name1", "tool_name2"]}}
+    # ── 图片/卡片生成（最高优先） ──────────────────────────────────────────────
 
-示例：
-用户：帮我记下来
-输出：{{"tools": ["reading_note"]}}
+    # 金句图：出现「金句」且有图/卡/发飞书意图
+    ("generate_quote_image",
+     r"金句.{0,8}(?:图片?|卡片?|做成|生成|发" + _FS + r"|发给)"
+     r"|(?:做|生成|来|整理).{0,6}金句"
+     r"|金句卡|金句图"),
 
-用户：今天读了多久
-输出：{{"tools": ["reading_stats"]}}
+    # 摘要/读书卡片：多种说法全覆盖
+    ("generate_summary_image",
+     r"(?:摘要|总结|读书|阅读|今天|本次|这次).{0,8}(?:卡片?|图片?|图文|图文卡|摘要卡|发" + _FS + r"|发给)"
+     r"|(?:生成|做成|整理|归纳|来张|来一张).{0,8}(?:卡片?|摘要图?|摘要卡|读书卡|图文卡)"
+     r"|(?:整理|总结|归纳).{0,6}(?:今天|本次|这次|笔记).{0,8}(?:发" + _FS + r"|发给|卡片?|图片?)"
+     r"|摘要图|摘要卡|图文卡|读书卡片?|阅读摘要"),
 
-用户：这段话什么意思
-输出：{{"tools": []}}
+    # 书页风格化
+    ("stylize_page",
+     r"(?:水彩|素描|漫画|吉卜力|水墨|插画|油画|手绘|像素|赛博朋克?).{0,6}(?:风格|画|图|转|做|效果)"
+     r"|(?:把|这张|这页|书页|当前页).{0,6}(?:做成|转成|变成|改成).{0,10}(?:风格|画|插图)"
+     r"|风格化"),
 
-用户：帮我把今天的笔记做成摘要图片卡发飞书
-输出：{{"tools": ["generate_summary_image"]}}
+    # ── 导出 ──────────────────────────────────────────────────────────────────
 
-用户：把今天读的内容整理成摘要卡片发飞书
-输出：{{"tools": ["generate_summary_image"]}}
+    ("export_ppt",
+     r"(?:导出|生成|做成|整理成|转成).{0,6}(?:PPT|ppt|演示文稿|幻灯片)"
+     r"|PPT|ppt|演示文稿|幻灯片"),
 
-用户：把这句话做成金句图片
-输出：{{"tools": ["generate_quote_image"]}}
+    ("export_markdown",
+     r"(?:导出|生成|保存|整理成|转成).{0,6}(?:[Mm]arkdown|[Mm][Dd]文件?|笔记文件)"
+     r"|导出.{0,4}(?:文件|[Mm][Dd])"),
 
-用户：导出 PPT
-输出：{{"tools": ["export_ppt"]}}"""
+    # ── 定时提醒 ──────────────────────────────────────────────────────────────
+    ("set_timer",
+     rf"{_NUM}\s*(?:分钟|小时|秒钟?).{{0,6}}(?:后|提醒|叫我?|通知|休息|结束|停止)"
+     rf"|(?:提醒|叫|通知)(?:我|一下)?.{{0,8}}{_NUM}\s*(?:分钟|小时|秒钟?)"
+     r"|半小时.{0,4}(?:后|提醒|叫)"
+     r"|(?:设置?|来个?|开始).{0,4}(?:定时|倒计时|计时器?)"
+     r"|休息.{0,4}提醒|提醒.{0,4}休息"),
+
+    # ── 微信读书（weread 系，需有明确前缀或专有词） ────────────────────────────
+
+    # 热门划线（最具体）
+    ("weread_best_highlights",
+     r"热门.{0,6}(?:划线|笔记|句子|段落|标注)"
+     r"|(?:大家|其他人|所有读者|别人).{0,6}(?:都|最多|常).{0,4}划"
+     r"|(?:最多|最热|精华).{0,6}(?:划线|标注)"
+     r"|热门标注"),
+
+    # 合并笔记/综合摘要
+    ("weread_merge_notes",
+     r"(?:合并|整合|汇总|综合).{0,8}(?:笔记|划线|微信读书|weread|想法)"
+     r"|(?:微信读书|weread).{0,8}(?:合并|整合|汇总)"),
+
+    # 微信读书进度（需有「微信读书/weread」限定）
+    ("weread_progress",
+     r"(?:微信读书|weread).{0,10}(?:进度|读了多少|百分|完成度)"
+     r"|在.{0,4}微信读书.{0,4}(?:读到|读了多少)"),
+
+    # 微信读书笔记本（有笔记的书单）
+    ("weread_notebook",
+     r"(?:微信读书|weread).{0,8}(?:笔记本|有笔记|笔记列表|记了笔记)"
+     r"|哪些书.{0,4}(?:有|记了).{0,4}笔记"),
+
+    # 微信读书书签/划线/想法/笔记——最常用 weread 查询
+    # 「划线」「想法」是 weread 专有名词，单独出现即可触发
+    # 「的书签」「里面...书签」表示查询某书书签，也归此工具
+    ("weread_get_notes",
+     r"(?:微信读书|weread).{0,10}(?:书签|划线|想法|笔记|点评|标注|摘录)"
+     r"|(?:帮我|看看|查查|找找|列出).{0,6}(?:微信读书|weread)"
+     r"|(?:在|从).{0,4}微信读书.{0,4}(?:里|中|上).{0,6}(?:书签|划线|笔记|想法)"
+     r"|读.{1,15}(?:划线|想法)"       # 读《XX》的划线/想法
+     r"|划线.{0,6}(?:里面|里有|查看|列出)"
+     r"|(?:看看|查查|读读).{0,4}书.{0,6}(?:书签|划线|想法|笔记)"
+     r"|(?:书里|书中|里面).{0,15}书签"   # 读书里面...书签 → weread
+     r"|《[^》]+》.{0,10}书签"          # 《某书》的书签 → weread
+     r"|[^我你他她这那\s]的书签"),       # "[书名末字]的书签"，排除「我/你/这/那的书签」
+
+    # 微信读书书架
+    ("weread_shelf",
+     r"(?:微信读书|weread).{0,6}(?:书架|书单|在读)"
+     r"|书架.{0,4}(?:里|上|看|查|有什么|有哪些)"
+     r"|(?:在读什么|最近在读|读了什么书|看了什么书)"),
+
+    # ── 本地笔记 ──────────────────────────────────────────────────────────────
+
+    # 语义搜索笔记（有「搜/找/查找」且指向笔记内容）
+    ("note_search",
+     r"(?:搜索?|查找|找一下|找找|搜一下).{0,8}(?:笔记|记录|内容|划线|相关)"
+     r"|(?:笔记|记录).{0,6}(?:里有没有|有没有关于|搜索?|查一下)"
+     r"|搜.{0,4}(?:笔记|记录)"),
+
+    # 查看笔记列表（非搜索、非创建）
+    ("reading_notes",
+     r"(?:看看|查看|列出|显示|给我看|翻翻).{0,6}(?:笔记|记录)"
+     r"|(?:我的|今天的?|最近的?|这本书的?).{0,4}笔记.{0,6}(?:有哪些|有什么|列表|看一下)?"
+     r"|笔记.{0,4}(?:列表|有哪些|查一下|看一下)"
+     r"|(?:有哪些|有什么).{0,4}笔记"),
+
+    # 保存笔记（动作明确：帮我记 / 记下来 / 存下来）
+    # 注意：避免「帮我.{0,6}记」误命中「笔记」「日记」等复合词
+    ("reading_note",
+     r"帮(?:我|忙)\s*(?:记下来?|存下来?|写下来?|记录下来?|保存一?下)"
+     r"|帮(?:我|忙).{0,3}(?:记一下|存一下|记个笔记)"
+     r"|记下来|存下来|记一下吧?|记个笔记|帮记一?下"
+     r"|(?:这段话?|这句话?|这个想法|刚才说的|刚才那段).{0,6}(?:帮我?记|存下来?|保存)"),
+
+    # ── 书签（本地 App，非微信读书） ──────────────────────────────────────────
+
+    # 创建书签
+    ("bookmark_create",
+     r"(?:加|记|标|打|创建|添加).{0,4}(?:个|一个)?.{0,2}书签"
+     r"|书签.{0,4}(?:标记|加一个|创建|记一下)"
+     r"|标记(?:这里|此处|当前位置|一下)"),
+
+    # 查看书签列表（本地，排除含「微信」「划线」「想法」的上下文）
+    ("bookmark_list",
+     r"(?:看|查|列出|显示|我的).{0,4}书签(?!.{0,10}(?:划线|想法|微信))"
+     r"|书签.{0,4}(?:列表|有哪些|查一下|看看)"),
+
+    # ── 阅读进度（本地记录） ──────────────────────────────────────────────────
+
+    # 更新进度（含页码或「完了/完啦」）
+    ("reading_progress_update",
+     rf"(?:我|现在|刚才).{{0,4}}(?:读到|读完|看到|看完).{{0,8}}(?:第?{_NUM}页|了$|啦$)"
+     r"|读完了|看完了|读完这本"
+     rf"|(?:读到|看到).{{0,4}}第?{_NUM}页"
+     r"|更新.{0,4}(?:阅读)?进度"),
+
+    # 查询进度
+    ("reading_progress_query",
+     r"(?:读到|看到|读了).{0,8}(?:哪里|哪一?页|多少页|哪儿)"
+     r"|(?:进度|读了多少).{0,6}(?:怎么样|如何|查一下|是多少|呢)"
+     r"|《.+?》.{0,8}(?:读到|进度|看了多少)"
+     r"|这本书.{0,4}(?:读了多少|进度|读到哪)"),
+
+    # ── 书单 ──────────────────────────────────────────────────────────────────
+    ("reading_list_manage",
+     r"(?:加入|添加|加到|放入).{0,6}(?:书单|想读|待读列表?)"
+     r"|书单.{0,8}(?:里有|加入|看看|查一下|移除|删除)"
+     r"|(?:想读|要读|准备读|打算读).{0,4}(?:这本|《)"
+     r"|(?:标记|改成|设为).{0,4}(?:在读|已读|读完|想读)"),
+
+    # ── 阅读统计 & 历史 ───────────────────────────────────────────────────────
+
+    # 历史记录（每次会话详情，非聚合统计）
+    ("reading_history",
+     r"(?:阅读|读书).{0,4}(?:记录|历史)(?!.{0,4}统计)"
+     r"|历史.{0,4}记录|每次.{0,6}(?:阅读|读书).{0,4}(?:时长|页数|多久)"
+     r"|上次.{0,4}(?:读了多久|读了多少|阅读时间)"),
+
+    # 聚合统计（时长/页数/笔记数汇总）
+    ("reading_stats",
+     r"(?:今天|本周|这周|本月|这月|总共|一共|全部|累计).{0,6}(?:读了|看了|翻了).{0,6}(?:多少|多久|几页|多长)"
+     r"|读了多久|多长时间.{0,4}(?:读|阅读)|阅读时长|阅读时间|阅读统计|翻了多少页"
+     r"|(?:今天|本周|这周|本月).{0,4}阅读.{0,6}(?:情况|数据|统计|总结)"
+     r"|读书统计|看了多少页"),
+
+    # ── 飞书纯文字消息（排除图片/卡片场景，那些已被上面规则捕获） ──────────────
+    ("feishu_send_message",
+     rf"(?:发|推送|发送).{{0,6}}{_FS}(?!.{{0,15}}(?:图片|卡片|摘要|金句|风格|ppt|PPT))"
+     rf"|{_FS}.{{0,6}}(?:发一条|发个消息|通知|告知|说一声)"),
+]
+
+# 预编译
+_COMPILED_RULES: List[Tuple[str, re.Pattern]] = [
+    (name, re.compile(pat, re.UNICODE)) for name, pat in _REGEX_RULES
+]
+
+# 互斥规则：命中 dominant 工具后，从结果中移除 excluded 工具
+_EXCLUSIONS: List[Tuple[str, List[str]]] = [
+    ("generate_quote_image",   ["feishu_send_message"]),
+    ("generate_summary_image", ["feishu_send_message", "reading_notes"]),
+    ("weread_merge_notes",     ["weread_get_notes"]),              # 合并比查询更具体
+    ("weread_notebook",        ["reading_notes"]),                 # weread 笔记本比本地列表更具体
+    ("weread_get_notes",       ["bookmark_list", "bookmark_create"]),
+    ("note_search",            ["reading_notes"]),
+]
 
 
-# ── 简单工具执行后直接返回固定文案，跳过 Round 2 ─────────────────────────────
-# None 表示从工具返回的 result["message"] 取文案
-SIMPLE_TOOL_REPLIES: Dict[str, Optional[str]] = {
-    # reading_note 不在此列：用户分享想法时需要 AI 温暖回应，走 Round 2
-    "set_timer":               None,
-    "bookmark_create":         "书签已保存。",
-    "reading_progress_update": "进度已更新。",
-    "reading_list_manage":     None,
-}
+def _regex_select(user_message: str) -> List[str]:
+    """0ms 正则匹配，返回命中工具列表（按规则优先级去重）。"""
+    matched: List[str] = []
+    seen: set = set()
+    for name, pattern in _COMPILED_RULES:
+        if name not in seen and pattern.search(user_message):
+            matched.append(name)
+            seen.add(name)
 
+    # 应用互斥规则
+    for dominant, excluded in _EXCLUSIONS:
+        if dominant in seen:
+            matched = [t for t in matched if t not in excluded]
+            seen -= set(excluded)
 
-# ── 超时兜底：仅用于 LLM 超时时的最后安全网 ─────────────────────────────────
-# key: 工具名  value: 触发关键词列表（命中任意一个即选该工具）
-_TIMEOUT_FALLBACK: Dict[str, List[str]] = {
-    "generate_summary_image":  ["摘要图片", "摘要图", "图片卡", "做成图", "图文卡", "摘要卡", "生成卡片", "做成卡片", "读书卡片", "发张卡片", "卡片发飞书", "整理今天", "总结发飞书", "阅读摘要", "摘要发飞书", "读的内容发飞书"],
-    "generate_quote_image":    ["金句图片", "金句图", "做成金句图", "金句卡"],
-    "export_ppt":              ["生成ppt", "生成PPT", "导出PPT", "导出ppt", "幻灯片", "演示文稿"],
-    "export_markdown":         ["导出markdown", "导出md", "导出笔记文件", "生成md"],
-    "reading_stats":   ["读了多久", "多长时间", "阅读时间", "阅读时长", "读了多少页", "翻了多少", "统计", "今天读了", "这周读", "本周读", "本月读"],
-    "reading_history": ["阅读记录", "读书记录", "历史记录", "读了什么"],
-    "reading_notes":   ["我的笔记", "查笔记", "看笔记", "列笔记"],
-    "set_timer":       ["提醒", "定时", "分钟后", "倒计时"],
-}
-
-
-def _timeout_fallback(user_message: str) -> List[str]:
-    """LLM 超时时按关键词匹配最多一个工具，完全匹配不到则返回 []。"""
-    for tool, keywords in _TIMEOUT_FALLBACK.items():
-        if any(kw in user_message for kw in keywords):
-            logger.info(f"[ToolSelector] 超时兜底：关键词命中 → [{tool}]")
-            return [tool]
-    return []
-
-
-class ToolSelector:
-    """
-    LLM 驱动的工具选择器（Stage 0）。
-
-    select() 返回值：
-      []    → 无需工具，纯文本回答
-      [...]  → 需要这些工具，加载完整 schema
-      None  → 选择失败，调用方降级为 []（纯文本回答）
-    """
-
-    TIMEOUT_S = 15.0
-
-    def __init__(self, llm_client):
-        self._llm = llm_client
-
-    async def select(self, user_message: str) -> Optional[List[str]]:
-        """发起 Stage 0 选择请求，失败时尝试关键词兜底。"""
-        try:
-            resp = await asyncio.wait_for(
-                self._llm.chat(
-                    user_message=user_message,
-                    system_prompt=_SELECTION_SYSTEM,
-                    max_tokens=200,
-                ),
-                timeout=self.TIMEOUT_S,
-            )
-            result = self._parse(resp.text)
-            if result is None:
-                # LLM 返回非 JSON（如问询文字），降级到关键词匹配
-                result = _timeout_fallback(user_message) or None
-            logger.info(f"[ToolSelector] '{user_message[:40]}' → {result}")
-            return result
-        except asyncio.TimeoutError:
-            fallback = _timeout_fallback(user_message)
-            logger.warning(f"[ToolSelector] 超时 ({self.TIMEOUT_S}s)，关键词兜底 → {fallback or '纯文本'}")
-            return fallback if fallback else None
-        except Exception as e:
-            logger.warning(f"[ToolSelector] 异常，降级纯文本回答: {e}")
-            return None
-
-    def _parse(self, text: str) -> Optional[List[str]]:
-        """
-        解析 LLM 返回的 JSON。容错：
-          - JSON 前后有多余文字 → 正则提取
-          - 工具名不在目录 → 过滤（防幻觉）
-          - 解析失败 → 返回 None 触发降级
-        """
-        if not text:
-            return None
-        try:
-            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-            if not match:
-                logger.warning(f"[ToolSelector] 未找到 JSON: {text[:80]}")
-                return None
-            data = json.loads(match.group())
-            raw: List = data.get("tools", [])
-            if not isinstance(raw, list):
-                return None
-            valid = [t for t in raw if t in TOOL_CATALOG]
-            unknown = set(raw) - set(valid)
-            if unknown:
-                logger.warning(f"[ToolSelector] 过滤幻觉工具名: {unknown}")
-            return valid
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"[ToolSelector] 解析失败: {e} | 原文: {text[:80]}")
-            return None
+    return matched

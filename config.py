@@ -106,6 +106,12 @@ class Config:
         self.AUTO_SCAN_INTERVAL = self._get("camera", "auto_scan_interval", 2)
         self.SCANNER_ENABLED = self._get("camera", "scanner_enabled", False)
 
+        # Sub Agent 配置（独立 LLM，负责工具选择和执行，与主对话解耦）
+        self.SUB_AGENT_PROVIDER = self._get("sub_agent", "provider", self.AI_PROVIDER)
+        self.SUB_AGENT_API_KEY  = self._get("sub_agent", "api_key", self.CURRENT_API_KEY)
+        self.SUB_AGENT_MODEL    = self._get("sub_agent", "model", self.CURRENT_MODEL)
+        self.SUB_AGENT_BASE_URL = self._get("sub_agent", "base_url", self.CURRENT_BASE_URL)
+
         # 调试模式：跳过 ASR/AI/TTS/飞书，仅运行摄像头+OCR
         self.DEBUG_MODE = self._get("debug", "debug_mode", False)
         

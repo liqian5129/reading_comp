@@ -701,7 +701,7 @@ class Storage:
         duration_str = f"{minutes} 分钟" if minutes < 60 else f"{minutes // 60} 小时 {minutes % 60} 分钟"
 
         return {
-            "period": period,
+            "period": days,
             "book_title": book_title,
             "total_pages": total_pages,
             "total_duration_ms": active_ms,

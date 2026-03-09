@@ -352,12 +352,15 @@ class AIClient:
         except Exception as e:
             total_end = time.time()
             total_ms = (total_end - total_start) * 1000
-            
+
+            # 提取 HTTP 状态码（openai SDK 异常通常有 status_code 属性）
+            status_code = getattr(e, "status_code", None)
+            err_detail = f"HTTP {status_code} " if status_code else ""
+
             if ttfb_start and not ttfb_end:
-                # 请求发出但没有收到响应
-                logger.error(f"❌ AI 请求超时或失败 (已等待 {total_ms:.0f} ms)")
+                logger.error(f"❌ AI 请求超时或失败 ({err_detail}已等待 {total_ms:.0f} ms): {type(e).__name__}: {e}")
             else:
-                logger.error(f"❌ AI API 调用失败: {e}")
+                logger.error(f"❌ AI API 调用失败 ({err_detail}{total_ms:.0f} ms): {type(e).__name__}: {e}")
             
             return LLMResponse(
                 text=f"抱歉，我遇到了一些问题: {str(e)}",

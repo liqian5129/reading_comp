@@ -75,6 +75,8 @@ class FeishuBot:
     
     async def _handle_message_async(self, chat_id: str, msg_id: str, text: str):
         """异步处理消息"""
+        # 先加「思考中」reaction，让用户知道消息已收到
+        await self.add_reaction(msg_id, "THINKING")
         try:
             response = await self.message_handler(text, channel="feishu", chat_id=chat_id)
             await self.send_text(chat_id, response)
@@ -253,6 +255,102 @@ class FeishuBot:
                 logger.error(f"图片消息发送失败: {response.code} - {response.msg}")
         except Exception as e:
             logger.error(f"发送图片消息失败: {e}")
+
+    async def add_reaction(self, message_id: str, emoji_type: str = "THINKING") -> bool:
+        """给消息添加 emoji reaction（默认 THINKING=思考中🤔）"""
+        import requests
+        try:
+            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            token_resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(token_url, json={"app_id": self.app_id, "app_secret": self.app_secret})
+            )
+            token = token_resp.json().get("tenant_access_token")
+            if not token:
+                logger.warning("add_reaction: 获取 token 失败")
+                return False
+
+            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions"
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    url,
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"reaction_type": {"emoji_type": emoji_type}},
+                )
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                logger.info(f"✅ reaction '{emoji_type}' 已添加: {message_id}")
+                return True
+            else:
+                logger.warning(f"❌ 添加 reaction 失败 (code={data.get('code')}): {data.get('msg')} | emoji={emoji_type} msg_id={message_id}")
+                return False
+        except Exception as e:
+            logger.error(f"add_reaction 失败: {e}")
+            return False
+
+    async def upload_file(self, file_path: str, file_type: str = "stream") -> Optional[str]:
+        """
+        上传文件到飞书，返回 file_key。
+        file_type: pdf / ppt / stream（其他格式用 stream）
+        """
+        import requests
+        import os
+        try:
+            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            token_resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(token_url, json={"app_id": self.app_id, "app_secret": self.app_secret})
+            )
+            token = token_resp.json().get("tenant_access_token")
+            if not token:
+                logger.error("upload_file: 获取 token 失败")
+                return None
+
+            url = "https://open.feishu.cn/open-apis/im/v1/files"
+            headers = {"Authorization": f"Bearer {token}"}
+            filename = os.path.basename(file_path)
+            with open(file_path, "rb") as f:
+                files = {"file": (filename, f, "application/octet-stream")}
+                data = {"file_type": file_type, "file_name": filename}
+                resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: requests.post(url, headers=headers, files=files, data=data)
+                )
+            upload_data = resp.json()
+            if upload_data.get("code") == 0:
+                file_key = upload_data.get("data", {}).get("file_key")
+                logger.debug(f"文件上传成功: {file_key} ({filename})")
+                return file_key
+            else:
+                logger.error(f"文件上传失败: {upload_data}")
+                return None
+        except Exception as e:
+            logger.error(f"upload_file 失败: {e}")
+            return None
+
+    async def send_file(self, chat_id: str, file_key: str):
+        """发送文件消息（file_key 由 upload_file 获取）"""
+        try:
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("file")
+                    .content(json.dumps({"file_key": file_key}))
+                    .build()
+                ) \
+                .build()
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.im.v1.message.create(request)
+            )
+            if not response.success():
+                logger.error(f"文件消息发送失败: {response.code} - {response.msg}")
+        except Exception as e:
+            logger.error(f"send_file 失败: {e}")
 
     async def send_to_user(self, user_id: str, text: str):
         """

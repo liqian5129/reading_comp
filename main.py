@@ -84,6 +84,25 @@ def _extract_tts_chunk(buf: str, force: bool = False, min_chars: int = _TTS_MIN_
     return None, buf  # 有边界但积累不足 min_chars，继续等
 
 
+def _format_tool_results(results: dict) -> str:
+    """将 Sub Agent 工具结果格式化为 system prompt 注入文本。
+    保留完整结构化数据，避免 LLM 因数据缺失而编造内容。
+    """
+    import json
+    lines = []
+    for name, result in results.items():
+        if not isinstance(result, dict):
+            lines.append(f"[{name}]: {result}")
+            continue
+        if not result.get("success", True):
+            lines.append(f"[{name}]: 执行失败 - {result.get('error', '未知错误')}")
+            continue
+        skip_keys = {"success", "book_title"}
+        data = {k: v for k, v in result.items() if k not in skip_keys and v}
+        lines.append(f"[{name}]:\n{json.dumps(data, ensure_ascii=False, indent=2)}")
+    return "\n\n".join(lines)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 导入模块
@@ -95,7 +114,7 @@ from agent.memory import Memory
 from agent.embedder import Embedder
 from agent.memory_consolidator import MemoryConsolidator
 from agent.tools import ToolRegistry, ToolDispatcher
-from agent.tool_selector import ToolSelector, SIMPLE_TOOL_REPLIES
+from agent.sub_agent import SubAgent
 from agent.timer_manager import ReadingTimerManager
 from agent.knowledge_linker import KnowledgeLinker
 from scanner.auto_scanner import AutoScanner
@@ -134,7 +153,6 @@ class ReadingCompanion:
         self.memory: Optional[Memory] = None
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_dispatcher: Optional[ToolDispatcher] = None
-        self.tool_selector: Optional[ToolSelector] = None
         self.knowledge_linker: Optional[KnowledgeLinker] = None
         self.scanner: Optional[AutoScanner] = None
         self._kimi_ocr = None
@@ -146,9 +164,12 @@ class ReadingCompanion:
         self.summary_pusher: Optional[SummaryPusher] = None
         self.weread_client = None
         self.weread_storage = None
+        self.jimeng_client = None
         self.embedder: Optional[Embedder] = None
         self.consolidator: Optional[MemoryConsolidator] = None
         self._periodic_task: Optional[asyncio.Task] = None
+        self.sub_agent_llm: Optional[AIClient] = None
+        self.sub_agent: Optional[SubAgent] = None
 
         # 状态
         self._running = False
@@ -195,15 +216,30 @@ class ReadingCompanion:
                 api_key=config.KIMI_API_KEY,
                 model=config.KIMI_MODEL,
                 base_url=config.KIMI_BASE_URL,
-                enable_thinking=config.KIMI_ENABLE_THINKING
+                enable_thinking=config.KIMI_ENABLE_THINKING,
+                max_retries=2,
             )
         else:  # doubao
             self.llm = AIClient(
                 provider="doubao",
                 api_key=config.DOUBAO_API_KEY,
                 model=config.DOUBAO_MODEL,
-                base_url=config.DOUBAO_BASE_URL
+                base_url=config.DOUBAO_BASE_URL,
+                max_retries=2,
             )
+
+        # Sub Agent LLM（独立于 Main LLM，负责工具选择和执行，不共享 rate limit）
+        self.sub_agent_llm = AIClient(
+            provider=config.SUB_AGENT_PROVIDER,
+            api_key=config.SUB_AGENT_API_KEY,
+            model=config.SUB_AGENT_MODEL,
+            base_url=config.SUB_AGENT_BASE_URL,
+            max_retries=1,
+        )
+        self.sub_agent = SubAgent()
+        logger.info(
+            f"Sub Agent LLM: provider={config.SUB_AGENT_PROVIDER}, model={config.SUB_AGENT_MODEL}"
+        )
 
         # Embedding 服务（阿里云百炼，独立 key/url）
         if config.EMBEDDING_ENABLED and config.EMBEDDING_API_KEY:
@@ -241,7 +277,6 @@ class ReadingCompanion:
             logger.info(f"已恢复今日阅读摘要（{len(self.memory.session_reading_digest)}字）")
 
         self.tool_registry = ToolRegistry()
-        self.tool_selector = ToolSelector(self.llm)
         self.timer_manager = ReadingTimerManager()
 
         # KnowledgeLinker（依赖 embedder/storage）
@@ -304,6 +339,19 @@ class ReadingCompanion:
         else:
             logger.info("🔍 KimiOCR 未启用（使用本地 PaddleOCR）")
 
+        # 4b-2. 即梦文生图客户端（可选）
+        if config.JIMENG_ENABLED and config.JIMENG_MODEL:
+            from rendering.jimeng_client import JimengClient
+            self.jimeng_client = JimengClient(
+                api_key=config.JIMENG_API_KEY,
+                model=config.JIMENG_MODEL,
+                base_url=config.JIMENG_BASE_URL,
+                timeout=config.JIMENG_TIMEOUT,
+            )
+            logger.info(f"🎨 即梦文生图已启用 (model={config.JIMENG_MODEL})")
+        else:
+            logger.info("🎨 即梦文生图未启用（jimeng.enabled=false 或未配置 model）")
+
         # 4c. 微信读书客户端（可选）
         if config.WEREAD_ENABLED and config.WEREAD_COOKIE:
             from weread import WeReadClient
@@ -334,6 +382,7 @@ class ReadingCompanion:
             embedder=self.embedder,
             storage=self.storage,
             knowledge_linker=self.knowledge_linker,
+            jimeng_client=self.jimeng_client,
         )
         self.tool_dispatcher = ToolDispatcher(_deps)
 
@@ -579,18 +628,11 @@ class ReadingCompanion:
         start_time = time.time()
 
         try:
-            # Stage 0：LLM 选择工具；超时/失败时降级为纯文本回答
-            selected_names = await self.tool_selector.select(text)
-            if selected_names is None:
-                selected_names = []
-            tools = self.tool_registry.get_tools_for_names(selected_names)
             system_prompt = self.memory.build_system_prompt(user_text=text)
             history = self.memory.get_history()
             page_ctx_len = len(self.memory.current_page_ocr)
-            total_tools = len(self.tool_registry.get_tools())
             logger.info(
-                f"   工具选择: {selected_names} ({len(tools)}/{total_tools}个), "
-                f"书页上下文: {page_ctx_len}字" + (" ✓" if page_ctx_len else " (无)")
+                f"   书页上下文: {page_ctx_len}字" + (" ✓" if page_ctx_len else " (无)")
             )
 
             MAX_ROUNDS = 5
@@ -603,25 +645,143 @@ class ReadingCompanion:
             if channel == "voice" and self.tts_player and hasattr(self.tts_player, "reset_timing"):
                 self.tts_player.reset_timing()
 
-            # 首轮 stream kwargs
+            # ── Sub Agent 并行路径 ────────────────────────────────────────────
+            # Sub Agent 始终启动，LLM 自己决定是否需要工具；正则仅在 LLM 超时时兜底
+            t_sub_agent_start = time.time()
+            all_tools = self.tool_registry.get_tools()
+            sub_agent_task = asyncio.create_task(
+                self.sub_agent.run(
+                    user_text=text,
+                    tools=all_tools,
+                    history=history,
+                    memory=self.memory,
+                    llm=self.sub_agent_llm,
+                    tool_dispatcher=self.tool_dispatcher,
+                )
+            )
+            # Main LLM 立即开始流式（不携带 tool schemas，不阻塞于工具执行）
+            system_prompt_r1 = (
+                system_prompt
+                + "\n\n## 当前情况"
+                + "\n你的助手正在后台帮你查询工具，你先开口回应用户。"
+                + "\n- 如果用户的请求涉及数据查询（书签、笔记、进度、微信读书等）："
+                + "自然说一句承接的话（例如「好的，我先查一下」「稍等，查一下书签」），不要编造数据。"
+                + "助手查完会把结果给你，你再接着说。"
+                + "\n- 如果是纯聊天或书页内容讨论：正常完整回复，不需要等待助手。"
+                + "\n- 如果用户的消息既有聊天又有查询（如讨论某段话同时触发工具）："
+                + "先完整回应聊天部分，在结尾自然带一句「帮你记下来了」或「先查一下」。"
+            )
             stream_kwargs = dict(
                 user_message=text,
-                system_prompt=system_prompt,
+                system_prompt=system_prompt_r1,
                 history=history,
-                tools=tools,
+                tools=[],
             )
 
+            # ── 流式 Main LLM Round 1 ─────────────────────────────────────
+            round_count += 1
+            tts_buf = ""
+            t_r1_start = time.time()
+            stream_start = t_r1_start
+            logger.info(f"⏱️  [R1] 开始流式 (SubAgent已并行启动 +{(t_r1_start - t_sub_agent_start)*1000:.0f}ms)")
+            first_token_time = None
+            total_chars = 0
+            chars_100_time = None
+            first_tts_sent = False
+
+            async for chunk in self.llm.chat_stream(**stream_kwargs):
+                if chunk.type == "text_delta":
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        logger.info(
+                            f"🚀 [Main/R1] 流式首字: {(first_token_time - stream_start)*1000:.0f}ms"
+                        )
+                    total_chars += len(chunk.content)
+                    if chars_100_time is None and total_chars >= 100:
+                        chars_100_time = time.time()
+                    tts_buf += chunk.content
+                    min_c = _TTS_FIRST_MIN_CHARS if not first_tts_sent else _TTS_MIN_CHARS
+                    chunk_to_send, tts_buf = _extract_tts_chunk(tts_buf, min_chars=min_c)
+                    if chunk_to_send:
+                        first_tts_sent = True
+                        if first_tts_enqueue_time is None:
+                            first_tts_enqueue_time = time.time()
+                        reply_parts.append(chunk_to_send)
+                        if channel == "voice":
+                            await self.tts_player.speak(chunk_to_send, interrupt=False)
+                # Sub Agent 路径下 Main LLM 不输出 tool_use，忽略其他 chunk 类型
+
+            # flush Round 1 剩余
+            tail, _ = _extract_tts_chunk(tts_buf, force=True)
+            if tail:
+                reply_parts.append(tail)
+                if channel == "voice":
+                    await self.tts_player.speak(tail, interrupt=False)
+            tts_buf = ""
+            r1_parts_count = len(reply_parts)  # R1 结束时的 reply_parts 边界
+
+            _chars100_str = (
+                f"{((chars_100_time - stream_start)*1000):.0f}ms"
+                if chars_100_time else "N/A"
+            )
+            logger.info(
+                f"📊 [Main/R1] 流式: 共{total_chars}字, "
+                f"首字={(((first_token_time or 0) - stream_start)*1000):.0f}ms, "
+                f"百字={_chars100_str}"
+            )
+            t_r1_end = time.time()
+            logger.info(
+                f"⏱️  [R1] LLM流式结束 耗时={(t_r1_end - t_r1_start)*1000:.0f}ms | "
+                f"共{total_chars}字 | R1输出=「{(''.join(reply_parts))[:40]}...」"
+            )
+            logger.info(f"⏱️  [R1→R2] 等待 Sub Agent 结果... (SubAgent已运行 {(t_r1_end - t_sub_agent_start)*1000:.0f}ms)")
+
+            # 等待 Sub Agent 完成
+            sub_agent_results = await sub_agent_task
+            t_sub_agent_done = time.time()
+            logger.info(f"⏱️  [SubAgent] 完成，等待耗时={(t_sub_agent_done - t_r1_end)*1000:.0f}ms | 总耗时={(t_sub_agent_done - t_sub_agent_start)*1000:.0f}ms")
+
+            if sub_agent_results:
+                # ── Sub Agent 有结果 → 进入 R2，由 R2 自己决定还需要说什么 ──
+                executed_names = list(sub_agent_results.keys())
+                tool_ctx = _format_tool_results(sub_agent_results)
+                round1_text = "".join(reply_parts)
+                logger.info(f"[SubAgent] 执行完成: {executed_names} | tool_ctx={len(tool_ctx)}字")
+                logger.info(f"⏱️  [R2] 准备启动 | R1说了=「{round1_text[:40]}...」")
+                enriched_prompt = (
+                    system_prompt
+                    + f"\n\n## 你刚才对用户说的话（R1）\n{round1_text}"
+                    + "\n\n## 你的助手执行工具后的结果\n" + tool_ctx
+                    + "\n\n现在你来决定接下来说什么："
+                    + "\n- 如果工具结果包含用户想要的具体数据（书签列表、笔记内容、统计数字等），自然地接着 R1 说，把数据告诉用户，不要重复 R1 已说过的内容。"
+                    + "\n- 如果 R1 已经完整覆盖了（比如你已经确认了定时器设置、书签保存、进度更新等操作），什么都不要说，直接输出空字符串。"
+                    + "\n不要重新开口（不要说「好的」「以下是」「查到了」等开场白）。"
+                )
+                stream_kwargs = dict(
+                    user_message=text,
+                    system_prompt=enriched_prompt,
+                    history=history,
+                    tools=[],
+                )
+            else:
+                logger.info("[SubAgent] 未调用工具，R1 为最终回复")
+                stream_kwargs = None
+
             while round_count < MAX_ROUNDS:
+                if stream_kwargs is None:
+                    break
                 round_count += 1
                 tts_buf = ""
                 tool_calls = None
                 raw_assistant_msg = None
 
                 # 性能打点
-                stream_start = time.time()
+                t_rN_start = time.time()
+                stream_start = t_rN_start
                 first_token_time = None
                 total_chars = 0
                 chars_100_time = None
+                logger.info(f"⏱️  [R{round_count}] 开始流式")
 
                 first_tts_sent = False  # 首段是否已发出（首段用低门槛快开口）
 
@@ -629,7 +789,7 @@ class ReadingCompanion:
                     if chunk.type == "text_delta":
                         if first_token_time is None:
                             first_token_time = time.time()
-                            logger.info(f"🚀 流式首字: {(first_token_time - stream_start)*1000:.0f}ms")
+                            logger.info(f"🚀 [R{round_count}] 流式首字: {(first_token_time - stream_start)*1000:.0f}ms")
                         total_chars += len(chunk.content)
                         if chars_100_time is None and total_chars >= 100:
                             chars_100_time = time.time()
@@ -677,59 +837,32 @@ class ReadingCompanion:
                     f"百字={_chars100_str}"
                 )
 
-                if not tool_calls:
-                    break
-
-                # 执行工具
-                tool_results = []
-                raw_results = []
-                for tc in tool_calls:
-                    result = await self.tool_dispatcher.execute(tc["name"], tc["input"])
-                    raw_results.append(result)
-                    tool_results.append({"tool_use_id": tc["id"], "content": str(result)})
-
-                # 记录本轮工具调用（暂存，稍后按正确顺序写入 history）
-                pending_tool_rounds.append((raw_assistant_msg, tool_results))
-
-                # 简单工具：跳过 Round 2，直接返回确认文案
-                if all(tc["name"] in SIMPLE_TOOL_REPLIES for tc in tool_calls):
-                    confirmations = []
-                    for tc, result in zip(tool_calls, raw_results):
-                        template = SIMPLE_TOOL_REPLIES[tc["name"]]
-                        if template is None:
-                            msg = result.get("message", "完成。") if isinstance(result, dict) else "完成。"
-                            confirmations.append(msg)
-                        else:
-                            confirmations.append(template)
-                    reply = "".join(confirmations)
-                    reply_parts.append(reply)
-                    if first_tts_enqueue_time is None:
-                        first_tts_enqueue_time = time.time()
-                    if channel == "voice":
-                        await self.tts_player.speak(reply, interrupt=False)
-                    logger.info(f"⚡ 简单工具，跳过 Round 2: {reply}")
-                    break
-
-                # 续轮 stream kwargs（复杂工具继续走 Round 2）
-                stream_kwargs = dict(
-                    user_message=text,
-                    system_prompt=system_prompt,
-                    history=history,
-                    tools=tools,
-                    tool_results=tool_results,
-                    assistant_message=raw_assistant_msg,
-                )
+                # R2 传入 tools=[]，Main LLM 不会输出 tool_use，直接退出
+                break
 
             reply_text = "".join(reply_parts)
+            r1_text_final = "".join(reply_parts[:r1_parts_count])
+            r2_text_final = "".join(reply_parts[r1_parts_count:])
 
-            # 打印 AI 回复内容
+            # 打印 AI 回复内容（R1/R2 分开）
             logger.info("=" * 60)
-            logger.info("🤖 AI 回复内容:")
+            logger.info(f"🤖 [R1] 内容（{len(r1_text_final)}字）:")
             logger.info("-" * 60)
-            for line in reply_text.split('\n'):
+            for line in r1_text_final.split('\n'):
                 while line:
                     logger.info(f"  {line[:58]}")
                     line = line[58:]
+            if r2_text_final:
+                logger.info("-" * 60)
+                logger.info(f"🤖 [R2] 内容（{len(r2_text_final)}字）:")
+            elif round_count >= 2:
+                logger.info("-" * 60)
+                logger.info("🤖 [R2] 静默（R1 已完整覆盖，R2 无输出）")
+                logger.info("-" * 60)
+                for line in r2_text_final.split('\n'):
+                    while line:
+                        logger.info(f"  {line[:58]}")
+                        line = line[58:]
             logger.info("-" * 60)
             logger.info(f"📊 回复长度: {len(reply_text)} 字符, 共 {round_count} 轮")
             logger.info("=" * 60)

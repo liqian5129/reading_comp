@@ -149,7 +149,7 @@ class ShareTools:
                 if raw and self.deps.llm:
                     try:
                         resp = await self.deps.llm.chat(
-                            user_message=f"请将以下阅读内容精炼为200字以内的摘要，直接输出：\n\n{raw[:2000]}",
+                            user_message=f"请将以下阅读内容精炼为200字以内的摘要，直接输出。注意：不要提及任何页码（如第X页），只描述内容和观点：\n\n{raw[:2000]}",
                             max_tokens=300,
                         )
                         if resp.text:
@@ -539,9 +539,8 @@ class ShareTools:
                     for p in pages:
                         time_str = datetime.fromtimestamp(p["ts"] / 1000).strftime("%H:%M")
                         book_hint = f"《{p['book_title']}》" if p["book_title"] else ""
-                        page_hint = f"第{p['page_num']}页" if p["page_num"] else ""
                         chapter_hint = f"【{p['chapter']}】" if p["chapter"] else ""
-                        header = f"[{time_str} {book_hint}{page_hint}{chapter_hint}]"
+                        header = f"[{time_str} {book_hint}{chapter_hint}]"
                         lines.append(f"{header}\n{p['ocr_text']}")
                     pages_text = "\n\n".join(lines)[:4000]
                     parts.append(f"【书页内容】\n{pages_text}")
@@ -578,15 +577,29 @@ class ShareTools:
         return False
 
     async def _push_file_to_feishu(self, filepath: str, display_name: str) -> bool:
-        """推送文件到飞书（以文本消息附带路径）"""
+        """上传文件并发送到飞书"""
         if not self.deps.feishu_pusher or not self.deps.feishu_chat_id:
             return False
+        bot = getattr(self.deps.feishu_pusher, "bot", None)
+        if not bot:
+            return False
+        import os
+        ext = os.path.splitext(filepath)[1].lower()
+        file_type_map = {".pdf": "pdf", ".ppt": "ppt", ".pptx": "ppt", ".doc": "doc", ".docx": "doc", ".xls": "xls", ".xlsx": "xls"}
+        file_type = file_type_map.get(ext, "stream")
         try:
-            await self.deps.feishu_pusher.push_text(
-                self.deps.feishu_chat_id,
-                f"文件已生成: {display_name}\n本地路径: {filepath}",
-            )
-            return True
+            file_key = await bot.upload_file(filepath, file_type=file_type)
+            if file_key:
+                await bot.send_file(self.deps.feishu_chat_id, file_key)
+                logger.info(f"文件已上传并发送到飞书: {display_name}")
+                return True
+            else:
+                # 上传失败降级为文本通知
+                await self.deps.feishu_pusher.push_text(
+                    self.deps.feishu_chat_id,
+                    f"文件已生成（上传失败，本地路径）: {filepath}",
+                )
+                return False
         except Exception as e:
-            logger.error(f"飞书文件通知失败: {e}")
+            logger.error(f"飞书文件发送失败: {e}")
             return False
