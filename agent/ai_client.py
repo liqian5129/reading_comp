@@ -546,7 +546,14 @@ class AIClient:
                             tc_accum[idx]["arguments"] += tc.function.arguments
         except Exception as e:
             logger.error(f"流式 AI 请求失败: {e}")
-            yield LLMStreamChunk(type="text_delta", content="抱歉，我没有理解，请再说一遍。")
+            err_str = str(e).lower()
+            if "429" in err_str or "overloaded" in err_str or "rate" in err_str:
+                err_msg = "服务器有点忙，稍后再试。"
+            elif "connection" in err_str or "timeout" in err_str or "network" in err_str:
+                err_msg = "网络有点问题，请稍后再说。"
+            else:
+                err_msg = "出了点问题，请稍后再试。"
+            yield LLMStreamChunk(type="text_delta", content=err_msg)
             yield LLMStreamChunk(type="done")
             return
 

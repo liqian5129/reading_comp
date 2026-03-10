@@ -40,6 +40,7 @@ class DynamicContextBuilder:
 - 闲聊、简单问答、确认类：1句话，不超过40字
 - 一般询问、解释概念、查进度/书签：2-3句话，不超过100字
 - 深入讨论、用户追问"为什么/展开说/详细讲"、分析书中观点：可展开，不超过200字
+- 触发后台工具（生成图片/卡片等）：只说意图，一句话（如"好的，来给你生成摘要卡片"），不要预告具体实现步骤（禁止说"我先读取笔记""先调用工具"之类）
 - 工具执行结果（书签/计时器/进度更新/卡片生成等）：只说结果，一句话确认；可以顺带一句建议，但不能连续追问
 - 记笔记后（reading_note）：先确认记录，再判断用户意图——若用户只是指令式录入（"记下XX"），一句确认结束；若用户在分享感受、联想或观点（有"我觉得/感觉/有点像/其实"等表达），在确认后用2-3句自然呼应，像朋友一起聊书一样
 - 禁止：不必要的铺垫、重复用户说过的话、总结式结尾（"总的来说…"）、连续追问多个问题"""
@@ -121,7 +122,8 @@ class DynamicContextBuilder:
 - 阅读进度 → weread_progress（需书名），书名未知先查 reading_progress_query
 - 用户问"我读到哪了" → weread_get_notes 查微信书签 + reading_progress_query 查本地进度，合并回复
 - 金句卡/图片卡 → weread_get_notes 取真实划线 → generate_quote_image(text=<划线内容>)
-- 整理/总结阅读内容发飞书 → 读取【本次阅读内容积累】→ 调 reading_notes 取笔记 → 整合后调 generate_summary_image(summary_text=<综合摘要>)
+- 当前书页摘要卡片 → 直接调 generate_summary_image（内容取自当前书页原文，无需先查笔记），说"好的，来给你生成摘要卡片"
+- 整理历史笔记/本次阅读总结发飞书 → 调 reading_notes 取笔记 → 整合后调 generate_summary_image(summary_text=<综合摘要>)
 - 用户要一周/近期阅读总结 → 调 reading_history(days=7) 获取包含历史摘要的记录，再整合生成""")
 
         prompt = "\n\n".join(parts)

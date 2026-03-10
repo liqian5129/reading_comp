@@ -248,8 +248,8 @@ WEREAD_NOTEBOOK_TOOL = {
     "name": "weread_notebook",
     "description": (
         "列出微信读书中有笔记的书单（含划线数和笔记数）。"
-        "用户问及任何微信读书笔记/划线/想法时，无论是否提到书名，都应首先调用此工具获取全局视图。"
-        "返回后可进一步调用 weread_get_notes 查看某本书详情。"
+        "仅当用户没有指定具体书名、或想查看「哪些书有笔记/划线」时调用。"
+        "若用户已指定书名，直接调用 weread_get_notes，不需要先调用此工具。"
     ),
     "input_schema": {"type": "object", "properties": {}, "required": []},
 }
@@ -258,9 +258,9 @@ WEREAD_GET_NOTES_TOOL = {
     "name": "weread_get_notes",
     "description": (
         "获取某本书的全部微信读书笔记，分四类：书签（位置标记）、划线、想法（附在划线上的评论）、点评（独立书评）。"
-        "用户问微信读书的书签、划线、笔记、想法时都应调用此工具。"
+        "用户问微信读书的书签、划线、笔记、想法时，只要提到了书名就直接调用此工具，无需先调用 weread_notebook。"
         "调用前自动同步最新数据，无需用户手动触发同步。"
-        "若用户未明确书名，先调用 weread_notebook 获取书单后自行推断，不要反复询问用户。"
+        "若用户未指定书名，改调 weread_notebook 而非本工具（本工具 book_title 必填）。"
     ),
     "input_schema": {
         "type": "object",

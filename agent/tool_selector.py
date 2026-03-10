@@ -127,7 +127,7 @@ _REGEX_RULES: List[Tuple[str, str]] = [
     # 「划线」「想法」是 weread 专有名词，单独出现即可触发
     # 「的书签」「里面...书签」表示查询某书书签，也归此工具
     ("weread_get_notes",
-     r"(?:微信读书|weread).{0,10}(?:书签|划线|想法|笔记|点评|标注|摘录)"
+     r"(?:微信读书|weread).{0,15}(?:书签|划线|想法|笔记|点评|标注|摘录)"
      r"|(?:帮我|看看|查查|找找|列出).{0,6}(?:微信读书|weread)"
      r"|(?:在|从).{0,4}微信读书.{0,4}(?:里|中|上).{0,6}(?:书签|划线|笔记|想法)"
      r"|读.{1,15}(?:划线|想法)"       # 读《XX》的划线/想法
@@ -232,9 +232,9 @@ _COMPILED_RULES: List[Tuple[str, re.Pattern]] = [
 _EXCLUSIONS: List[Tuple[str, List[str]]] = [
     ("generate_quote_image",   ["feishu_send_message"]),
     ("generate_summary_image", ["feishu_send_message", "reading_notes"]),
-    ("weread_merge_notes",     ["weread_get_notes"]),              # 合并比查询更具体
+    ("weread_merge_notes",     ["weread_get_notes", "weread_notebook"]),  # 合并比查询更具体
+    ("weread_get_notes",       ["weread_notebook", "bookmark_list", "bookmark_create"]),  # 有书名直接查，不走笔记本
     ("weread_notebook",        ["reading_notes"]),                 # weread 笔记本比本地列表更具体
-    ("weread_get_notes",       ["bookmark_list", "bookmark_create"]),
     ("note_search",            ["reading_notes"]),
 ]
 

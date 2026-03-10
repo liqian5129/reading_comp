@@ -664,6 +664,7 @@ class ReadingCompanion:
                     memory=self.memory,
                     llm=self.sub_agent_llm,
                     tool_dispatcher=self.tool_dispatcher,
+                    page_context=self.memory.current_page_ocr or None,
                 )
             )
             # Main LLM 立即开始流式（不携带 tool schemas，不阻塞于工具执行）
@@ -757,12 +758,34 @@ class ReadingCompanion:
             t_sub_agent_done = time.time()
             logger.info(f"⏱️  [SubAgent] 完成，等待耗时={(t_sub_agent_done - t_r1_end)*1000:.0f}ms | 总耗时={(t_sub_agent_done - t_sub_agent_start)*1000:.0f}ms")
 
+            # 超时标志检测
+            _subagent_timed_out = isinstance(sub_agent_results, dict) and sub_agent_results.get("__timeout__")
+            if _subagent_timed_out:
+                sub_agent_results = None
+
+            # ── 工具结果契约 ────────────────────────────────────────────────────
+            # Sync 工具（数据已就绪）：返回 {"success": True/False, ...data...}
+            # Async 工具（后台已启动）：返回 {"status": "ok", "message": "正在..."}
+            #   - async 工具立即返回 ack，真正的产物（图片/推送）由后台 task 完成
+            #   - R1 已经宣布了"我来做"，R2 对 async ack 没有任何新内容可说
+            #   - 混合场景（sync + async）：R2 只拿到 sync 数据，async ack 不进 tool_ctx
+            # ──────────────────────────────────────────────────────────────────
+            def _is_async_ack(r: dict) -> bool:
+                return isinstance(r, dict) and r.get("status") == "ok" and "success" not in r
+
             if sub_agent_results:
-                # ── Sub Agent 有结果 → 进入 R2，由 R2 自己决定还需要说什么 ──
                 executed_names = list(sub_agent_results.keys())
-                tool_ctx = _format_tool_results(sub_agent_results)
+                sync_results = {k: v for k, v in sub_agent_results.items() if not _is_async_ack(v)}
+                async_names  = [k for k, v in sub_agent_results.items() if _is_async_ack(v)]
+
+            if sub_agent_results and sync_results:
+                # ── 有 sync 数据 → R2 汇报（async ack 已被过滤，不进 tool_ctx）──
+                tool_ctx = _format_tool_results(sync_results)
                 round1_text = "".join(reply_parts)
-                logger.info(f"[SubAgent] 执行完成: {executed_names} | tool_ctx={len(tool_ctx)}字")
+                if async_names:
+                    logger.info(f"[SubAgent] 执行完成: {executed_names} | async跳过={async_names} | tool_ctx={len(tool_ctx)}字")
+                else:
+                    logger.info(f"[SubAgent] 执行完成: {executed_names} | tool_ctx={len(tool_ctx)}字")
                 logger.info(f"⏱️  [R2] 准备启动 | R1说了=「{round1_text[:40]}...」")
                 enriched_prompt = (
                     system_prompt
@@ -772,11 +795,33 @@ class ReadingCompanion:
                     + "\n- 操作成功：「定好了」「书签记上了」等简短确认，一句话"
                     + "\n- 操作失败：告知失败原因"
                     + "\n- 查询结果：直接说数据内容"
+                    + "\n- 若工具返回的是概览/书单但用户明显要某本书的具体内容：告诉用户找到了这本书但详情没拿到，建议重新问（如「你可以说帮我查《xxx》的划线」）"
+                    + "\n- 不要说「这就查」「马上查」「接下来查」等暗示自己会再次查询的话，你没有再次执行工具的能力"
                     + "\n不要重新开口（不要说「好的」「以下是」），不要复述 R1 已说过的内容。"
                 )
                 stream_kwargs = dict(
                     user_message=text,
                     system_prompt=enriched_prompt,
+                    history=history,
+                    tools=[],
+                )
+            elif sub_agent_results and async_names:
+                # ── 全为 async ack，R1 已覆盖，跳过 R2 ──
+                logger.info(f"[SubAgent] 执行完成: {executed_names} | 全为异步启动任务，R1 已覆盖，跳过 R2")
+                stream_kwargs = None
+            elif _subagent_timed_out:
+                # ── SubAgent 超时，R2 告知用户 ──
+                logger.warning("[SubAgent] 超时，启动 R2 告知用户")
+                round1_text = "".join(reply_parts)
+                timeout_prompt = (
+                    system_prompt
+                    + f"\n\n## 你刚才对用户说的话（R1）\n{round1_text}"
+                    + "\n\n## 情况说明\n后台工具查询超时，未能获取数据。"
+                    + "\n\n请用一句话告诉用户查询超时，请他再试一次。不要说「好的」或重复 R1 已说的内容。"
+                )
+                stream_kwargs = dict(
+                    user_message=text,
+                    system_prompt=timeout_prompt,
                     history=history,
                     tools=[],
                 )

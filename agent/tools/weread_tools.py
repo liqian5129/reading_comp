@@ -97,7 +97,7 @@ class WeReadTools:
 
         return {
             "success": True,
-            "message": f"共 {len(book_list)} 本书有笔记，可用 weread_get_notes 查看某本书的详细内容",
+            "message": f"共 {len(book_list)} 本书有笔记",
             "books": book_list,
             "total": len(book_list),
         }

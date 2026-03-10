@@ -267,7 +267,7 @@ class AutoScanner:
             # KimiOCR 路径：指纹去重后 fire-and-forget，结果通过回调返回
             if self._kimi_ocr is not None:
                 fp = fingerprint(frame)
-                if fp and not is_page_turn(self._last_fingerprint, fp):
+                if fp and not is_page_turn(self._last_fingerprint, fp, threshold=20):
                     logger.debug("KimiOCR: 页面未变化（指纹相同），跳过")
                     return None
 
