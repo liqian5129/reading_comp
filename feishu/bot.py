@@ -77,9 +77,13 @@ class FeishuBot:
         """异步处理消息"""
         # 先加「思考中」reaction，让用户知道消息已收到
         await self.add_reaction(msg_id, "THINKING")
+
+        async def send_callback(reply: str):
+            if reply.strip():
+                await self.send_text(chat_id, reply)
+
         try:
-            response = await self.message_handler(text, channel="feishu", chat_id=chat_id)
-            await self.send_text(chat_id, response)
+            await self.message_handler(text, channel="feishu", chat_id=chat_id, send_callback=send_callback)
         except Exception as e:
             logger.error(f"处理消息失败: {e}")
             await self.send_text(chat_id, f"抱歉，处理消息时出错: {str(e)}")

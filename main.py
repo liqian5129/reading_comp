@@ -48,11 +48,18 @@ import warnings
 warnings.filterwarnings("ignore", category=Warning, module="urllib3")
 
 # ── TTS 分块参数 ──────────────────────────────────────────────────────────────
-# TTS 单次合成约 3-4s，太短的片段得不偿失，采用句子边界 + 最小字符阈值
+# TTS 切割阈值（有效字符 = 汉字+字母+数字，不含标点符号）
 _SENT_END = re.compile(r'(?<=[。！？…!?\n])\s*')
-_TTS_FIRST_MIN_CHARS = 10  # 首段门槛：遇到第一个句子边界且 ≥10 字即发，快开口
-_TTS_MIN_CHARS = 50        # 后续段门槛：积累 ≥50 字再发，配合贪婪批合并保证连续
-_TTS_MAX_CHARS = 200       # 强制切割上限
+_TTS_FIRST_MIN_CHARS = 8   # 首段门槛：遇到句子边界且有效字符 ≥8 即开口
+_TTS_MIN_CHARS = 31        # 后续段门槛：有效字符 >30（即 ≥31）再发一批
+_TTS_MAX_CHARS = 200       # 强制切割上限（仍用原始长度，作为安全兜底）
+
+_EFFECTIVE_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uF900-\uFAFFa-zA-Z0-9]')
+
+
+def _count_effective(text: str) -> int:
+    """统计有效字符数：汉字 + 字母 + 数字，不含标点和其他符号"""
+    return len(_EFFECTIVE_RE.findall(text))
 
 
 def _extract_tts_chunk(buf: str, force: bool = False, min_chars: int = _TTS_MIN_CHARS):
@@ -60,8 +67,8 @@ def _extract_tts_chunk(buf: str, force: bool = False, min_chars: int = _TTS_MIN_
     从缓冲区提取一个 TTS 片段，返回 (片段或None, 剩余缓冲)。
 
     策略：
-    - 找到句子边界 AND 累积字数 >= min_chars → 发出
-    - 累积字数 >= _TTS_MAX_CHARS → 强制切割
+    - 找到句子边界 AND 有效字符数 >= min_chars → 发出
+    - 原始长度 >= _TTS_MAX_CHARS → 强制切割（安全兜底）
     - force=True（流结束）→ 发出所有剩余
     """
     if force and buf.strip():
@@ -77,11 +84,11 @@ def _extract_tts_chunk(buf: str, force: bool = False, min_chars: int = _TTS_MIN_
     accumulated = ""
     for i, part in enumerate(parts[:-1]):
         accumulated += part
-        if len(accumulated) >= min_chars:
+        if _count_effective(accumulated) >= min_chars:
             remainder = "".join(parts[i + 1:])
             return accumulated.strip(), remainder
 
-    return None, buf  # 有边界但积累不足 min_chars，继续等
+    return None, buf  # 有边界但有效字符不足 min_chars，继续等
 
 
 def _format_tool_results(results: dict) -> str:
@@ -609,14 +616,14 @@ class ReadingCompanion:
             self._ai_task.cancel()
         self._ai_task = asyncio.create_task(self._process_user_message(text))
     
-    async def _process_user_message(self, text: str, channel: str = "voice"):
+    async def _process_user_message(self, text: str, channel: str = "voice", feishu_send_callback=None):
         """
         处理用户消息 - 流式 ReAct 多轮循环
         """
         async with self._msg_lock:
-            return await self._process_user_message_inner(text, channel)
+            return await self._process_user_message_inner(text, channel, feishu_send_callback)
 
-    async def _process_user_message_inner(self, text: str, channel: str = "voice"):
+    async def _process_user_message_inner(self, text: str, channel: str = "voice", feishu_send_callback=None):
         """
         处理用户消息核心逻辑（由 _process_user_message 持锁调用）
         """
@@ -663,13 +670,13 @@ class ReadingCompanion:
             system_prompt_r1 = (
                 system_prompt
                 + "\n\n## 当前情况"
-                + "\n你的助手正在后台帮你查询工具，你先开口回应用户。"
-                + "\n- 如果用户的请求涉及数据查询（书签、笔记、进度、微信读书等）："
-                + "自然说一句承接的话（例如「好的，我先查一下」「稍等，查一下书签」），不要编造数据。"
-                + "助手查完会把结果给你，你再接着说。"
-                + "\n- 如果是纯聊天或书页内容讨论：正常完整回复，不需要等待助手。"
-                + "\n- 如果用户的消息既有聊天又有查询（如讨论某段话同时触发工具）："
-                + "先完整回应聊天部分，在结尾自然带一句「帮你记下来了」或「先查一下」。"
+                + "\n你的助手正在后台帮你执行操作，你先开口回应用户。"
+                + "\n- 不管是操作类（定时器、书签、进度）还是查询类（书签列表、笔记、统计）："
+                + "只说你在做什么，不要假装已经完成或假装已经拿到结果。"
+                + "\n  例：「好的，我来定个时」「稍等，查一下书签」「帮你记一下」"
+                + "\n- 不要复述用户刚说过的具体内容（书名、时间、数字等），越短越好。"
+                + "\n- 不要编造结果：不说「已设置好」「已记录」「已查到」，结果由助手查完后告诉你。"
+                + "\n- 纯聊天（无工具触发）：正常完整回复。"
             )
             stream_kwargs = dict(
                 user_message=text,
@@ -714,11 +721,20 @@ class ReadingCompanion:
             # flush Round 1 剩余
             tail, _ = _extract_tts_chunk(tts_buf, force=True)
             if tail:
+                if first_tts_enqueue_time is None:
+                    first_tts_enqueue_time = time.time()
                 reply_parts.append(tail)
                 if channel == "voice":
                     await self.tts_player.speak(tail, interrupt=False)
             tts_buf = ""
             r1_parts_count = len(reply_parts)  # R1 结束时的 reply_parts 边界
+            r1_first_token_time = first_token_time  # 保存 R1 首字时间，避免被 R2 循环覆盖
+
+            # 飞书通道：R1 完成后立即发出，不等工具结果
+            if feishu_send_callback:
+                r1_text_early = "".join(reply_parts)
+                if r1_text_early.strip():
+                    await feishu_send_callback(r1_text_early)
 
             _chars100_str = (
                 f"{((chars_100_time - stream_start)*1000):.0f}ms"
@@ -751,11 +767,12 @@ class ReadingCompanion:
                 enriched_prompt = (
                     system_prompt
                     + f"\n\n## 你刚才对用户说的话（R1）\n{round1_text}"
-                    + "\n\n## 你的助手执行工具后的结果\n" + tool_ctx
-                    + "\n\n现在你来决定接下来说什么："
-                    + "\n- 如果工具结果包含用户想要的具体数据（书签列表、笔记内容、统计数字等），自然地接着 R1 说，把数据告诉用户，不要重复 R1 已说过的内容。"
-                    + "\n- 如果 R1 已经完整覆盖了（比如你已经确认了定时器设置、书签保存、进度更新等操作），什么都不要说，直接输出空字符串。"
-                    + "\n不要重新开口（不要说「好的」「以下是」「查到了」等开场白）。"
+                    + "\n\n## 你的助手执行工具后的真实结果\n" + tool_ctx
+                    + "\n\n请自然地接着你刚才说的话，把真实结果告诉用户。"
+                    + "\n- 操作成功：「定好了」「书签记上了」等简短确认，一句话"
+                    + "\n- 操作失败：告知失败原因"
+                    + "\n- 查询结果：直接说数据内容"
+                    + "\n不要重新开口（不要说「好的」「以下是」），不要复述 R1 已说过的内容。"
                 )
                 stream_kwargs = dict(
                     user_message=text,
@@ -844,6 +861,10 @@ class ReadingCompanion:
             r1_text_final = "".join(reply_parts[:r1_parts_count])
             r2_text_final = "".join(reply_parts[r1_parts_count:])
 
+            # 飞书通道：R2 完成后发出（若有内容）
+            if feishu_send_callback and r2_text_final.strip():
+                await feishu_send_callback(r2_text_final)
+
             # 打印 AI 回复内容（R1/R2 分开）
             logger.info("=" * 60)
             logger.info(f"🤖 [R1] 内容（{len(r1_text_final)}字）:")
@@ -855,14 +876,14 @@ class ReadingCompanion:
             if r2_text_final:
                 logger.info("-" * 60)
                 logger.info(f"🤖 [R2] 内容（{len(r2_text_final)}字）:")
-            elif round_count >= 2:
-                logger.info("-" * 60)
-                logger.info("🤖 [R2] 静默（R1 已完整覆盖，R2 无输出）")
                 logger.info("-" * 60)
                 for line in r2_text_final.split('\n'):
                     while line:
                         logger.info(f"  {line[:58]}")
                         line = line[58:]
+            elif round_count >= 2:
+                logger.info("-" * 60)
+                logger.info("🤖 [R2] 静默（R2 无输出）")
             logger.info("-" * 60)
             logger.info(f"📊 回复长度: {len(reply_text)} 字符, 共 {round_count} 轮")
             logger.info("=" * 60)
@@ -899,7 +920,7 @@ class ReadingCompanion:
             logger.info("=" * 60)
             logger.info("📊 全链路延迟（从收到用户消息开始）")
             logger.info("-" * 60)
-            logger.info(f"  LLM 首字出现:   {_ms(first_token_time)}  ← AI 开始生成")
+            logger.info(f"  LLM 首字出现:   {_ms(r1_first_token_time)}  ← R1 开始生成")
             logger.info(f"  TTS 文本入队:   {_ms(first_tts_enqueue_time)}  ← 首段文字送出")
             logger.info(f"  TTS 开始合成:   {_ms(tts_synth_start)}  ← synth_worker 拾取")
             logger.info(f"  TTS 合成完成:   {_ms(tts_synth_end)}  ← 首段音频就绪")
@@ -920,7 +941,7 @@ class ReadingCompanion:
 
         return reply_text
 
-    async def _handle_feishu_message(self, text: str, channel: str = "feishu", chat_id: str = "") -> str:
+    async def _handle_feishu_message(self, text: str, channel: str = "feishu", chat_id: str = "", send_callback=None) -> str:
         """处理飞书消息"""
         # 动态更新 chat_id：首条消息即可获得真实会话 ID，后续定时器推送可用
         if chat_id and self.summary_pusher:
@@ -929,7 +950,7 @@ class ReadingCompanion:
                 logger.debug(f"飞书 chat_id 已更新: {chat_id}")
             if self.tool_dispatcher:
                 self.tool_dispatcher.feishu_chat_id = chat_id
-        return await self._process_user_message(text, channel="feishu")
+        return await self._process_user_message(text, channel="feishu", feishu_send_callback=send_callback)
     
     @staticmethod
     def _is_content_page_turn(old_text: str, new_text: str) -> bool:

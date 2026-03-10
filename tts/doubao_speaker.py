@@ -462,12 +462,18 @@ class DoubaoTTSPlayer:
         return final_segments if final_segments else [text[:max_length]]
         
     async def start(self):
-        """启动播放器（合成+播放双流水线）"""
+        """启动播放器"""
         self._running = True
-        self._synth_task = asyncio.create_task(self._synth_worker())
-        self._play_task = asyncio.create_task(self._play_worker())
-        mode = "mpg123 stdin" if self._use_mpg123 else "afplay 临时文件"
-        logger.info(f"豆包 TTS 播放器已启动（双流水线 / {mode}）")
+        if self._use_mpg123:
+            # 流式模式：synthesize_stream → 直接 pipe mpg123，首帧 ~0.3-0.8s 即出声
+            self._synth_task = asyncio.create_task(self._stream_worker())
+            # _play_worker 不启动，mpg123 已在 _stream_worker 中驱动
+            logger.info("豆包 TTS 播放器已启动（流式合成 / mpg123 stdin）")
+        else:
+            # 批量模式：afplay 双流水线兜底
+            self._synth_task = asyncio.create_task(self._synth_worker())
+            self._play_task = asyncio.create_task(self._play_worker())
+            logger.info("豆包 TTS 播放器已启动（双流水线 / afplay 临时文件）")
 
     async def stop(self):
         """停止播放器"""
@@ -571,7 +577,150 @@ class DoubaoTTSPlayer:
         except asyncio.TimeoutError:
             return 0.0
 
-    # ── 合成协程 ──────────────────────────────────────────────────────────────
+    # ── 流式合成+播放协程（mpg123 模式）────────────────────────────────────────
+    async def _do_synth_to_queue(self, text: str, queue: asyncio.Queue):
+        """在独立 Task 中运行 synthesize_stream，将音频帧放入 queue，结束后放 None sentinel。"""
+        try:
+            async for frame in self.tts.synthesize_stream(text):
+                await queue.put(frame)
+        except Exception as e:
+            logger.error(f"❌ 合成帧收集失败: {e}")
+        finally:
+            await queue.put(None)  # sentinel：通知消费方合成结束
+
+    async def _stream_worker(self):
+        """
+        流式合成 + mpg123 播放，并在播放当前段期间预合成下一段。
+
+        时序：
+          当前段合成（Task）→ pipe 首帧 → mpg123 开始播放
+          ↓ stdin 关闭后，mpg123 自行播完剩余缓冲
+          同时：预合成 Task 已经在跑下一段
+          mpg123 播完 → 立刻用已到达的帧开始下一段播放
+          → R2 等待时间 ≈ max(0, R2合成时间 - R1播放时间) ≈ 0
+        """
+        # next_item: 预合成好的下一段 (request, frames_queue, synth_task)
+        next_item: Optional[tuple] = None
+
+        while self._running:
+            # ── 取请求：优先用预合成的，否则阻塞等队列 ──────────────────────
+            if next_item is not None:
+                cur_request, cur_frames_q, cur_synth_task = next_item
+                next_item = None
+            else:
+                try:
+                    cur_request = await asyncio.wait_for(self._text_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                if self._interrupt_event.is_set():
+                    continue
+                cur_frames_q: asyncio.Queue = asyncio.Queue()
+                cur_synth_task = asyncio.create_task(
+                    self._do_synth_to_queue(cur_request.text, cur_frames_q)
+                )
+
+            # ── 启动 mpg123 ───────────────────────────────────────────────
+            is_first = (self.first_synth_start is None)
+            if is_first:
+                self.first_synth_start = time.time()
+            synth_start = time.time()
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "mpg123", "-q", "-",
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                logger.error(f"❌ mpg123 启动失败: {e}")
+                cur_synth_task.cancel()
+                continue
+
+            self._playing = True
+            first_frame = True
+            total_bytes = 0
+
+            # ── 边收帧边 pipe 给 mpg123 ───────────────────────────────────
+            try:
+                while not self._interrupt_event.is_set():
+                    try:
+                        frame = await asyncio.wait_for(cur_frames_q.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        # 超时时检查合成 Task 是否已结束且队列已空
+                        if cur_synth_task.done() and cur_frames_q.empty():
+                            break
+                        continue
+
+                    if frame is None:  # sentinel：合成结束
+                        break
+
+                    if first_frame:
+                        first_frame = False
+                        if self.first_play_start is None:
+                            self.first_play_start = time.time()
+                        if is_first:
+                            self.first_synth_end = time.time()
+                            self.last_synthesis_ms = (self.first_synth_end - synth_start) * 1000
+                            self._synthesis_done.set()
+                            logger.info(f"🚀 TTS 流式首帧: {self.last_synthesis_ms:.0f} ms")
+
+                    total_bytes += len(frame)
+                    try:
+                        proc.stdin.write(frame)
+                        await proc.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
+            except Exception as e:
+                logger.error(f"❌ 流式 TTS pipe 失败: {e}")
+
+            # ── 关闭 stdin，mpg123 继续播完其缓冲区 ──────────────────────
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+            # ── 预合成下一段（与 mpg123 播放剩余缓冲并行） ────────────────
+            if not self._interrupt_event.is_set():
+                try:
+                    next_req = self._text_queue.get_nowait()
+                    next_frames_q: asyncio.Queue = asyncio.Queue()
+                    next_synth_task = asyncio.create_task(
+                        self._do_synth_to_queue(next_req.text, next_frames_q)
+                    )
+                    next_item = (next_req, next_frames_q, next_synth_task)
+                    logger.debug(f"📦 预合成下一段: {next_req.text[:20]}...")
+                except asyncio.QueueEmpty:
+                    pass
+
+            # ── 等 mpg123 播完 ────────────────────────────────────────────
+            if self._interrupt_event.is_set():
+                try:
+                    proc.stdin.transport.abort()
+                except Exception:
+                    pass
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                # 取消预合成
+                if next_item:
+                    next_item[1]  # frames_q（不需要清理）
+                    next_item[2].cancel()
+                    next_item = None
+            else:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+
+            self._playing = False
+            elapsed = (time.time() - synth_start) * 1000
+            logger.info(f"🔊 豆包 TTS 流式播完: {elapsed:.0f} ms, {total_bytes} bytes")
+
+    # ── 批量合成协程（afplay 兜底模式）────────────────────────────────────────
     async def _synth_worker(self):
         """
         从文本队列取一段 → synthesize → 推入音频队列。
