@@ -390,6 +390,7 @@ class ReadingCompanion:
             storage=self.storage,
             knowledge_linker=self.knowledge_linker,
             jimeng_client=self.jimeng_client,
+            tts_player=None,
         )
         self.tool_dispatcher = ToolDispatcher(_deps)
 
@@ -453,6 +454,8 @@ class ReadingCompanion:
         from tts import create_tts_player
         self.tts_player = create_tts_player(config)
         await self.tts_player.start()
+        # 把 TTS 注入工具调度器（供异步工具完成后通知用户）
+        self.tool_dispatcher._deps.tts_player = self.tts_player
         # 把 TTS 注入定时器（无论飞书是否启用都能播报）
         self.timer_manager.set_tts_player(self.tts_player)
         self.timer_manager.set_recorder(self.recorder)
@@ -791,6 +794,11 @@ class ReadingCompanion:
                     system_prompt
                     + f"\n\n## 你刚才对用户说的话（R1）\n{round1_text}"
                     + "\n\n## 你的助手执行工具后的真实结果\n" + tool_ctx
+                    + "\n\n## 静默规则（优先级最高）"
+                    + "\n对比 R1 已说过的话和工具返回的结果："
+                    + "\n- 若工具结果中有 R1 未提及的具体数据（书签内容、划线列表、统计数字等）→ 一句话说出新数据"
+                    + "\n- 若工具结果仅是操作成功确认，且 R1 已经表达了承诺或确认（「定好了」「帮你记」「稍等查」等）→ 只输出 [SILENT]，不要任何其他内容"
+                    + "\n- 不要说「好的」「已设置」「完成了」等对 R1 的语义重复"
                     + "\n\n请自然地接着你刚才说的话，把真实结果告诉用户。"
                     + "\n- 操作成功：「定好了」「书签记上了」等简短确认，一句话"
                     + "\n- 操作失败：告知失败原因"
@@ -883,11 +891,16 @@ class ReadingCompanion:
 
                 # 流结束后 flush 剩余
                 if not tool_calls:
-                    tail, _ = _extract_tts_chunk(tts_buf, force=True)
-                    if tail:
-                        reply_parts.append(tail)
-                        if channel == "voice":
-                            await self.tts_player.speak(tail, interrupt=False)
+                    # R2 静默机制：[SILENT] 哨兵 token → 跳过 TTS，不写入 reply_parts
+                    if round_count >= 2 and tts_buf.strip() == "[SILENT]":
+                        logger.info("[R2] 输出 [SILENT]，跳过 TTS 和 history 写入")
+                        tts_buf = ""
+                    else:
+                        tail, _ = _extract_tts_chunk(tts_buf, force=True)
+                        if tail:
+                            reply_parts.append(tail)
+                            if channel == "voice":
+                                await self.tts_player.speak(tail, interrupt=False)
 
                 _chars100_str = (
                     f"{((chars_100_time - stream_start)*1000):.0f}ms"
@@ -976,6 +989,8 @@ class ReadingCompanion:
             logger.info("=" * 60)
 
         except asyncio.CancelledError:
+            if 'sub_agent_task' in locals() and not sub_agent_task.done():
+                sub_agent_task.cancel()
             logger.info("🛑 AI 处理被用户打断")
             raise  # 必须重新抛出，让 Task 正常结束
         except Exception as e:

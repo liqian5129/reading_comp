@@ -123,6 +123,9 @@ class ShareTools:
                 template_name=template or None,
             )
             await self._push_image_to_feishu(filepath)
+            tts = getattr(self.deps, "tts_player", None)
+            if tts:
+                await tts.speak("金句卡片已生成，已推送到飞书～", interrupt=False)
         except Exception as e:
             logger.error(f"后台金句卡片生成失败: {e}")
 
@@ -192,6 +195,9 @@ class ShareTools:
                 mood=mood,
             )
             await self._push_image_to_feishu(filepath)
+            tts = getattr(self.deps, "tts_player", None)
+            if tts:
+                await tts.speak("摘要卡片已生成，已推送到飞书～", interrupt=False)
         except Exception as e:
             logger.error(f"后台摘要卡片生成失败: {e}")
 
@@ -266,6 +272,9 @@ class ShareTools:
             )
             if result_path:
                 await self._push_image_to_feishu(result_path)
+                tts = getattr(self.deps, "tts_player", None)
+                if tts:
+                    await tts.speak("书页插画已生成，已推送到飞书～", interrupt=False)
             else:
                 logger.warning("风格转换未返回结果，请检查即梦 API 配置")
         except Exception as e:

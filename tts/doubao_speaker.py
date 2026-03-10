@@ -711,10 +711,32 @@ class DoubaoTTSPlayer:
                     next_item[2].cancel()
                     next_item = None
             else:
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
+                # 每 50ms 轮询一次打断信号，确保 interrupt() 能及时停止 mpg123
+                deadline = time.time() + 60.0
+                while proc.returncode is None:
+                    if self._interrupt_event.is_set():
+                        try:
+                            proc.stdin.transport.abort()
+                        except Exception:
+                            pass
+                        proc.terminate()
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            proc.kill()
+                        # 取消预合成
+                        if next_item:
+                            next_item[2].cancel()
+                            next_item = None
+                        break
+                    if time.time() > deadline:
+                        proc.kill()
+                        break
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=0.05)
+                        break  # 自然结束
+                    except asyncio.TimeoutError:
+                        continue
 
             self._playing = False
             elapsed = (time.time() - synth_start) * 1000
