@@ -41,6 +41,11 @@ class WeReadTools:
             await self.deps.weread_storage.upsert_books(books)
             for prog in progress_list:
                 await self.deps.weread_storage.upsert_progress(prog)
+            # bookProgress 列表是实际阅读进度，合并进 books（readingBookInfo.progress 通常为 0）
+            progress_map = {p.book_id: p.progress for p in progress_list}
+            for b in books:
+                if b.book_id in progress_map and b.progress == 0:
+                    b.progress = progress_map[b.book_id]
         else:
             books = await self.deps.weread_storage.list_books()
 

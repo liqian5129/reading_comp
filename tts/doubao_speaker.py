@@ -668,6 +668,9 @@ class DoubaoTTSPlayer:
                     total_bytes += len(frame)
                     try:
                         proc.stdin.write(frame)
+                        await asyncio.sleep(0)  # 强制让出事件循环，确保 interrupt 信号能及时处理
+                        if self._interrupt_event.is_set():
+                            break
                         await proc.stdin.drain()
                     except (BrokenPipeError, ConnectionResetError):
                         break
