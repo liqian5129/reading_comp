@@ -11,13 +11,12 @@ logger = logging.getLogger(__name__)
 # ==================== 工具定义 (JSON Schema) ====================
 
 READING_NOTE_TOOL = {
-    "name": "reading_note",
+    "name": "saving_note",
     "description": (
         "保存一条读书笔记到本地。书名优先从当前阅读上下文自动获取，无需用户指定。"
         "用户明确要求记录（摘抄、记下来、做笔记）时调用；"
         "用户表达值得记录的个人感悟、联想或新发现时也可主动调用。"
-        "【user_comment 必须提取】用户在请求记笔记时，往往同时表达了自己的看法或感受（如「这句话真的很深刻」「感觉和XX一样」「说的太对了」），"
-        "必须将这部分提取到 user_comment 字段，不能遗漏。"
+        "若用户表达了看法则提取到 user_comment，没有则留空，禁止编造。"
         "【多句合并】若用户要求把多个句子/段落「存在一起」「一起记下来」，"
         "必须从 OCR 文本中依次找到这些句子并拼接为一条 content，只调用一次工具，不要拆分成多次调用。"
         "「这句话的后面这句话」「后面那段」等指 OCR 文本中紧跟当前句子之后的内容，需从 OCR 原文中提取。"
@@ -36,7 +35,7 @@ READING_NOTE_TOOL = {
             },
             "user_comment": {
                 "type": "string",
-                "description": "用户对笔记内容的批注或个人想法。从用户话语中提取，不能遗漏。例：用户说「记下这句话，说的真的很深刻」→ user_comment='说的真的很深刻'；「把这段记下来，感觉跟打工人一样」→ user_comment='感觉跟打工人一样'。用户没有表达任何看法时才留空。",
+                "description": "用户对笔记内容的批注或个人想法。正例：「记下这句话，说的真的很深刻」→ user_comment='说的真的很深刻'；「把这段记下来，感觉跟打工人一样」→ user_comment='感觉跟打工人一样'。用户没有表达看法时必须留空，禁止编造。",
             },
             "save_image": {
                 "type": "boolean",
@@ -158,7 +157,7 @@ READING_LIST_MANAGE_TOOL = {
                 "type": "string",
                 "description": "add（加入）/ list（查看）/ mark_done（标记完成）/ mark_reading（标记在读）/ remove（移除）",
             },
-            "book_title": {"type": "string", "description": "书名，list 操作可留空"},
+            "book_title": {"type": "string", "description": "书名；action 为 list 时可留空，其余操作（add/mark_done/mark_reading/remove）必填"},
             "author": {"type": "string", "description": "作者（add 时可选）"},
             "notes": {"type": "string", "description": "备注（add 时可选）"},
             "filter_status": {
@@ -312,7 +311,7 @@ WEREAD_MERGE_NOTES_TOOL = {
         "type": "object",
         "properties": {
             "book_title": {"type": "string", "description": "书名（模糊匹配），必填"},
-            "push_to_feishu": {"type": "boolean", "description": "是否推送摘要到飞书（默认 false）"},
+            "push_to_feishu": {"type": "boolean", "description": "是否推送摘要到飞书（默认 false）；用户说「发给我」「发飞书」时设为 true"},
         },
         "required": ["book_title"],
     },
@@ -354,7 +353,7 @@ GENERATE_SUMMARY_IMAGE_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "summary_text": {"type": "string", "description": "摘要内容。留空则自动使用最近阅读摘要"},
+            "summary_text": {"type": "string", "description": "用户直接提供的特定文字才填写（如「把这段话做成卡片」）。若用户要总结今天/最近的阅读历史，此字段留空，工具自动从数据库获取"},
             "title": {"type": "string", "description": "卡片标题，默认用书名"},
             "days": {"type": "integer", "description": "summary 为空时拉取最近 N 天的摘要，默认 1"},
             "illustration_prompt": {
@@ -526,7 +525,7 @@ class ToolDispatcher:
         self._weread = WeReadTools(deps)
 
         self._dispatch = {
-            "reading_note": self._note.exec_reading_note,
+            "saving_note": self._note.exec_reading_note,
             "reading_history": self._note.exec_reading_history,
             "reading_notes": self._note.exec_reading_notes,
             "note_search": self._note.exec_note_search,

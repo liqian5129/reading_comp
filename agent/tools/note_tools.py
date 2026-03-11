@@ -1,5 +1,5 @@
 """
-笔记相关工具：reading_note, reading_history, reading_notes, note_search
+笔记相关工具：saving_note, reading_history, reading_notes, note_search
 """
 import asyncio
 import logging

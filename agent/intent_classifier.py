@@ -35,7 +35,7 @@ INTENT_CONFIGS = {
     ),
     Intent.NOTE_TAKING: IntentConfig(
         needs_page_context=True, needs_memory=True, needs_prefetch=False,
-        role_hint="请调用 reading_note 工具记录笔记。记录后判断用户是指令式录入还是在分享感受——前者一句确认，后者简短呼应。"
+        role_hint="请调用 saving_note 工具记录笔记。记录后判断：用户说「帮我记/记下来/把XX记下来」= 指令式，只一句确认（如「记下了」），不展开讨论不追问；用户同时表达了感受或观点（含「我觉得/感觉/其实/真的很」）= 分享感受，确认后2句自然回应。"
     ),
     Intent.NOTE_RECALL: IntentConfig(
         needs_page_context=False, needs_memory=True, needs_prefetch=True,
@@ -47,7 +47,7 @@ INTENT_CONFIGS = {
     ),
     Intent.WEREAD: IntentConfig(
         needs_page_context=False, needs_memory=False, needs_prefetch=False,
-        role_hint="请使用 weread_* 系列工具。"
+        role_hint="请使用 weread_* 系列工具。工具返回结果后只回答用户问的那一类数据（问书签只说书签，问划线只说划线），不把其他类型一并报出。数据直接列出，不加评论、不引发讨论、不追问。"
     ),
     Intent.TIMER: IntentConfig(
         needs_page_context=False, needs_memory=False, needs_prefetch=False,
@@ -59,7 +59,7 @@ INTENT_CONFIGS = {
     ),
     Intent.GENERAL_CHAT: IntentConfig(
         needs_page_context=True, needs_memory=True, needs_prefetch=True,
-        role_hint="若用户表达了值得记录的个人感悟、联想或新发现，可主动调用 reading_note 保存，无需等用户明确要求。"
+        role_hint="若用户表达了值得记录的个人感悟、联想或新发现，可主动调用 saving_note 保存，无需等用户明确要求。"
     ),
 }
 

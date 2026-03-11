@@ -681,6 +681,7 @@ class ReadingCompanion:
                 + "\n- 不要复述用户刚说过的具体内容（书名、时间、数字等），越短越好。"
                 + "\n- 不要编造结果：不说「已设置好」「已记录」「已查到」，结果由助手查完后告诉你。"
                 + "\n- 纯聊天（无工具触发）：正常完整回复。"
+                + "\n- 严禁输出任何思考过程、步骤规划、内部分析（如「我需要先...」「步骤1...」「让我调用...」），直接说结果或意图即可。"
             )
             stream_kwargs = dict(
                 user_message=text,
@@ -790,22 +791,23 @@ class ReadingCompanion:
                 else:
                     logger.info(f"[SubAgent] 执行完成: {executed_names} | tool_ctx={len(tool_ctx)}字")
                 logger.info(f"⏱️  [R2] 准备启动 | R1说了=「{round1_text[:40]}...」")
+                # R1 进 history，工具结果作为新的 user 输入
+                # 模型能自然感知"R1 已回复过"，再根据工具结果决定是否补充
+                r2_history = history + [{"role": "assistant", "content": round1_text}]
                 enriched_prompt = (
                     system_prompt
-                    + "\n\n## 工具已执行，结果如下\n" + tool_ctx
-                    + f"\n\n## R1（你刚才对用户说的话）\n{round1_text}"
                     + "\n\n## 输出规则（严格执行，禁止输出任何推理过程）"
                     + "\n根据工具返回的结果类型决定输出："
                     + "\n【操作类】工具返回操作成功确认（已记录/已创建/已设定/已保存等）→ 只输出 [SILENT]"
-                    + "\n【数据类】工具返回具体数据（统计数字、书签内容、划线列表、进度信息等）→ 一句话说出核心数据，不重复 R1"
+                    + "\n【数据类】工具返回具体数据（统计数字、书签内容、划线列表、进度信息等）→ 一句话说出核心数据，不重复 R1，不延伸讨论，不追问用户"
                     + "\n【失败类】工具返回失败 → 一句话说明原因"
                     + "\n【特殊】工具返回概览但用户要某书具体内容 → 告知找到了但详情未取到，建议重新问"
                     + "\n禁止：复述 R1 / 说「好的」「完成了」「已设置」/ 输出任何判断过程或解释"
                 )
                 stream_kwargs = dict(
-                    user_message=text,
+                    user_message=f"用户说：{text}\n\n[工具结果]\n{tool_ctx}",
                     system_prompt=enriched_prompt,
-                    history=history,
+                    history=r2_history,
                     tools=[],
                 )
             elif sub_agent_results and async_names:

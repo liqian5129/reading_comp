@@ -13,29 +13,29 @@ logger = logging.getLogger(__name__)
 
 # ── 工具目录（LLM 模式和日志使用） ────────────────────────────────────────────
 TOOL_CATALOG: Dict[str, str] = {
-    "reading_note":            "用户说「帮我记下来」「记一下」「把这句话存下来」「做个笔记」→ 保存读书笔记",
-    "reading_notes":           "查看/列出本地保存的历史笔记，可按书名或时间过滤",
-    "note_search":             "用语义搜索查找本地笔记和微信读书划线中的相关内容",
-    "bookmark_create":         "用户说「记个书签」「标记一下」「读到第X页了帮我记一下」→ 创建书签（非微信读书书签）",
-    "bookmark_list":           "查看本 App 保存的书签列表（仅限本 App 手动创建，非微信读书书签）",
-    "reading_progress_update": "更新本地记录的阅读进度（页码/完成状态）",
-    "reading_progress_query":  "查询本地记录的阅读进度",
-    "reading_list_manage":     "管理个人书单（添加想读/查看/标记完成或在读/移除）",
-    "reading_stats":           "查询阅读统计汇总（翻页数/时长/笔记数），可按今天/本周/本月/全部",
-    "reading_history":         "查询每次阅读会话的详细记录（每条含具体时长和翻页数）",
-    "set_timer":               "用户说「定时」「X分钟后提醒我」「帮我设个提醒」「提醒我休息/倒水/…」→ 设置倒计时",
-    "generate_quote_image":    "将金句/摘抄渲染为精美图片卡片（含背景/排版），完成后推送飞书图片",
-    "generate_summary_image":  "生成带 AI 插图的摘要图片卡片（图文混排），完成后推送飞书图片；用户说「生成卡片/做成卡片/摘要图/摘要卡/做成图」时优先选此工具",
-    "stylize_page":            "将当前书页照片转换为水彩/素描/漫画/吉卜力/水墨等插画风格，完成后推送飞书",
-    "export_ppt":              "将笔记/摘要/金句导出为 PPT 演示文稿（.pptx）",
-    "export_markdown":         "将笔记/摘要/金句导出为格式化 Markdown 文件（.md）",
-    "feishu_send_message":     "发送任意文本消息到飞书；图片卡片请用 generate_quote_image 或 generate_summary_image",
-    "weread_shelf":            "查看微信读书书架（书目列表和阅读进度概览）",
-    "weread_notebook":         "列出微信读书中有笔记的书单（含划线数和想法数）",
-    "weread_get_notes":        "获取某书的微信读书书签/划线/想法/点评（微信读书的书签在这里，不在 bookmark_list）",
-    "weread_progress":         "查询微信读书某书的阅读进度（百分比和时长）",
-    "weread_best_highlights":  "获取某书在微信读书上的热门划线（所有读者共同标注的精华句）",
-    "weread_merge_notes":      "合并某书的微信读书划线/想法与本地笔记，生成综合摘要，可推飞书",
+    "saving_note":             "用户想把读到的某句话、某个感悟或想法记录保存下来（写入新笔记，非查看）",
+    "reading_notes":           "用户想查看或回顾自己之前保存的读书笔记（查看已有，非写入）",
+    "note_search":             "用户想在笔记和划线里搜索某个主题或内容",
+    "bookmark_create":         "用户想标记当前读到的位置（非微信读书书签）",
+    "bookmark_list":           "用户想查看自己在本 App 手动创建的书签列表（本 App 专属，微信读书书签用 weread_get_notes）",
+    "reading_progress_update": "用户想更新本地记录的阅读页码或完成状态",
+    "reading_progress_query":  "用户想查询某本书本地 App 记录的阅读进度（非微信读书进度，微信读书用 weread_progress）",
+    "reading_list_manage":     "用户想管理自己的书单，包括添加想读、标记在读/已读、查看书单",
+    "reading_stats":           "用户想知道汇总数字——读了多久、翻了多少页、记了多少笔记（不含每次会话明细，明细用 reading_history）",
+    "reading_history":         "用户想查看每次具体阅读会话的时长和翻页记录（逐条明细，非汇总数字）",
+    "set_timer":               "用户想要在一段时间后收到提醒，去做某件事（喝水、休息、离开等）",
+    "generate_quote_image":    "用户想把某句金句或摘抄做成精美图片卡片发到飞书",
+    "generate_summary_image":  "用户想把阅读内容整理成图文摘要卡片发到飞书",
+    "stylize_page":            "用户想把当前书页照片转成水彩、漫画、吉卜力等艺术风格图片发飞书",
+    "export_ppt":              "用户想把笔记或摘要导出为 PPT 文件",
+    "export_markdown":         "用户想把笔记或摘要导出为 Markdown 文件",
+    "feishu_send_message":     "用户想发一条纯文字消息到飞书（图片/卡片请用图片工具）",
+    "weread_shelf":            "用户想查看微信读书书架上有哪些书及阅读进度",
+    "weread_notebook":         "用户想查看微信读书里哪些书有划线或笔记",
+    "weread_get_notes":        "用户想获取某本书在微信读书上的书签、划线、想法或点评（微信读书数据，本 App 书签用 bookmark_list）",
+    "weread_progress":         "用户想查询某本书在微信读书上的阅读进度（非本地记录，本地用 reading_progress_query）",
+    "weread_best_highlights":  "用户想看某本书在微信读书上被所有读者标注最多的热门句子",
+    "weread_merge_notes":      "用户想把微信读书的划线/想法和本地笔记合并成一份综合摘要",
 }
 
 
@@ -160,7 +160,7 @@ _REGEX_RULES: List[Tuple[str, str]] = [
 
     # 保存笔记（动作明确：帮我记 / 记下来 / 存下来）
     # 注意：避免「帮我.{0,6}记」误命中「笔记」「日记」等复合词
-    ("reading_note",
+    ("saving_note",
      r"帮(?:我|忙)\s*(?:记下来?|存下来?|写下来?|记录下来?|保存一?下)"
      r"|帮(?:我|忙).{0,3}(?:记一下|存一下|记个笔记)"
      r"|记下来|存下来|记一下吧?|记个笔记|帮记一?下"

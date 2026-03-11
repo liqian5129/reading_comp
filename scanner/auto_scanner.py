@@ -267,7 +267,11 @@ class AutoScanner:
             # KimiOCR 路径：指纹去重后 fire-and-forget，结果通过回调返回
             if self._kimi_ocr is not None:
                 fp = fingerprint(frame)
-                if fp and not is_page_turn(self._last_fingerprint, fp, threshold=20):
+                if fp and self._last_fingerprint:
+                    from camera.page_tracker import hamming_distance
+                    dist = hamming_distance(self._last_fingerprint, fp)
+                    logger.info(f"[指纹] 汉明距离={dist}（阈值12，>12判定为翻页）")
+                if fp and not is_page_turn(self._last_fingerprint, fp, threshold=12):
                     logger.debug("KimiOCR: 页面未变化（指纹相同），跳过")
                     return None
 
