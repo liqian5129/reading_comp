@@ -46,7 +46,7 @@ class AIClient:
                  model: str = "",
                  base_url: str = "",
                  enable_thinking: bool = False,
-                 max_retries: int = 2,
+                 max_retries: int = 4,
                  timeout: float = 60.0,
                  reasoning_effort: Optional[str] = None):
         """

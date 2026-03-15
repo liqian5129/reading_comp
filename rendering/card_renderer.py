@@ -167,7 +167,9 @@ class CardRenderer:
 
         dt = date or datetime.now()
         s = self._scale
-        img = Image.new("RGB", (self.width, self.height), tpl.bg_color)
+        # 用足够大的画布避免长文本超出边界被裁剪，最后按实际内容高度 crop
+        _canvas_h = max(self.height, 6000)
+        img = Image.new("RGB", (self.width, _canvas_h), tpl.bg_color)
         draw = ImageDraw.Draw(img)
 
         margin_x = int(80 * s)
@@ -240,12 +242,9 @@ class CardRenderer:
                 )
                 y += s_bbox[3] - s_bbox[1] + int(8 * s)
 
-        # 动态裁剪/扩展画布到实际内容高度
+        # 裁剪到实际内容高度（画布足够大，内容不会被裁掉）
         final_h = y + int(100 * s)
-        if final_h != self.height:
-            new_img = Image.new("RGB", (self.width, final_h), tpl.bg_color)
-            new_img.paste(img, (0, 0))
-            img = new_img
+        img = img.crop((0, 0, self.width, final_h))
 
         # 保存
         ts = dt.strftime("%Y%m%d_%H%M%S")

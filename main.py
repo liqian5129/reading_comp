@@ -185,6 +185,13 @@ class ReadingCompanion:
         self._msg_lock = asyncio.Lock()  # 防止并发处理用户消息
         self._ai_task: Optional[asyncio.Task] = None
         self._last_page_text: str = ""  # 上一次 OCR 文本（用于内容比对翻页检测）
+
+        # 阅读状态机
+        self._is_reading: bool = False
+        self._last_page_change_ts: float = 0.0   # 上次翻页或首次检测到内容的时间戳
+        self._reading_watchdog_task: Optional[asyncio.Task] = None
+        self._READING_IDLE_TIMEOUT_S = 600        # 同一页超过 10 分钟 → IDLE
+        self._READING_HEARTBEAT_S = 120           # READING 态下每 2 分钟写一条心跳记录
         
     async def initialize(self):
         """初始化所有模块"""
@@ -515,6 +522,45 @@ class ReadingCompanion:
         else:
             logger.info("✅ 所有记录 embedding 已完整，无需补全")
 
+    async def _reading_watchdog(self) -> None:
+        """阅读状态看门狗：每30s 检查空闲超时；每2分钟写心跳记录。"""
+        import time as _time
+        _CHECK_INTERVAL_S = 30
+        _last_heartbeat_ts: float = 0.0
+
+        while self._running:
+            await asyncio.sleep(_CHECK_INTERVAL_S)
+            if not self._running:
+                break
+
+            now_s = _time.time()
+
+            if not self._is_reading:
+                continue
+
+            # ── 空闲超时检测 ──────────────────────────────────────────────────
+            idle_secs = now_s - self._last_page_change_ts
+            if idle_secs > self._READING_IDLE_TIMEOUT_S:
+                self._is_reading = False
+                logger.info(f"📖 阅读状态 → IDLE（{idle_secs/60:.1f}min 无翻页）")
+                continue
+
+            # ── 心跳记录（每 2 分钟） ─────────────────────────────────────────
+            if now_s - _last_heartbeat_ts >= self._READING_HEARTBEAT_S:
+                _last_heartbeat_ts = now_s
+                if self.session_manager:
+                    try:
+                        await self.session_manager.record_reading_activity(
+                            ts=int(now_s),
+                            page_num=None,
+                            book_title=self.memory.current_book_context.get("book_title", "") if self.memory else "",
+                            ocr_chars=0,
+                            is_page_turn=0,
+                        )
+                        logger.debug("📖 心跳记录已写入 reading_activity")
+                    except Exception as e:
+                        logger.warning(f"[watchdog] 心跳写入失败: {e}")
+
     async def shutdown(self):
         """关闭所有模块"""
         if self._shutting_down:
@@ -523,6 +569,24 @@ class ReadingCompanion:
         logger.info("正在关闭...")
 
         self._running = False
+
+        # 取消阅读 watchdog；若当前仍在阅读，写一条最终心跳保留时长
+        if self._reading_watchdog_task and not self._reading_watchdog_task.done():
+            self._reading_watchdog_task.cancel()
+        if self._is_reading and self.session_manager:
+            import time as _time
+            try:
+                await self.session_manager.record_reading_activity(
+                    ts=int(_time.time()),
+                    page_num=None,
+                    book_title=self.memory.current_book_context.get("book_title", "") if self.memory else "",
+                    ocr_chars=0,
+                    is_page_turn=0,
+                )
+                logger.info("📖 shutdown 心跳已写入 reading_activity")
+            except Exception as e:
+                logger.warning(f"shutdown 心跳写入失败: {e}")
+            self._is_reading = False
 
         # 取消定时巩固 task
         if self._periodic_task and not self._periodic_task.done():
@@ -593,6 +657,9 @@ class ReadingCompanion:
             else:
                 self._print_ready_banner()
         
+        # 启动阅读状态 watchdog
+        self._reading_watchdog_task = asyncio.create_task(self._reading_watchdog())
+
         # 保持运行
         try:
             while self._running:
@@ -676,8 +743,10 @@ class ReadingCompanion:
                 + "\n\n## 当前阶段（R1）"
                 + "\n工具尚未执行完毕，你现在不知道操作是否成功、也不知道查询结果是什么。"
                 + "\n因此只能说意图，在逻辑上不可能说结果："
-                + "\n  正确：「好，来定个两分钟提醒」「稍等，查书签」「帮你记一下」"
-                + "\n  错误：「定好了」「记下了」「查到了」「已设置」——说这些等于假装知道结果"
+                + "\n  ✓ 正确：「好，来定个两分钟提醒」「稍等，查书签」「帮你记一下」"
+                + "\n  ✗ 错误：「定好了」「记下了」「查到了」「已设置」——说这些等于假装知道结果"
+                + "\n  ✗ 错误：「用户要把金句做成卡片，需要调用…按…处理，稍等」——暴露推理步骤（禁止）"
+                + "\n  ✓ 正确：「稍等，帮你生成金句卡片发飞书」——只说最终意图，不解释过程"
                 + "\n不要复述用户说的具体内容（书名、时间、数字），一句话即止。"
                 + "\n纯聊天（无工具触发）：正常完整回复。"
                 + "\n严禁输出任何思考过程或步骤规划，直接说意图即可。"
@@ -797,11 +866,13 @@ class ReadingCompanion:
                     system_prompt
                     + "\n\n## 输出规则（严格执行，禁止输出任何推理过程）"
                     + "\n根据工具返回的结果类型决定输出："
-                    + "\n【操作类】工具返回操作成功确认（已记录/已创建/已设定/已保存/success=True 且无需展示的数据）→ 只输出 [SILENT]，就算结果里带了页码、ID 等字段也不说，这些是内部数据不是用户要看的"
+                    + "\n【永远 [SILENT]】以下工具无论 tool_ctx 里有什么内容，统一输出 [SILENT]（tool_ctx 里的是内部元数据，不是给用户看的）："
+                    + "\n  saving_note、bookmark_create、reading_progress_update"
+                    + "\n【操作类】其他工具返回操作成功确认（success=True 且无需展示的数据）→ 只输出 [SILENT]"
                     + "\n【数据类】工具返回具体数据（统计数字、书签内容、划线列表、进度信息等）→ 一句话说出核心数据，不重复 R1，不延伸讨论，不追问用户"
                     + "\n【失败类】工具返回失败 → 一句话说明原因"
                     + "\n【特殊】工具返回概览但用户要某书具体内容 → 告知找到了但详情未取到，建议重新问"
-                    + "\n禁止：复述 R1 / 说「好的」「完成了」「已设置」/ 输出任何判断过程或解释"
+                    + "\n禁止：复述 R1 / 说「好的」「完成了」「已设置」「记下了」/ 输出任何判断过程或解释"
                 )
                 stream_kwargs = dict(
                     user_message=f"用户说：{text}\n\n[工具结果]\n{tool_ctx}",
@@ -1056,9 +1127,23 @@ class ReadingCompanion:
                 self._last_page_text = current_text
 
         now_ts = int(_time.time() * 1000)
+        now_s = _time.time()
 
-        # 每次 is_reading=true 都记录到 reading_activity（用于计算阅读时长）
-        if self.session_manager:
+        # ── 阅读状态机 ────────────────────────────────────────────────────────
+        if current_text:
+            if not self._is_reading:
+                self._is_reading = True
+                self._last_page_change_ts = now_s
+                logger.info("📖 阅读状态 → READING")
+            if pages_turned > 0:
+                self._last_page_change_ts = now_s  # 翻页：重置空闲计时器
+        else:
+            if self._is_reading:
+                self._is_reading = False
+                logger.info("📖 阅读状态 → IDLE（无书页内容）")
+
+        # 翻页时写 reading_activity（页数统计用）
+        if pages_turned > 0 and self.session_manager:
             asyncio.create_task(
                 self.session_manager.record_reading_activity(
                     ts=now_ts,

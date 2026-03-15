@@ -45,10 +45,11 @@ _STAGE_B_SYSTEM = """你是对话助手的后台工具执行器。
 - 若必填参数无法从对话中获取，将该字段置为 null，不要编造或猜测"""
 
 # Stage A：目录选择（小 payload，快）；Stage B：参数生成（少量 schema，也快）
-_STAGE_A_TIMEOUT_S = 12.0
-_STAGE_B_TIMEOUT_S = 18.0
+# 留足 SDK retry 时间：kimi 偶发 5xx 时 SDK 会等 0.4s 后重试，12s 太紧
+_STAGE_A_TIMEOUT_S = 25.0
+_STAGE_B_TIMEOUT_S = 35.0
 # 外层安全兜底（Stage A + Stage B 总时间上限）
-_LLM_TIMEOUT_S = 30.0
+_LLM_TIMEOUT_S = 60.0
 
 
 class SubAgent:
@@ -84,10 +85,10 @@ class SubAgent:
             )
             logger.info(f"[SubAgent] LLM 完成 +{time.time()-t0:.1f}s | tool_calls={[tc['name'] for tc in tool_calls] if tool_calls else '[]'}")
         except asyncio.TimeoutError:
-            logger.warning(f"[SubAgent] LLM 超时（>{_LLM_TIMEOUT_S}s），返回超时标志")
+            logger.warning(f"[SubAgent] LLM 超时（实际耗时 {time.time()-t0:.1f}s），返回超时标志")
             return {"__timeout__": True}
         except Exception as e:
-            logger.warning(f"[SubAgent] LLM 异常: {e}，返回超时标志")
+            logger.warning(f"[SubAgent] LLM 异常（实际耗时 {time.time()-t0:.1f}s）: {e}，返回超时标志")
             return {"__timeout__": True}
 
         if not tool_calls:
