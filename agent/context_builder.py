@@ -95,6 +95,14 @@ class DynamicContextBuilder:
                 f"请直接基于它回答用户问题，无需再次拍照：\n\n{page_text}{truncated}"
             )
 
+        # 6.5 手指点读上下文
+        if memory.finger_pointed_text:
+            parts.append(
+                f"【用户手指当前指向的文字】\n"
+                f"{memory.finger_pointed_text}\n"
+                f"（用户可能想朗读、翻译或摘抄这段文字，请根据用户的语音指令判断意图）"
+            )
+
         # 7. 工具调用策略（始终注入）
         parts.append("""## 工具调用策略
 

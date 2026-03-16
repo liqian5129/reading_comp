@@ -492,6 +492,24 @@ class ReadingCompanion:
         if self.embedder and self.storage:
             asyncio.create_task(self._backfill_embeddings())
 
+        # 9. 指尖点读（可选，需要 mediapipe）
+        if config.FINGER_DETECTION_ENABLED and self.scanner:
+            from scanner.finger_detector import FingerDetector
+            fd = FingerDetector()
+            if fd.is_available():
+                self.scanner._finger_detector = fd
+                self.scanner.on_finger_stable = self._on_finger_stable
+                # 预加载 Crop PaddleOCR，避免首次触发时卡顿
+                from ocr.engine import get_crop_ocr as _get_crop_ocr
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _get_crop_ocr)
+                asyncio.create_task(self.scanner._finger_loop())
+                logger.info(
+                    f"[Finger] 指尖检测已启动（停留阈值 {config.FINGER_DWELL_SECONDS}s）"
+                )
+            else:
+                logger.warning("[Finger] mediapipe 未安装，运行: pip install mediapipe")
+
         logger.info("初始化完成")
 
     async def _backfill_embeddings(self) -> None:
@@ -560,6 +578,107 @@ class ReadingCompanion:
                         logger.debug("📖 心跳记录已写入 reading_activity")
                     except Exception as e:
                         logger.warning(f"[watchdog] 心跳写入失败: {e}")
+
+    # ------------------------------------------------------------------
+    # 指尖点读
+    # ------------------------------------------------------------------
+
+    def _on_finger_stable(self, px: int, py: int, frame, hand: str = "Unknown",
+                          dir_x: int = 0, dir_y: int = 0):
+        """由 _finger_loop 在事件循环中调用，派发异步处理"""
+        asyncio.create_task(self._process_finger_point(px, py, frame, dir_x, dir_y))
+
+    async def _process_finger_point(self, px: int, py: int, frame,
+                                     dir_x: int = 0, dir_y: int = 0):
+        """识别手指指向的文字行，注入到 memory.finger_pointed_text。
+
+        策略：对指尖周围搜索区做 OCR，提取所有 bounding box，
+        用 lm6→lm8 指向向量打射线，找射线穿越的 box；无法计算方向时退化为 nearest-centroid。
+        """
+        import cv2 as _cv2
+        import numpy as np
+        from ocr.engine import get_crop_ocr, _extract_boxes
+
+        h, w = frame.shape[:2]
+
+        # 1. 裁剪搜索区（宽覆盖整行，高覆盖 3 行）
+        SEARCH_W, SEARCH_H = 900, 240
+        x1 = max(0, px - SEARCH_W // 2)
+        x2 = min(w, px + SEARCH_W // 2)
+        y1 = max(0, py - SEARCH_H // 2)
+        y2 = min(h, py + SEARCH_H // 2)
+        search_crop = frame[y1:y2, x1:x2]
+
+        if search_crop.size == 0:
+            logger.warning(f"[Finger] 搜索区为空 px={px} py={py} frame={w}x{h}")
+            return
+
+        # 2. OCR 提取搜索区内所有 box（锐化后识别，改善书脊弯曲处模糊文字）
+        loop = asyncio.get_event_loop()
+        def _ocr_boxes():
+            from ocr.engine import _sharpen
+            ocr = get_crop_ocr()
+            result = list(ocr.predict(_sharpen(search_crop)))
+            return _extract_boxes(result)
+
+        boxes = await loop.run_in_executor(None, _ocr_boxes)
+
+        if not boxes:
+            logger.debug("[Finger] 搜索区无文字 box")
+            return
+
+        # 3. 坐标从 crop 空间转换到校正帧空间
+        for box in boxes:
+            box["poly"] = [[pt[0] + x1, pt[1] + y1] for pt in box["poly"]]
+            box["cx"] += x1
+            box["cy"] += y1
+
+        # 4. 射线查找：lm6(dir_x,dir_y) → lm8(px,py) 方向延伸
+        rdx, rdy = px - dir_x, py - dir_y
+        r_len = (rdx ** 2 + rdy ** 2) ** 0.5
+        has_direction = r_len > 5   # lm6/lm8 距离太近时方向不可信
+        if has_direction:
+            rdx, rdy = rdx / r_len, rdy / r_len
+        logger.debug(f"[Finger] 指向向量 ({rdx:.2f},{rdy:.2f}) has_direction={has_direction}")
+
+        RAY_PERP_THRESH = 80   # 射线垂直容忍距离（px），约覆盖一行字高的一半
+        RAY_T_MAX = 600        # 沿射线最远搜索距离（px）
+
+        matched = None
+
+        # Step 1: 射线穿越 —— 找垂直距离最小且在射线前方的 box
+        if has_direction:
+            best_perp, best_box = float("inf"), None
+            for box in boxes:
+                cx, cy = box["cx"], box["cy"]
+                t = (cx - px) * rdx + (cy - py) * rdy   # 投影，>0 = 指尖前方
+                if t < 0 or t > RAY_T_MAX:
+                    continue
+                perp = abs((cx - px) * rdy - (cy - py) * rdx)  # 垂直距离
+                if perp < RAY_PERP_THRESH and perp < best_perp:
+                    best_perp, best_box = perp, box
+            if best_box:
+                matched = best_box["text"]
+                logger.info(f"[Finger] box 命中（ray perp={best_perp:.0f}px）: 「{matched[:50]}」")
+
+        # Step 2: 退化兜底 —— 方向不可信时用 nearest-centroid
+        if matched is None:
+            MAX_DIST_Y = 120
+            best_dist, best_box = float("inf"), None
+            for box in boxes:
+                dy = abs(box["cy"] - py)
+                if dy > MAX_DIST_Y:
+                    continue
+                dist = (box["cx"] - px) ** 2 + dy ** 2
+                if dist < best_dist:
+                    best_dist, best_box = dist, box
+            if best_box:
+                matched = best_box["text"]
+                logger.info(f"[Finger] box 命中（fallback nearest {best_dist**0.5:.0f}px）: 「{matched[:50]}」")
+
+        if matched and self.memory:
+            self.memory.set_finger_text(matched)
+            logger.info(f"[Finger] ✅ 注入上下文: 「{matched[:60]}」")
 
     async def shutdown(self):
         """关闭所有模块"""

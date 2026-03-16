@@ -9,8 +9,9 @@
 """
 import asyncio
 import logging
+import time
 import cv2
-import numpy as np
+import numpy as np  # noqa: F401 — used in _finger_loop perspectiveTransform
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -106,6 +107,15 @@ class AutoScanner:
 
         # 语音录音器引用（用于 OCR/ASR 资源冲突规避）
         self._voice_recorder = None
+
+        # 指尖检测
+        self._finger_detector = None
+        self._last_stable_pos: Optional[tuple] = None   # (norm_x, norm_y)
+        self._finger_dwell_since: float = 0.0
+        self._finger_dwell_threshold: float = config.FINGER_DWELL_SECONDS
+        self._last_raw_frame: Optional[np.ndarray] = None  # 保存最新原始帧
+        self.on_finger_stable: Optional[Callable[[int, int, np.ndarray], None]] = None
+        # 回调参数: (pixel_x, pixel_y, raw_frame)
 
         # 固定透视校正矩阵（可选，由标定脚本生成）
         if config.PERSPECTIVE_ENABLED:
@@ -264,6 +274,9 @@ class AutoScanner:
             if self._perspective_M is not None:
                 frame = apply_fixed_homography(frame, self._perspective_M)
 
+            # 保存校正后的帧供指尖裁剪使用（与 OCR 坐标空间一致）
+            self._last_raw_frame = frame
+
             # KimiOCR 路径：指纹去重后 fire-and-forget，结果通过回调返回
             if self._kimi_ocr is not None:
                 fp = fingerprint(frame)
@@ -334,6 +347,108 @@ class AutoScanner:
         except Exception as e:
             logger.error(f"扫描失败: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # 指尖检测
+    # ------------------------------------------------------------------
+
+    async def _finger_loop(self):
+        """指尖检测主循环，在独立 task 中运行"""
+        DETECT_INTERVAL = 1.0 / config.FINGER_DETECTION_FPS
+        DWELL_MOVE_THRESHOLD = 0.02  # 归一化距离，超过则重置计时
+
+        loop = asyncio.get_event_loop()
+        logger.info("[Finger] 指尖检测循环已启动")
+
+        while self._running:
+            try:
+                if self._camera is None or not self._camera.is_opened():
+                    await asyncio.sleep(DETECT_INTERVAL)
+                    continue
+
+                raw_frame = await loop.run_in_executor(None, self._camera.read)
+                if raw_frame is None:
+                    await asyncio.sleep(DETECT_INTERVAL)
+                    continue
+
+                # 校正帧：用于裁剪和 OCR
+                if self._perspective_M is not None:
+                    corrected = apply_fixed_homography(raw_frame, self._perspective_M)
+                else:
+                    corrected = raw_frame
+                self._last_raw_frame = corrected
+
+                # MediaPipe 在原始帧上检测（手的形态自然，不被透视扭曲）
+                h_r, w_r = raw_frame.shape[:2]
+                mp_scale = 960 / max(h_r, w_r)
+                if mp_scale < 1.0:
+                    small = cv2.resize(raw_frame, (int(w_r * mp_scale), int(h_r * mp_scale)))
+                else:
+                    small = raw_frame
+
+                finger = await loop.run_in_executor(
+                    None, self._finger_detector.process, small
+                )
+
+                if finger is None:
+                    self._last_stable_pos = None
+                    self._finger_dwell_since = 0.0
+                    await asyncio.sleep(DETECT_INTERVAL)
+                    continue
+
+                now = time.time()
+                if self._last_stable_pos is None:
+                    self._last_stable_pos = (finger.x, finger.y)
+                    self._finger_dwell_since = now
+                else:
+                    dx = abs(finger.x - self._last_stable_pos[0])
+                    dy = abs(finger.y - self._last_stable_pos[1])
+                    if dx > DWELL_MOVE_THRESHOLD or dy > DWELL_MOVE_THRESHOLD:
+                        self._last_stable_pos = (finger.x, finger.y)
+                        self._finger_dwell_since = now
+                    elif now - self._finger_dwell_since >= self._finger_dwell_threshold:
+                        self._finger_dwell_since = now + 9999
+                        # 原始坐标映射到校正帧坐标
+                        px_r = int(finger.x * w_r)
+                        py_r = int(finger.y * h_r)
+                        if self._perspective_M is not None:
+                            pt = np.array([[[px_r, py_r]]], dtype=np.float32)
+                            pt_c = cv2.perspectiveTransform(pt, self._perspective_M)
+                            px = int(pt_c[0][0][0])
+                            py = int(pt_c[0][0][1])
+                        else:
+                            px, py = px_r, py_r
+                        if self.on_finger_stable and self._last_raw_frame is not None:
+                            # 方向：原始帧中 lm6→lm8 单位向量，取 lm8 身后 50px 近距探测点
+                            # 再透视变换。近距探测点与 lm8 高度几乎相同，避免 lm6 因离书面
+                            # 较远导致透视变换偏差大的问题。
+                            raw_dx = (finger.x - finger.dir_x) * w_r
+                            raw_dy = (finger.y - finger.dir_y) * h_r
+                            raw_len = (raw_dx**2 + raw_dy**2) ** 0.5
+                            if raw_len > 5:
+                                probe_x = px_r - raw_dx / raw_len * 50
+                                probe_y = py_r - raw_dy / raw_len * 50
+                            else:
+                                probe_x = finger.dir_x * w_r
+                                probe_y = finger.dir_y * h_r
+                            dir_px, dir_py = int(probe_x), int(probe_y)
+                            if self._perspective_M is not None:
+                                dpt = np.array([[[probe_x, probe_y]]], dtype=np.float32)
+                                dpt_c = cv2.perspectiveTransform(dpt, self._perspective_M)
+                                dir_px = int(dpt_c[0][0][0])
+                                dir_py = int(dpt_c[0][0][1])
+                            self.on_finger_stable(px, py, self._last_raw_frame.copy(),
+                                                  finger.hand, dir_px, dir_py)
+
+                await asyncio.sleep(DETECT_INTERVAL)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Finger] 检测循环异常: {e}")
+                await asyncio.sleep(DETECT_INTERVAL)
+
+        logger.info("[Finger] 指尖检测循环已退出")
 
     # ------------------------------------------------------------------
     # 状态查询

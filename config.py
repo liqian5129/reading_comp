@@ -182,6 +182,11 @@ class Config:
             "https://ark.cn-beijing.volces.com/api/v3"
         )
 
+        # 指尖点读
+        self.FINGER_DETECTION_ENABLED = self._get("finger", "enabled", False)
+        self.FINGER_DETECTION_FPS     = self._get("finger", "detection_fps", 15)
+        self.FINGER_DWELL_SECONDS     = self._get("finger", "dwell_seconds", 1.5)
+
         # 数据目录
         data_dir = self._get("data", "data_dir", "./data")
         self.DATA_DIR = Path(data_dir)

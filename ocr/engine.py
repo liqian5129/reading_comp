@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 # 延迟导入 PaddleOCR，避免启动时加载
 _ocr_instance = None
+_crop_ocr_instance = None  # 专用于小图裁剪，不使用 UVDoc
 
 
 def _sharpen(image: np.ndarray) -> np.ndarray:
@@ -51,6 +52,38 @@ def _create_paddle_ocr():
         # 2.x：传统参数
         return PaddleOCR(
             use_angle_cls=True,
+            lang='ch',
+            use_gpu=False,
+            show_log=False,
+        )
+
+
+def _create_crop_ocr():
+    """
+    创建专用于指尖小图裁剪的轻量 PaddleOCR 实例。
+    关闭 UVDoc（use_doc_unwarping）和方向分类——这两个模块设计用于全页图，
+    在 500×55px 的小图上会因尺寸检查失败而返回空结果。
+    """
+    from paddleocr import PaddleOCR
+    import paddleocr as _pkg
+    version = getattr(_pkg, '__version__', '2.0')
+    major = int(version.split('.')[0])
+
+    if major >= 3:
+        return PaddleOCR(
+            lang='ch',
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            text_detection_model_name='PP-OCRv5_server_det',
+            text_recognition_model_name='PP-OCRv5_server_rec',
+            text_det_limit_side_len=960,
+            text_det_limit_type='max',
+            text_det_box_thresh=0.4,
+            text_det_unclip_ratio=1.8,
+        )
+    else:
+        return PaddleOCR(
+            use_angle_cls=False,
             lang='ch',
             use_gpu=False,
             show_log=False,
@@ -107,6 +140,75 @@ def sort_dual_page_lines(polys, texts, scores, score_thresh: float = 0.5) -> Lis
 
     # 单页，直接按 Y 排序
     return [t for _, _, t in sorted(items, key=lambda x: x[1])]
+
+
+def _extract_boxes(result, score_thresh: float = 0.4) -> List[dict]:
+    """
+    从 PaddleOCR 原始 result 提取每行 bounding box 信息。
+    返回列表，每项为 {text, poly, cx, cy}。
+    - poly: 4 点列表 [[x, y], ...]，坐标在输入图像的像素空间
+    - cx, cy: 多边形中心点
+
+    兼容 PaddleOCR 2.x / 3.x。
+    """
+    if not result:
+        return []
+    if not isinstance(result, list):
+        result = list(result)
+    if not result:
+        return []
+
+    first = result[0]
+    boxes = []
+
+    # 3.x: OCRResult dict-like 对象
+    if hasattr(first, '__getitem__') and not isinstance(first, list):
+        try:
+            for r in result:
+                polys  = r.get('rec_polys') or r.get('dt_polys') or []
+                texts  = r['rec_texts']  or []
+                scores = r['rec_scores'] or []
+                for poly, text, score in zip(polys, texts, scores):
+                    if score < score_thresh or not text.strip():
+                        continue
+                    pts = np.array(poly, dtype=np.float32)
+                    cx = float(pts[:, 0].mean())
+                    cy = float(pts[:, 1].mean())
+                    boxes.append({
+                        "text": text,
+                        "poly": [[float(p[0]), float(p[1])] for p in poly],
+                        "cx": cx,
+                        "cy": cy,
+                    })
+            return boxes
+        except (KeyError, TypeError):
+            pass
+
+    # 2.x: 嵌套 list 格式
+    try:
+        for block in result:
+            if block is None:
+                continue
+            for item in block:
+                if item and len(item) >= 2:
+                    poly  = item[0]
+                    text  = item[1][0]
+                    score = item[1][1]
+                    if score < score_thresh or not text.strip():
+                        continue
+                    pts = np.array(poly, dtype=np.float32)
+                    cx = float(pts[:, 0].mean())
+                    cy = float(pts[:, 1].mean())
+                    boxes.append({
+                        "text": text,
+                        "poly": [[float(p[0]), float(p[1])] for p in poly],
+                        "cx": cx,
+                        "cy": cy,
+                    })
+    except (IndexError, TypeError):
+        pass
+
+    return boxes
 
 
 def _extract_lines(result, score_thresh: float = 0.5) -> List[str]:
@@ -174,6 +276,19 @@ def get_ocr():
         _ocr_instance = _create_paddle_ocr()
         logger.info("PaddleOCR 初始化完成")
     return _ocr_instance
+
+
+def get_crop_ocr():
+    """
+    获取指尖小图专用 PaddleOCR 单例（无 UVDoc，无方向分类）。
+    与 get_ocr() 共享检测/识别模型权重文件，只是配置不同，初始化快。
+    """
+    global _crop_ocr_instance
+    if _crop_ocr_instance is None:
+        logger.info("正在初始化 Crop PaddleOCR（无 UVDoc）...")
+        _crop_ocr_instance = _create_crop_ocr()
+        logger.info("Crop PaddleOCR 初始化完成")
+    return _crop_ocr_instance
 
 
 def extract_text_from_image(image: np.ndarray) -> str:
@@ -287,3 +402,20 @@ class OCREngine:
 def create_ocr_engine() -> OCREngine:
     """创建新的 OCR 引擎实例（用于子进程）"""
     return OCREngine()
+
+
+def extract_text_from_crop(image: np.ndarray) -> str:
+    """
+    对指尖裁剪的小图做快速 OCR。
+    使用专用单例（无 UVDoc、无方向分类），兼容 500×55px 等小尺寸输入。
+    """
+    try:
+        ocr = get_crop_ocr()
+        result = ocr.predict(image)
+        lines = _extract_lines(result)
+        text = ' '.join(lines)
+        logger.debug(f"Crop OCR 原始结果: lines={lines}")
+        return text
+    except Exception as e:
+        logger.error(f"Crop OCR 失败: {e}")
+        return ""

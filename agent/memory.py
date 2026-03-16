@@ -144,6 +144,9 @@ class Memory:
         # 翻页预分析 hint（由 ProactivePageAnalyzer 写入，翻页时重置）
         self.proactive_page_hint: Optional[str] = None
 
+        # 指尖点读：当前手指指向的文字（行级别）
+        self.finger_pointed_text: str = ""
+
         # 本次会话滚动阅读摘要
         self.session_reading_digest: str = ""
         self._new_pages_buffer: list = []   # 待压缩的新页摘录
@@ -353,6 +356,12 @@ class Memory:
 
         return DynamicContextBuilder().build(self, intent, config)
     
+    def set_finger_text(self, text: str):
+        self.finger_pointed_text = text
+
+    def clear_finger_text(self):
+        self.finger_pointed_text = ""
+
     def update_from_session_summary(self, summary: str):
         """
         从会话总结中提取并更新用户偏好
