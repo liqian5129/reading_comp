@@ -3,65 +3,136 @@
   "_comment2": "AI 读书搭子 配置文件",
   "_comment3": "复制此文件为 config.json 并填写你的密钥",
   "_comment4": "===========================================",
-  
+
   "ai": {
     "_comment": "AI 提供商: kimi 或 doubao",
     "provider": "kimi",
-    "kimi_api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+
+    "_comment2": "Kimi 配置 - https://platform.moonshot.cn/",
+    "kimi_api_key": "YOUR_KIMI_API_KEY",
     "kimi_model": "kimi-k2.5",
     "kimi_base_url": "https://api.moonshot.cn/v1",
-    "kimi_enable_thinking": false
+    "kimi_enable_thinking": false,
+
+    "_comment3": "豆包配置 - https://console.volcengine.com/",
+    "doubao_api_key": "YOUR_DOUBAO_API_KEY",
+    "doubao_model": "YOUR_DOUBAO_MODEL_ENDPOINT",
+    "doubao_base_url": "https://ark.cn-beijing.volces.com/api/v3"
   },
-  
+
+  "aliyun_nls": {
+    "_comment": "阿里云 NLS 配置 - https://nls-portal.console.aliyun.com/",
+    "_comment2": "Token 有过期时间（默认 24 小时），需要定期更新",
+    "_comment3": "或者填写 access_key_id 和 access_key_secret 自动获取 Token",
+
+    "app_key": "YOUR_ALIYUN_NLS_APP_KEY",
+    "token": "YOUR_ALIYUN_NLS_TOKEN",
+    "access_key_id": "YOUR_ALIYUN_ACCESS_KEY_ID",
+    "access_key_secret": "YOUR_ALIYUN_ACCESS_KEY_SECRET"
+  },
+
   "tts": {
-    "_comment": "TTS 提供商: aliyun / elevenlabs / doubao",
+    "_comment": "TTS 提供商: aliyun 或 elevenlabs 或doubao",
     "provider": "doubao",
-    
+
     "_comment2": "阿里云 NLS TTS 配置",
     "aliyun_voice": "xiaoyun",
     "aliyun_player_cmd": "afplay",
-    
+
     "_comment3": "ElevenLabs TTS 配置 - https://elevenlabs.io/app/settings/api-keys",
-    "elevenlabs_api_key": "sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-    "elevenlabs_voice_id": "pNInz6obpgDQGcFmaJgB",
+    "elevenlabs_api_key": "YOUR_ELEVENLABS_API_KEY",
+    "elevenlabs_voice_id": "YOUR_ELEVENLABS_VOICE_ID",
+    "_comment4": "推荐中文声音:",
+    "_comment5": "  - pNInz6obpgDQGcFmaJgB (Adam - 男声)",
+    "_comment6": "  - XB0fDUnXU5powFXDhCwa (Bella - 女声)",
+    "_comment7": "  - Xb7hH8MSUJpSbSDYk0k2 (Alice - 女声)",
     "elevenlabs_model": "eleven_multilingual_v2",
     "elevenlabs_player_cmd": "afplay",
-    
-    "_comment4": "豆包 TTS 配置 - https://www.volcengine.com/docs/6561/1257584",
-    "_comment5": "从 https://console.volcengine.com/iam/keymanagement/ 获取 Access Key",
-    "doubao_tts_appid": "your-app-id",
-    "doubao_tts_token": "your-access-token",
+
+    "doubao_tts_appid": "YOUR_DOUBAO_TTS_APPID",
+    "doubao_tts_token": "YOUR_DOUBAO_TTS_TOKEN",
     "doubao_tts_cluster": "volcano_tts",
-    "doubao_tts_voice_type": "BV001_streaming",
+    "doubao_tts_voice_type": "zh_female_shuangkuaisisi_uranus_bigtts",
     "doubao_tts_emotion": "happy",
     "doubao_tts_speed_ratio": 1.0,
     "doubao_tts_volume_ratio": 1.0,
     "doubao_tts_pitch_ratio": 1.0,
     "doubao_tts_player_cmd": "afplay"
   },
-  
-  "aliyun_nls": {
-    "_comment": "阿里云 NLS 配置（用于 ASR）",
-    "app_key": "你的 NLS App Key",
-    "token": "你的 NLS Token",
-    "access_key_id": "",
-    "access_key_secret": ""
+
+  "asr": {
+    "_comment": "ASR 提供商: aliyun（云端）或 funasr（本地）",
+    "provider": "funasr",
+    "_comment2": "FunASR 本地设置（provider=funasr 时生效）",
+    "funasr_device": "auto",
+    "_comment3": "auto 自动选 mps（Apple Silicon）或 cpu，也可手动指定",
+    "funasr_model": "paraformer-zh-streaming",
+    "funasr_chunk_size_frames": 10
   },
-  
+
   "feishu": {
-    "enabled": false,
-    "app_id": "cli_xxxxxxxxxxxx",
-    "app_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "_comment": "飞书配置（可选）- https://open.feishu.cn/app/",
+    "enabled": true,
+    "app_id": "YOUR_FEISHU_APP_ID",
+    "app_secret": "YOUR_FEISHU_APP_SECRET",
     "encrypt_key": "",
-    "verification_token": ""
+    "verification_token": "",
+    "default_chat_id": "YOUR_FEISHU_CHAT_ID"
   },
-  
+
+  "weread": {
+    "enabled": true,
+    "cookie_string": "YOUR_WEREAD_COOKIE_STRING"
+  },
+
   "camera": {
+    "_comment": "摄像头配置",
     "device": 0,
-    "auto_scan_interval": 2
+    "auto_scan_interval": 10,
+    "scanner_enabled": true,
+    "auto_detect": false
   },
-  
+
+  "perspective": {
+    "enabled": true
+  },
+
+  "vision_ocr": {
+    "primary": "doubao",
+    "doubao_model": "YOUR_DOUBAO_VISION_MODEL_ENDPOINT",
+    "doubao_api_key": "YOUR_DOUBAO_VISION_API_KEY"
+  },
+
+  "kimi_ocr": {
+    "enabled": true,
+    "interval": 30,
+    "save_results": true,
+    "_comment_api_key": "独立 API key，与主对话隔离 rate limit；不填则复用主 key",
+    "api_key": "YOUR_KIMI_OCR_API_KEY"
+  },
+
+  "embedding": {
+    "_comment": "阿里云百炼 Embedding - https://dashscope.console.aliyun.com/",
+    "enabled": true,
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key": "YOUR_DASHSCOPE_API_KEY",
+    "model": "text-embedding-v4"
+  },
+
+  "jimeng": {
+    "enabled": true,
+    "api_key": "YOUR_JIMENG_API_KEY",
+    "model": "YOUR_JIMENG_MODEL_ENDPOINT"
+  },
+
+  "illustration_llm": {
+    "api_key": "YOUR_ILLUSTRATION_LLM_API_KEY",
+    "model": "YOUR_ILLUSTRATION_LLM_MODEL_ENDPOINT",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3"
+  },
+
   "data": {
+    "_comment": "数据存储目录",
     "data_dir": "./data"
   }
 }
