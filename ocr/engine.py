@@ -142,6 +142,50 @@ def sort_dual_page_lines(polys, texts, scores, score_thresh: float = 0.5) -> Lis
     return [t for _, _, t in sorted(items, key=lambda x: x[1])]
 
 
+def _parse_paddle_result(result) -> tuple:
+    """
+    将 PaddleOCR 2.x / 3.x 的原始 result 统一解析为 (polys, texts, scores) 三元组。
+    不做过滤，由调用方按需 filter。返回空列表表示解析失败。
+    """
+    if not result:
+        return [], [], []
+    if not isinstance(result, list):
+        result = list(result)
+    if not result:
+        return [], [], []
+
+    first = result[0]
+
+    # 3.x: OCRResult dict-like 对象
+    if hasattr(first, '__getitem__') and not isinstance(first, list):
+        try:
+            polys, texts, scores = [], [], []
+            for r in result:
+                polys.extend(r.get('rec_polys') or r.get('dt_polys') or [])
+                texts.extend(r['rec_texts'] or [])
+                scores.extend(r['rec_scores'] or [])
+            return polys, texts, scores
+        except (KeyError, TypeError):
+            pass
+
+    # 2.x: 嵌套 list 格式
+    try:
+        polys, texts, scores = [], [], []
+        for block in result:
+            if block is None:
+                continue
+            for item in block:
+                if item and len(item) >= 2:
+                    polys.append(item[0])
+                    texts.append(item[1][0])
+                    scores.append(item[1][1])
+        return polys, texts, scores
+    except (IndexError, TypeError):
+        pass
+
+    return [], [], []
+
+
 def _extract_boxes(result, score_thresh: float = 0.4) -> List[dict]:
     """
     从 PaddleOCR 原始 result 提取每行 bounding box 信息。
@@ -151,63 +195,18 @@ def _extract_boxes(result, score_thresh: float = 0.4) -> List[dict]:
 
     兼容 PaddleOCR 2.x / 3.x。
     """
-    if not result:
-        return []
-    if not isinstance(result, list):
-        result = list(result)
-    if not result:
-        return []
-
-    first = result[0]
+    polys, texts, scores = _parse_paddle_result(result)
     boxes = []
-
-    # 3.x: OCRResult dict-like 对象
-    if hasattr(first, '__getitem__') and not isinstance(first, list):
-        try:
-            for r in result:
-                polys  = r.get('rec_polys') or r.get('dt_polys') or []
-                texts  = r['rec_texts']  or []
-                scores = r['rec_scores'] or []
-                for poly, text, score in zip(polys, texts, scores):
-                    if score < score_thresh or not text.strip():
-                        continue
-                    pts = np.array(poly, dtype=np.float32)
-                    cx = float(pts[:, 0].mean())
-                    cy = float(pts[:, 1].mean())
-                    boxes.append({
-                        "text": text,
-                        "poly": [[float(p[0]), float(p[1])] for p in poly],
-                        "cx": cx,
-                        "cy": cy,
-                    })
-            return boxes
-        except (KeyError, TypeError):
-            pass
-
-    # 2.x: 嵌套 list 格式
-    try:
-        for block in result:
-            if block is None:
-                continue
-            for item in block:
-                if item and len(item) >= 2:
-                    poly  = item[0]
-                    text  = item[1][0]
-                    score = item[1][1]
-                    if score < score_thresh or not text.strip():
-                        continue
-                    pts = np.array(poly, dtype=np.float32)
-                    cx = float(pts[:, 0].mean())
-                    cy = float(pts[:, 1].mean())
-                    boxes.append({
-                        "text": text,
-                        "poly": [[float(p[0]), float(p[1])] for p in poly],
-                        "cx": cx,
-                        "cy": cy,
-                    })
-    except (IndexError, TypeError):
-        pass
-
+    for poly, text, score in zip(polys, texts, scores):
+        if score < score_thresh or not text.strip():
+            continue
+        pts = np.array(poly, dtype=np.float32)
+        boxes.append({
+            "text": text,
+            "poly": [[float(p[0]), float(p[1])] for p in poly],
+            "cx": float(pts[:, 0].mean()),
+            "cy": float(pts[:, 1].mean()),
+        })
     return boxes
 
 
@@ -215,57 +214,12 @@ def _extract_lines(result, score_thresh: float = 0.5) -> List[str]:
     """
     统一解析 PaddleOCR 2.x / 3.x 的识别结果，返回文字行列表。
     双页摊开时自动检测书脊，左页优先排列。
-
-    3.x 结果: List[OCRResult]，每个 OCRResult 支持 result['rec_texts'] / result['rec_scores']
-    2.x 结果: List[List[List]]，每条记录格式为 [box, (text, confidence)]
     """
-    if not result:
-        return []
-
-    # PaddleOCR 3.x 的 predict() 返回生成器，先转 list 以支持索引访问
-    if not isinstance(result, list):
-        result = list(result)
-    if not result:
-        return []
-
-    first = result[0]
-
-    # 3.x: OCRResult 对象，支持 dict-like 访问，且含 rec_polys 坐标
-    if hasattr(first, '__getitem__') and not isinstance(first, list):
-        try:
-            all_polys, all_texts, all_scores = [], [], []
-            for r in result:
-                polys  = r.get('rec_polys')  or r.get('dt_polys')  or []
-                texts  = r['rec_texts']  or []
-                scores = r['rec_scores'] or []
-                all_polys.extend(polys)
-                all_texts.extend(texts)
-                all_scores.extend(scores)
-            if all_polys:
-                return sort_dual_page_lines(all_polys, all_texts, all_scores, score_thresh)
-            # 无坐标信息时退化为顺序输出
-            return [t for t, s in zip(all_texts, all_scores)
-                    if s >= score_thresh and t.strip()]
-        except (KeyError, TypeError):
-            pass
-
-    # 2.x: 嵌套 list 格式，box 即多边形顶点
-    try:
-        all_polys, all_texts, all_scores = [], [], []
-        for block in result:
-            if block is None:
-                continue
-            for item in block:
-                if item and len(item) >= 2:
-                    all_polys.append(item[0])
-                    all_texts.append(item[1][0])
-                    all_scores.append(item[1][1])
-        if all_polys:
-            return sort_dual_page_lines(all_polys, all_texts, all_scores, score_thresh)
-    except (IndexError, TypeError):
-        pass
-
-    return []
+    polys, texts, scores = _parse_paddle_result(result)
+    if not polys:
+        # 无坐标信息时退化为顺序输出（过滤低置信度）
+        return [t for t, s in zip(texts, scores) if s >= score_thresh and t.strip()]
+    return sort_dual_page_lines(polys, texts, scores, score_thresh)
 
 
 def get_ocr():

@@ -583,21 +583,22 @@ class ReadingCompanion:
     # 指尖点读
     # ------------------------------------------------------------------
 
-    def _on_finger_stable(self, px: int, py: int, frame, hand: str = "Unknown",
-                          dir_x: int = 0, dir_y: int = 0):
+    def _on_finger_stable(self, px: int, py: int, frame,
+                          probe_x: int = 0, probe_y: int = 0):
         """由 _finger_loop 在事件循环中调用，派发异步处理"""
-        asyncio.create_task(self._process_finger_point(px, py, frame, dir_x, dir_y))
+        asyncio.create_task(self._process_finger_point(px, py, frame, probe_x, probe_y))
 
     async def _process_finger_point(self, px: int, py: int, frame,
-                                     dir_x: int = 0, dir_y: int = 0):
+                                     probe_x: int = 0, probe_y: int = 0):
         """识别手指指向的文字行，注入到 memory.finger_pointed_text。
 
         策略：对指尖周围搜索区做 OCR，提取所有 bounding box，
-        用 lm6→lm8 指向向量打射线，找射线穿越的 box；无法计算方向时退化为 nearest-centroid。
+        用 probe→tip 指向向量打射线，找射线穿越的 box；无法计算方向时退化为 nearest-centroid。
+        probe 是 lm8 身后 50px 的近距探测点（已透视变换到校正帧坐标）。
         """
         import cv2 as _cv2
         import numpy as np
-        from ocr.engine import get_crop_ocr, _extract_boxes
+        from ocr.engine import get_crop_ocr, _extract_boxes, _sharpen
 
         h, w = frame.shape[:2]
 
@@ -605,8 +606,8 @@ class ReadingCompanion:
         SEARCH_W, SEARCH_H = 900, 240
         x1 = max(0, px - SEARCH_W // 2)
         x2 = min(w, px + SEARCH_W // 2)
-        y1 = max(0, py - SEARCH_H // 2)
-        y2 = min(h, py + SEARCH_H // 2)
+        y1 = max(0, py - SEARCH_H // 2 - 50)
+        y2 = min(h, py + SEARCH_H // 2 - 50)
         search_crop = frame[y1:y2, x1:x2]
 
         if search_crop.size == 0:
@@ -616,7 +617,6 @@ class ReadingCompanion:
         # 2. OCR 提取搜索区内所有 box（锐化后识别，改善书脊弯曲处模糊文字）
         loop = asyncio.get_event_loop()
         def _ocr_boxes():
-            from ocr.engine import _sharpen
             ocr = get_crop_ocr()
             result = list(ocr.predict(_sharpen(search_crop)))
             return _extract_boxes(result)
@@ -633,35 +633,39 @@ class ReadingCompanion:
             box["cx"] += x1
             box["cy"] += y1
 
-        # 4. 射线查找：lm6(dir_x,dir_y) → lm8(px,py) 方向延伸
-        rdx, rdy = px - dir_x, py - dir_y
+        # 4. 射线查找：probe_point → lm8(px,py) 方向延伸
+        rdx, rdy = px - probe_x, py - probe_y
         r_len = (rdx ** 2 + rdy ** 2) ** 0.5
         has_direction = r_len > 5   # lm6/lm8 距离太近时方向不可信
         if has_direction:
             rdx, rdy = rdx / r_len, rdy / r_len
         logger.debug(f"[Finger] 指向向量 ({rdx:.2f},{rdy:.2f}) has_direction={has_direction}")
 
-        RAY_PERP_THRESH = 80   # 射线垂直容忍距离（px），约覆盖一行字高的一半
-        RAY_T_MAX = 600        # 沿射线最远搜索距离（px）
-
         matched = None
 
-        # Step 1: 射线穿越 —— 找垂直距离最小且在射线前方的 box
-        if has_direction:
-            best_perp, best_box = float("inf"), None
-            for box in boxes:
-                cx, cy = box["cx"], box["cy"]
-                t = (cx - px) * rdx + (cy - py) * rdy   # 投影，>0 = 指尖前方
-                if t < 0 or t > RAY_T_MAX:
-                    continue
-                perp = abs((cx - px) * rdy - (cy - py) * rdx)  # 垂直距离
-                if perp < RAY_PERP_THRESH and perp < best_perp:
-                    best_perp, best_box = perp, box
-            if best_box:
-                matched = best_box["text"]
-                logger.info(f"[Finger] box 命中（ray perp={best_perp:.0f}px）: 「{matched[:50]}」")
+        # Step 1: point-in-polygon —— 找包含指尖的 box（纵向扩展 30px 容忍手指厚度偏差）
+        # 射线方向在"手指指向某行左端"时 centroid 在箭头路径之外（perp > 80px）必然失效；
+        # 而指尖位置本身就是最可靠的信号：哪个 box 包含指尖就选哪个。
+        Y_EXPAND = 30
+        candidates = []
+        for box in boxes:
+            poly = np.array(box["poly"], dtype=np.float32)
+            # 纵向扩展：上下各移 Y_EXPAND
+            y_mid = poly[:, 1].mean()
+            poly_exp = poly.copy()
+            poly_exp[:, 1] += np.where(poly[:, 1] < y_mid, -Y_EXPAND, Y_EXPAND)
+            if cv2.pointPolygonTest(poly_exp, (float(px), float(py)), False) >= 0:
+                candidates.append(box)
+        if candidates:
+            # 多个 box 重叠时取面积最小的（最精确的单行检测）
+            def _poly_area(box):
+                p = np.array(box["poly"], dtype=np.float32)
+                return float(cv2.contourArea(p))
+            best_box = min(candidates, key=_poly_area)
+            matched = best_box["text"]
+            logger.info(f"[Finger] box 命中（in-poly，{len(candidates)} 个候选）: 「{matched[:50]}」")
 
-        # Step 2: 退化兜底 —— 方向不可信时用 nearest-centroid
+        # Step 2: nearest-centroid —— 无 box 包含指尖时取距离最近的
         if matched is None:
             MAX_DIST_Y = 120
             best_dist, best_box = float("inf"), None
@@ -674,7 +678,7 @@ class ReadingCompanion:
                     best_dist, best_box = dist, box
             if best_box:
                 matched = best_box["text"]
-                logger.info(f"[Finger] box 命中（fallback nearest {best_dist**0.5:.0f}px）: 「{matched[:50]}」")
+                logger.info(f"[Finger] box 命中（nearest {best_dist**0.5:.0f}px）: 「{matched[:50]}」")
 
         if matched and self.memory:
             self.memory.set_finger_text(matched)

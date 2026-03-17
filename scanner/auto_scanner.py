@@ -19,7 +19,8 @@ from typing import Optional, Tuple, Callable
 
 from camera import fingerprint, is_page_turn
 from camera.capture import CameraCapture, find_external_camera
-from camera.perspective import load_fixed_homography, apply_fixed_homography
+from camera.perspective import load_fixed_homography, apply_fixed_homography, transform_point
+from scanner.finger_detector import compute_probe_point
 from ocr.engine import create_ocr_engine
 from config import config
 
@@ -113,9 +114,9 @@ class AutoScanner:
         self._last_stable_pos: Optional[tuple] = None   # (norm_x, norm_y)
         self._finger_dwell_since: float = 0.0
         self._finger_dwell_threshold: float = config.FINGER_DWELL_SECONDS
-        self._last_raw_frame: Optional[np.ndarray] = None  # 保存最新原始帧
-        self.on_finger_stable: Optional[Callable[[int, int, np.ndarray], None]] = None
-        # 回调参数: (pixel_x, pixel_y, raw_frame)
+        self._last_corrected_frame: Optional[np.ndarray] = None  # 保存最新透视校正帧
+        self.on_finger_stable: Optional[Callable[[int, int, np.ndarray, int, int], None]] = None
+        # 回调参数: (pixel_x, pixel_y, corrected_frame, probe_x, probe_y)
 
         # 固定透视校正矩阵（可选，由标定脚本生成）
         if config.PERSPECTIVE_ENABLED:
@@ -275,7 +276,7 @@ class AutoScanner:
                 frame = apply_fixed_homography(frame, self._perspective_M)
 
             # 保存校正后的帧供指尖裁剪使用（与 OCR 坐标空间一致）
-            self._last_raw_frame = frame
+            self._last_corrected_frame = frame
 
             # KimiOCR 路径：指纹去重后 fire-and-forget，结果通过回调返回
             if self._kimi_ocr is not None:
@@ -376,7 +377,7 @@ class AutoScanner:
                     corrected = apply_fixed_homography(raw_frame, self._perspective_M)
                 else:
                     corrected = raw_frame
-                self._last_raw_frame = corrected
+                self._last_corrected_frame = corrected
 
                 # MediaPipe 在原始帧上检测（手的形态自然，不被透视扭曲）
                 h_r, w_r = raw_frame.shape[:2]
@@ -407,38 +408,24 @@ class AutoScanner:
                         self._last_stable_pos = (finger.x, finger.y)
                         self._finger_dwell_since = now
                     elif now - self._finger_dwell_since >= self._finger_dwell_threshold:
-                        self._finger_dwell_since = now + 9999
-                        # 原始坐标映射到校正帧坐标
+                        self._finger_dwell_since = float('inf')  # 防止重复触发直到手指移动
                         px_r = int(finger.x * w_r)
                         py_r = int(finger.y * h_r)
                         if self._perspective_M is not None:
-                            pt = np.array([[[px_r, py_r]]], dtype=np.float32)
-                            pt_c = cv2.perspectiveTransform(pt, self._perspective_M)
-                            px = int(pt_c[0][0][0])
-                            py = int(pt_c[0][0][1])
+                            px, py = transform_point(px_r, py_r, self._perspective_M)
                         else:
                             px, py = px_r, py_r
-                        if self.on_finger_stable and self._last_raw_frame is not None:
-                            # 方向：原始帧中 lm6→lm8 单位向量，取 lm8 身后 50px 近距探测点
-                            # 再透视变换。近距探测点与 lm8 高度几乎相同，避免 lm6 因离书面
-                            # 较远导致透视变换偏差大的问题。
-                            raw_dx = (finger.x - finger.dir_x) * w_r
-                            raw_dy = (finger.y - finger.dir_y) * h_r
-                            raw_len = (raw_dx**2 + raw_dy**2) ** 0.5
-                            if raw_len > 5:
-                                probe_x = px_r - raw_dx / raw_len * 50
-                                probe_y = py_r - raw_dy / raw_len * 50
-                            else:
-                                probe_x = finger.dir_x * w_r
-                                probe_y = finger.dir_y * h_r
-                            dir_px, dir_py = int(probe_x), int(probe_y)
+                        if self.on_finger_stable and self._last_corrected_frame is not None:
+                            # 探测点：lm8 身后 50px，与指尖同高，透视变换误差极小
+                            probe_x, probe_y = compute_probe_point(
+                                finger.x, finger.y, finger.dir_x, finger.dir_y, w_r, h_r
+                            )
                             if self._perspective_M is not None:
-                                dpt = np.array([[[probe_x, probe_y]]], dtype=np.float32)
-                                dpt_c = cv2.perspectiveTransform(dpt, self._perspective_M)
-                                dir_px = int(dpt_c[0][0][0])
-                                dir_py = int(dpt_c[0][0][1])
-                            self.on_finger_stable(px, py, self._last_raw_frame.copy(),
-                                                  finger.hand, dir_px, dir_py)
+                                dir_px, dir_py = transform_point(probe_x, probe_y, self._perspective_M)
+                            else:
+                                dir_px, dir_py = int(probe_x), int(probe_y)
+                            self.on_finger_stable(px, py, self._last_corrected_frame.copy(),
+                                                  dir_px, dir_py)
 
                 await asyncio.sleep(DETECT_INTERVAL)
 

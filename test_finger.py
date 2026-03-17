@@ -177,8 +177,8 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
     import numpy as np
     from pathlib import Path
     from datetime import datetime
-    from scanner.finger_detector import FingerDetector
-    from ocr.engine import get_crop_ocr, _extract_boxes
+    from scanner.finger_detector import FingerDetector, compute_probe_point
+    from ocr.engine import get_crop_ocr, _extract_boxes, _sharpen
 
     fd = FingerDetector()
     from camera.capture import CameraCapture
@@ -194,7 +194,7 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
     print(f"✅ PaddleOCR 预加载完成（{(time.time()-t_preload)*1000:.0f}ms）")
 
     from config import config
-    from camera.perspective import load_fixed_homography, apply_fixed_homography
+    from camera.perspective import load_fixed_homography, apply_fixed_homography, transform_point
     perspective_M = None
     if config.PERSPECTIVE_ENABLED:
         perspective_M = load_fixed_homography(config.PERSPECTIVE_HOMOGRAPHY_FILE)
@@ -248,36 +248,24 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
             px_r = int(fp.x * w_r)
             py_r = int(fp.y * h_r)
 
-            # 用正向矩阵 M 把原始坐标映射到校正帧坐标
+            # 指尖和探测点变换到校正帧坐标
             if perspective_M is not None:
-                pt = np.array([[[px_r, py_r]]], dtype=np.float32)
-                pt_c = cv2.perspectiveTransform(pt, perspective_M)
-                px = int(pt_c[0][0][0])
-                py = int(pt_c[0][0][1])
-                # 方向：lm6/lm8 都是归一化坐标，先转成 4K 像素再算单位向量。
-                # 取 lm8 身后 50px 的近距探测点再变换到校正帧，避免 lm6 因高于
-                # 书面导致透视变换偏差大。
-                raw_dx = (fp.x - fp.dir_x) * w_r   # 归一化差值 × 4K 宽
-                raw_dy = (fp.y - fp.dir_y) * h_r   # 归一化差值 × 4K 高
-                raw_len = (raw_dx**2 + raw_dy**2) ** 0.5
-                if raw_len > 5:
-                    probe_x = px_r - raw_dx / raw_len * 50
-                    probe_y = py_r - raw_dy / raw_len * 50
-                else:
-                    probe_x = fp.dir_x * w_r
-                    probe_y = fp.dir_y * h_r
-                dpt = np.array([[[probe_x, probe_y]]], dtype=np.float32)
-                dpt_c = cv2.perspectiveTransform(dpt, perspective_M)
-                dir_cx = int(dpt_c[0][0][0])
-                dir_cy = int(dpt_c[0][0][1])
+                px, py = transform_point(px_r, py_r, perspective_M)
+                probe_rx, probe_ry = compute_probe_point(
+                    fp.x, fp.y, fp.dir_x, fp.dir_y, w_r, h_r
+                )
+                dir_cx, dir_cy = transform_point(probe_rx, probe_ry, perspective_M)
             else:
                 px, py = px_r, py_r
-                dir_cx, dir_cy = fp.dir_x, fp.dir_y
+                probe_rx, probe_ry = compute_probe_point(
+                    fp.x, fp.y, fp.dir_x, fp.dir_y, w_r, h_r
+                )
+                dir_cx, dir_cy = int(probe_rx), int(probe_ry)
 
             x1 = max(0, px - SEARCH_W // 2)
             x2 = min(w_c, px + SEARCH_W // 2)
-            y1 = max(0, py - SEARCH_H // 2)
-            y2 = min(h_c, py + SEARCH_H // 2)
+            y1 = max(0, py - SEARCH_H // 2 - 50)
+            y2 = min(h_c, py + SEARCH_H // 2 - 50)
 
             # 映射到 display 尺寸
             dx  = int(px * disp_scale)
@@ -312,7 +300,7 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
                     status = "手指移动，重置计时"
                     box_color = (0, 200, 200)
                 else:
-                    elapsed = now - dwell_since
+                    elapsed = now - dwell_since if dwell_since != float('inf') else dwell_seconds
                     remaining = max(0.0, dwell_seconds - elapsed)
                     ratio = min(elapsed / dwell_seconds, 1.0)
                     g = int(255 * ratio)
@@ -323,7 +311,7 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
                     cv2.rectangle(display, (rx1, ry1), (rx2, ry2), box_color, thickness)
 
                     if elapsed >= dwell_seconds and dwell_since < now - 0.1:
-                        dwell_since = now + 9999
+                        dwell_since = float('inf')  # 防止重复触发直到手指移动
                         trigger_count += 1
                         ts = datetime.now().strftime("%H%M%S")
                         rdx_t, rdy_t = px - dir_cx, py - dir_cy
@@ -340,7 +328,6 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
                             status = "搜索区失败"
                         else:
                             t0 = time.time()
-                            from ocr.engine import _sharpen
                             ocr = get_crop_ocr()
                             result = list(ocr.predict(_sharpen(search_crop)))
                             boxes = _extract_boxes(result)
@@ -354,23 +341,22 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
 
                             print(f"  PaddleOCR ({elapsed_ocr:.0f}ms): {len(boxes)} 个 box")
 
-                            # 射线查找
-                            RAY_PERP_THRESH, RAY_T_MAX = 80, 600
+                            # Step 1: point-in-polygon
+                            Y_EXPAND = 30
                             matched_box = None
+                            candidates = []
+                            for box in boxes:
+                                poly_b = np.array(box["poly"], dtype=np.float32)
+                                y_mid_b = poly_b[:, 1].mean()
+                                poly_exp = poly_b.copy()
+                                poly_exp[:, 1] += np.where(poly_b[:, 1] < y_mid_b, -Y_EXPAND, Y_EXPAND)
+                                if cv2.pointPolygonTest(poly_exp, (float(px), float(py)), False) >= 0:
+                                    candidates.append(box)
+                            if candidates:
+                                matched_box = min(candidates, key=lambda b: cv2.contourArea(np.array(b["poly"], dtype=np.float32)))
+                                print(f"  ✅ 命中 box（in-poly，{len(candidates)} 候选）: 「{matched_box['text'][:60]}」")
 
-                            if has_dir:
-                                best_perp = float("inf")
-                                for box in boxes:
-                                    cx_b, cy_b = box["cx"], box["cy"]
-                                    t_b = (cx_b - px) * rdx_t + (cy_b - py) * rdy_t
-                                    if t_b < 0 or t_b > RAY_T_MAX:
-                                        continue
-                                    perp = abs((cx_b - px) * rdy_t - (cy_b - py) * rdx_t)
-                                    if perp < RAY_PERP_THRESH and perp < best_perp:
-                                        best_perp, matched_box = perp, box
-                                if matched_box:
-                                    print(f"  ✅ 命中 box（ray perp={best_perp:.0f}px）: 「{matched_box['text'][:60]}」")
-
+                            # Step 2: nearest-centroid
                             if matched_box is None:
                                 best_dist = float("inf")
                                 for box in boxes:
@@ -381,7 +367,7 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
                                     if dist < best_dist:
                                         best_dist, matched_box = dist, box
                                 if matched_box:
-                                    print(f"  ✅ 命中 box（fallback nearest {best_dist**0.5:.0f}px）: 「{matched_box['text'][:60]}」")
+                                    print(f"  ✅ 命中 box（nearest {best_dist**0.5:.0f}px）: 「{matched_box['text'][:60]}」")
 
                             if matched_box is None:
                                 print("  ❌ 未命中任何 box")

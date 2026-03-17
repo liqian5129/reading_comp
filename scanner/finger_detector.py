@@ -32,6 +32,37 @@ def _ensure_model() -> str:
     return str(_MODEL_PATH)
 
 
+def compute_probe_point(
+    tip_x: float, tip_y: float,
+    joint_x: float, joint_y: float,
+    frame_w: int, frame_h: int,
+    offset_px: float = 50.0,
+) -> tuple:
+    """
+    在原始帧像素空间中，沿 lm6(joint)→lm8(tip) 方向，取指尖身后 offset_px 处的探测点。
+
+    探测点与指尖高度几乎相同（仅 50px 之差），透视变换误差远小于直接变换 lm6
+    （lm6 距书面更高，变换偏差大）。
+
+    Args:
+        tip_x/y:   lm8 归一化坐标
+        joint_x/y: lm6 归一化坐标
+        frame_w/h: 原始帧尺寸（像素）
+        offset_px: 探测点到指尖的距离（原始帧像素）
+
+    Returns:
+        (probe_px, probe_py): 原始帧像素坐标（float）
+    """
+    dx = (tip_x - joint_x) * frame_w
+    dy = (tip_y - joint_y) * frame_h
+    length = (dx ** 2 + dy ** 2) ** 0.5
+    tip_px = tip_x * frame_w
+    tip_py = tip_y * frame_h
+    if length > 5:
+        return tip_px - dx / length * offset_px, tip_py - dy / length * offset_px
+    return joint_x * frame_w, joint_y * frame_h
+
+
 @dataclass
 class FingerPoint:
     x: float      # 归一化 [0,1]，相对于输入图像宽度
@@ -66,9 +97,9 @@ class FingerDetector:
         options = mp.tasks.vision.HandLandmarkerOptions(
             base_options=base_options,
             num_hands=2,
-            min_hand_detection_confidence=0.7,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
         )
         self._detector = mp.tasks.vision.HandLandmarker.create_from_options(options)
         logger.info("[FingerDetector] HandLandmarker 初始化完成")
@@ -93,19 +124,20 @@ class FingerDetector:
             if not result.hand_landmarks:
                 return None
 
-            cx_img, cy_img = w / 2.0, h / 2.0
             best: Optional[FingerPoint] = None
-            best_dist = float("inf")
+            best_extend = -1.0  # lm5→lm8 伸展距离（归一化），取最大值 = 最伸展的食指
 
             for i, hand_landmarks in enumerate(result.hand_landmarks):
-                # landmark 8 = 食指指尖，landmark 6 = PIP 关节（用于算指向方向）
+                # landmark 8 = 食指指尖，landmark 6 = PIP 关节，landmark 5 = MCP 关节
                 lm8 = hand_landmarks[8]
                 lm6 = hand_landmarks[6]
+                lm5 = hand_landmarks[5]
                 px = int(lm8.x * w)
                 py = int(lm8.y * h)
-                dist = (px - cx_img) ** 2 + (py - cy_img) ** 2
-                if dist < best_dist:
-                    best_dist = dist
+                # 食指伸展度 = lm5→lm8 的欧氏距离（归一化坐标）
+                extend = ((lm8.x - lm5.x) ** 2 + (lm8.y - lm5.y) ** 2) ** 0.5
+                if extend > best_extend:
+                    best_extend = extend
                     hand_name = "Unknown"
                     if result.handedness and i < len(result.handedness):
                         cats = result.handedness[i]

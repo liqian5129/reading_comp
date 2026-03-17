@@ -203,6 +203,13 @@ def load_fixed_homography(path: str = HOMOGRAPHY_PATH) -> Optional[np.ndarray]:
         return None
 
 
+def transform_point(x: float, y: float, M: np.ndarray) -> Tuple[int, int]:
+    """将单个点通过单应矩阵 M 变换到目标坐标系，返回整数像素坐标。"""
+    pt = np.array([[[x, y]]], dtype=np.float32)
+    pt_c = cv2.perspectiveTransform(pt, M)
+    return int(pt_c[0][0][0]), int(pt_c[0][0][1])
+
+
 def apply_fixed_homography(
     image: np.ndarray,
     M: np.ndarray,
