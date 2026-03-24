@@ -211,7 +211,7 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
     print(f"✅ 端到端测试启动（停留阈值={dwell_seconds}s，按 q 退出）")
     print("   将食指指向书页某行，静止后自动触发 OCR")
 
-    SEARCH_W, SEARCH_H = 900, 240
+    SEARCH_W, SEARCH_H = 900, 180
     MOVE_THRESH = 0.02
     last_stable_pos = None
     dwell_since = 0.0
@@ -264,8 +264,8 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
 
             x1 = max(0, px - SEARCH_W // 2)
             x2 = min(w_c, px + SEARCH_W // 2)
-            y1 = max(0, py - SEARCH_H // 2 - 50)
-            y2 = min(h_c, py + SEARCH_H // 2 - 50)
+            y1 = max(0, py - SEARCH_H // 2 - 110)
+            y2 = min(h_c, py + SEARCH_H // 2 - 110)
 
             # 映射到 display 尺寸
             dx  = int(px * disp_scale)
@@ -373,7 +373,10 @@ def stage_e2e(camera_id: int = 0, dwell_seconds: float = 1.5):
                                 print("  ❌ 未命中任何 box")
                                 status = "❌ 未命中"
                             else:
-                                status = f"✅ {matched_box['text'][:30]}"
+                                from ocr.engine import extract_word_at_x
+                                word = extract_word_at_x(matched_box, px, window=4)
+                                print(f"  🔍 词级: 「{word}」（来自行: 「{matched_box['text'][:40]}」）")
+                                status = f"✅ {word}"
 
                             # 可视化：在 display 上绘制所有 box（灰色），命中 box 高亮（绿色）
                             for box in boxes:

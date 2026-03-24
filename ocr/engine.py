@@ -373,3 +373,47 @@ def extract_text_from_crop(image: np.ndarray) -> str:
     except Exception as e:
         logger.error(f"Crop OCR 失败: {e}")
         return ""
+
+
+def extract_word_at_x(box: dict, px: float, window: int = 4) -> str:
+    """
+    在行级 box 中根据指尖 X 坐标提取指向的词。
+    1. 等宽插值定位 char_idx
+    2. jieba 分词后找到 char_idx 所在词，对齐自然词边界
+    3. jieba 不可用时退化为固定窗口截取
+    """
+    text = box["text"]
+    N = len(text)
+    if N == 0:
+        return text
+
+    poly = np.array(box["poly"], dtype=np.float32)
+    sorted_by_x = sorted(poly.tolist(), key=lambda p: p[0])
+    left_x  = float(np.mean([p[0] for p in sorted_by_x[:2]]))
+    right_x = float(np.mean([p[0] for p in sorted_by_x[2:]]))
+    line_w = max(right_x - left_x, 1.0)
+
+    char_idx = int((px - left_x) / line_w * N)
+    char_idx = max(0, min(N - 1, char_idx))
+
+    # jieba 分词：找 char_idx 所在词
+    try:
+        import jieba
+        words = list(jieba.cut(text, cut_all=False))
+        offset = 0
+        for i, w in enumerate(words):
+            end = offset + len(w)
+            if offset <= char_idx < end:
+                # 单字符词（助词/标点）→ 合并下一个词
+                if len(w) == 1 and i + 1 < len(words):
+                    return w + words[i + 1]
+                return w
+            offset = end
+    except ImportError:
+        pass
+
+    # fallback：固定窗口
+    half = window // 2
+    start = max(0, char_idx - half)
+    end   = min(N, start + window)
+    return text[start:end]

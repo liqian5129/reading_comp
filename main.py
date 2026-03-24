@@ -603,11 +603,11 @@ class ReadingCompanion:
         h, w = frame.shape[:2]
 
         # 1. 裁剪搜索区（宽覆盖整行，高覆盖 3 行）
-        SEARCH_W, SEARCH_H = 900, 240
+        SEARCH_W, SEARCH_H = 900, 180
         x1 = max(0, px - SEARCH_W // 2)
         x2 = min(w, px + SEARCH_W // 2)
-        y1 = max(0, py - SEARCH_H // 2 - 50)
-        y2 = min(h, py + SEARCH_H // 2 - 50)
+        y1 = max(0, py - SEARCH_H // 2 - 110)
+        y2 = min(h, py + SEARCH_H // 2 - 110)
         search_crop = frame[y1:y2, x1:x2]
 
         if search_crop.size == 0:
@@ -654,13 +654,13 @@ class ReadingCompanion:
             y_mid = poly[:, 1].mean()
             poly_exp = poly.copy()
             poly_exp[:, 1] += np.where(poly[:, 1] < y_mid, -Y_EXPAND, Y_EXPAND)
-            if cv2.pointPolygonTest(poly_exp, (float(px), float(py)), False) >= 0:
+            if _cv2.pointPolygonTest(poly_exp, (float(px), float(py)), False) >= 0:
                 candidates.append(box)
         if candidates:
             # 多个 box 重叠时取面积最小的（最精确的单行检测）
             def _poly_area(box):
                 p = np.array(box["poly"], dtype=np.float32)
-                return float(cv2.contourArea(p))
+                return float(_cv2.contourArea(p))
             best_box = min(candidates, key=_poly_area)
             matched = best_box["text"]
             logger.info(f"[Finger] box 命中（in-poly，{len(candidates)} 个候选）: 「{matched[:50]}」")
@@ -668,6 +668,7 @@ class ReadingCompanion:
         # Step 2: nearest-centroid —— 无 box 包含指尖时取距离最近的
         if matched is None:
             MAX_DIST_Y = 120
+            MAX_DIST_PX = 200   # 超过此距离视为未命中，不注入
             best_dist, best_box = float("inf"), None
             for box in boxes:
                 dy = abs(box["cy"] - py)
@@ -676,13 +677,34 @@ class ReadingCompanion:
                 dist = (box["cx"] - px) ** 2 + dy ** 2
                 if dist < best_dist:
                     best_dist, best_box = dist, box
-            if best_box:
+            if best_box and best_dist ** 0.5 <= MAX_DIST_PX:
                 matched = best_box["text"]
                 logger.info(f"[Finger] box 命中（nearest {best_dist**0.5:.0f}px）: 「{matched[:50]}」")
+            elif best_box:
+                logger.debug(f"[Finger] nearest box 距离 {best_dist**0.5:.0f}px > {MAX_DIST_PX}px，放弃注入")
 
         if matched and self.memory:
-            self.memory.set_finger_text(matched)
-            logger.info(f"[Finger] ✅ 注入上下文: 「{matched[:60]}」")
+            # 在行内做词级精确定位（字符 X 坐标等宽插值）
+            from ocr.engine import extract_word_at_x
+            word = extract_word_at_x(best_box, px, window=4)
+            matched = word if word else matched
+
+            # 质量过滤：拒绝注入无意义内容
+            def _is_valid_word(w: str) -> bool:
+                w = w.strip()
+                if len(w) < 2:
+                    return False
+                # 非字母数字汉字字符占比超过 50% → 乱码
+                valid_chars = sum(1 for c in w if c.isalnum() or '\u4e00' <= c <= '\u9fff')
+                if valid_chars / len(w) < 0.5:
+                    return False
+                return True
+
+            if _is_valid_word(matched):
+                self.memory.set_finger_text(matched)
+                logger.info(f"[Finger] ✅ 注入上下文: 「{matched[:60]}」")
+            else:
+                logger.debug(f"[Finger] 词质量过滤，跳过注入: 「{matched[:30]}」")
 
     async def shutdown(self):
         """关闭所有模块"""
